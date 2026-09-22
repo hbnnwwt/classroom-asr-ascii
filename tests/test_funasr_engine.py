@@ -125,6 +125,51 @@ class TestParseResultsTextList:
         assert segs[0].text == "大家好"
 
 
+class TestEngineCache:
+    """P1-1 引擎缓存：同参数 build_engine 返回同一实例；use_cache=False 旁路。
+
+    FunASREngine 惰性加载（构造函数不加载模型），所以这些测试不碰真实模型。
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clean_engine_cache(self):
+        """清空模块级 _ENGINE_CACHE，保证测试互不污染（hermetic）。"""
+        from asr.pipeline import _ENGINE_CACHE
+        _ENGINE_CACHE.clear()
+        yield
+        _ENGINE_CACHE.clear()
+
+    def test_same_params_returns_same_instance(self, cfg):
+        from asr.pipeline import build_engine
+        e1 = build_engine(cfg)
+        e2 = build_engine(cfg)
+        assert e1 is e2
+
+    def test_use_cache_false_builds_fresh(self, cfg):
+        from asr.pipeline import _ENGINE_CACHE, build_engine
+        e1 = build_engine(cfg)
+        e2 = build_engine(cfg, use_cache=False)
+        assert e1 is not e2
+        # 旁路构建不进缓存：后续缓存构建仍拿到 e1
+        assert e2 not in _ENGINE_CACHE.values()
+        assert build_engine(cfg) is e1
+
+    def test_different_quality_is_different_key(self, cfg):
+        from asr.pipeline import build_engine
+        cfg_fast = load_config("config.yaml", strict_models=False)
+        cfg_fast._quality_override = "fast"
+        assert build_engine(cfg) is not build_engine(cfg_fast)
+
+    def test_close_cached_engines_clears_and_rebuilds(self, cfg):
+        from asr.pipeline import _ENGINE_CACHE, build_engine, close_cached_engines
+        e1 = build_engine(cfg)
+        assert _ENGINE_CACHE
+        close_cached_engines()
+        assert not _ENGINE_CACHE
+        # 关闭后再构建是全新实例
+        assert build_engine(cfg) is not e1
+
+
 class TestCharLevelTimestamps:
     """P0-1：timestamp 与字符逐一对齐，按强标点切段，时间戳真实（非插值）。"""
 

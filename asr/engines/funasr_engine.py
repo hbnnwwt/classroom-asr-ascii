@@ -10,6 +10,7 @@ FunASR 引擎（默认引擎，**唯一启用**的引擎）。
 """
 from __future__ import annotations
 
+import subprocess
 import sys
 from pathlib import Path
 from typing import List, Optional, Callable
@@ -134,18 +135,28 @@ class FunASREngine(ASREngine):
             logger.warning(
                 f"检测到非 ASCII 模型路径 {p_obj}，建立 junction 到 {tmp_dst} 规避 sentencepiece Windows 兼容性 bug"
             )
+            junction_ok = False
             if sys.platform == "win32":
                 # Windows 目录 junction：mklink /J
-                os.system(f'mklink /J "{tmp_dst}" "{p_obj}" >nul 2>&1')
+                # P1-10：参数化 subprocess 替代 os.system —— 后者重定向吞掉
+                # 返回码，静默失败后走 copytree 兜底，是 tmp_models/ 膨胀的
+                # 直接诱因之一。subprocess 返回码真实可信。
+                proc = subprocess.run(
+                    ["cmd", "/c", "mklink", "/J", str(tmp_dst), str(p_obj)],
+                    capture_output=True,
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                )
+                junction_ok = proc.returncode == 0 and tmp_dst.exists()
             else:
                 # 非 Windows：符号链接（理论上不会走到这里）
                 os.symlink(p_obj, tmp_dst, target_is_directory=True)
+                junction_ok = tmp_dst.exists()
 
-        if not tmp_dst.exists():
-            # junction 创建失败 → 退而求其次：完整复制（占空间但能跑）
-            import shutil
-            logger.warning(f"junction 失败，改用复制 {p_obj} -> {tmp_dst}")
-            shutil.copytree(p_obj, tmp_dst)
+            if not junction_ok:
+                # junction 创建失败 → 退而求其次：完整复制（占空间但能跑）
+                import shutil
+                logger.warning(f"junction 失败，改用复制 {p_obj} -> {tmp_dst}")
+                shutil.copytree(p_obj, tmp_dst)
         return tmp_dst.as_posix()
 
     # ------------------------------------------------------------------

@@ -23,6 +23,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from loguru import logger
 
 from ..config import ConfigLoadError, load_config
+from ..pipeline import close_cached_engines
 from ..pipeline import run as pipeline_run
 
 
@@ -157,6 +158,8 @@ async def lifespan(app: FastAPI):
     _init_db()
     logger.info(f"[web] 数据库: {DB_PATH}")
     yield
+    # P1-1：进程退出前释放缓存的引擎（模型内存/显存）
+    close_cached_engines()
 
 
 app = FastAPI(title="Classroom ASR", version="1.0", lifespan=lifespan)

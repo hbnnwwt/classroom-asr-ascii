@@ -37,13 +37,42 @@ class Result:
     segments_count: int
 
 
-def build_engine(cfg: AppConfig) -> ASREngine:
+# P1-1 引擎缓存：key = (engine, quality, asr 模型, device, diarize)
+_ENGINE_CACHE: dict[tuple, ASREngine] = {}
+
+
+def build_engine(cfg: AppConfig, use_cache: bool = True) -> ASREngine:
     """
     按 cfg.engine 创建引擎实例。当前仅支持 funasr。
+
+    P1-1：进程内按 (engine, quality, asr 模型, device, diarize) 缓存引擎，
+    批量/连续上传不再每个文件重载 2GB 模型。FunASREngine 惰性加载
+    （构造函数不碰模型），缓存未加载实例无内存代价；缓存实例的 close()
+    统一由 close_cached_engines() 负责（web lifespan 退出时调用），run()
+    不 close。多线程并发 build 同 key 的良性竞争（后写覆盖）可接受，不加锁。
     """
-    if cfg.engine == "funasr":
-        return FunASREngine(cfg)
-    raise RuntimeError(f"未知引擎: {cfg.engine}（当前仅支持 funasr）")
+    key = (
+        cfg.engine,
+        getattr(cfg, "_quality_override", "balanced"),
+        str(cfg.asr.paraformer_model or cfg.models.funasr.asr),
+        cfg.device,
+        cfg.diarize.enabled,
+    )
+    if use_cache and key in _ENGINE_CACHE:
+        return _ENGINE_CACHE[key]
+    if cfg.engine != "funasr":
+        raise RuntimeError(f"未知引擎: {cfg.engine}（当前仅支持 funasr）")
+    eng = FunASREngine(cfg)
+    if use_cache:
+        _ENGINE_CACHE[key] = eng
+    return eng
+
+
+def close_cached_engines() -> None:
+    """释放并清空引擎缓存（进程退出前调用；web lifespan 已挂）。"""
+    for eng in _ENGINE_CACHE.values():
+        eng.close()
+    _ENGINE_CACHE.clear()
 
 
 def _apply_overrides(cfg: AppConfig, overrides: dict) -> None:

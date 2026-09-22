@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import copy
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -53,7 +54,9 @@ def batch_run(
 
     def _one(p: Path) -> tuple[Path, str | None]:
         try:
-            r = pipeline_run(p, cfg, overrides)
+            # P1-2：pipeline.run 会原位改 cfg（_quality_override / diarize.enabled /
+            # output.formats）。线程池共享一个 cfg 时任务互相踩，每任务深拷贝隔离。
+            r = pipeline_run(p, copy.deepcopy(cfg), overrides)
             return p, None
         except Exception as e:
             err = f"{type(e).__name__}: {e}"
