@@ -302,3 +302,38 @@ class TestCharLevelTimestamps:
         segs = self._engine()._parse_results(
             [{"key": "k", "text": "大家好", "timestamp": []}], duration_s=100.0)
         assert segs[0].start == 0.0 and segs[0].end == 100.0
+
+    def test_split_by_char_ts_keeps_soft_punct(self):
+        """R13：软标点（，、：（）等）必须保留在输出文本，只是不消费 ts 槽位。
+
+        ts 数按 n_text 口径（排除 _NO_TS_CHARS ∪ _HARD_PUNCT）构造：
+        逗号在文本里但**不占** ts 项。断言：软标点守恒 + 段数/时间戳与
+        无逗号等价文本完全一致（对齐不受影响）。
+        """
+        from asr.engines.funasr_engine import _split_by_char_ts, _NO_TS_CHARS, _HARD_PUNCT
+        text = "大家好，今天上课。再见"
+        n = sum(1 for c in text if c not in _NO_TS_CHARS and c not in _HARD_PUNCT)
+        assert n == 9                              # 大家好今天上课再见
+        ts = [[1000 + i * 500, 1200 + i * 500] for i in range(n)]
+        segs = _split_by_char_ts(text, ts, duration_s=5.0)
+        # 与"无逗号等价文本"逐段对比：段数与时间戳完全一致
+        segs_plain = _split_by_char_ts("大家好今天上课。再见", ts, duration_s=5.0)
+        assert len(segs) == len(segs_plain) == 2
+        assert [(s.start, s.end) for s in segs] == [(s.start, s.end) for s in segs_plain]
+        # 软标点守恒：逗号保留在第一段文本中（旧代码静默丢弃）
+        assert segs[0].text == "大家好，今天上课。"
+        assert segs[1].text == "再见"
+
+    def test_parse_results_soft_punct_conserved(self):
+        """R13 全链路守恒：输入文本 N 个软标点 → 输出各段软标点总数 == N。"""
+        from asr.engines.funasr_engine import _NO_TS_CHARS, _HARD_PUNCT
+        text = "大家好，今天：上课（开始）。再见、同学们"
+        n = sum(1 for c in text if c not in _NO_TS_CHARS and c not in _HARD_PUNCT)
+        ts = [[500 + i * 300, 700 + i * 300] for i in range(n)]
+        segs = self._engine()._parse_results(
+            [{"key": "k", "text": text, "timestamp": ts}], duration_s=3.0)
+        soft = set(_NO_TS_CHARS) - set("\n\r\t ")   # 只统计可见软标点
+        n_in = sum(1 for c in text if c in soft)
+        n_out = sum(1 for s in segs for c in s.text if c in soft)
+        assert n_in == 5                            # ，：（）、
+        assert n_out == n_in

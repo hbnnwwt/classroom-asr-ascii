@@ -336,7 +336,7 @@ def _as_spk(v) -> Optional[str]:
     return str(v) if str(v).startswith("spk") else f"spk{v}"
 
 
-# 强标点：切段边界；弱标点与空白：无 timestamp，对齐时跳过
+# 强标点：切段边界；弱标点与空白：无 timestamp，对齐时不消费 ts 槽位但保留在文本（R13）
 _HARD_PUNCT = "。？！；\n"
 _NO_TS_CHARS = set("，、：“”‘’（）()《》\n\r\t ")
 
@@ -361,6 +361,7 @@ def _split_by_char_ts(text: str, ts: list, duration_s: float | None) -> List[Seg
                 buf, t0 = [], None
             continue
         if ch in _NO_TS_CHARS:
+            buf.append(ch)   # R13：保留字符；不消费 ts 槽位（n_text 对齐口径一致）
             continue
         if ti >= len(ts):
             buf.append(ch)              # 时间戳耗尽：残余文本留给收尾并入
