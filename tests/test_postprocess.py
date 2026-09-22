@@ -209,42 +209,63 @@ def test_newline_sanitized_in_apply():
 
 
 def test_validate_timestamps_clamps_overflow():
-    """时间戳超出视频时长 → 单段被重新分配到 [0, duration]。"""
+    """时间戳超出视频时长 → 该段 clamp 到 [0, duration+0.5]，不再全局重排（P1-6）。"""
     segs = [Segment(start=0.0, end=999.0, text="异常段")]
     out = validate_timestamps(segs, duration_s=10.0)
     assert len(out) == 1
-    # 全段重排逻辑：单段文本覆盖 [0, duration]
+    # clamp 语义：单段只被裁剪到时长+0.5s
     assert out[0].start == 0.0
-    assert abs(out[0].end - 10.0) < 0.01
+    assert abs(out[0].end - 10.5) < 0.01
 
 
-def test_validate_timestamps_overflow_realigns_all():
-    """**关键**：当任意段 end > duration+1s 时，全部段按字数比例均分到 [0, duration]。
+def test_validate_timestamps_overflow_no_global_realign():
+    """P1-6：整批时间戳溢出时**不再**触发全局按字数重排。
 
-    这是 FunASR 长 wav centisecond 数值溢出问题的兜底：
-    保证字幕覆盖完整音频，而不是被"end<=start"误杀。
+    旧"全段均分"兜底已删除（引擎现输出字对齐时间戳，重排会毁掉正确段）。
+    现 clamp 语义下：起点在时长内的段被 clamp 保留；
+    起点本身超出 duration+0.5s 的段 clamp 后 end<=start，被跳过并 warning。
     """
     segs = [
-        Segment(start=0.0, end=50000.0, text="短句"),       # 2 字
-        Segment(start=50000.0, end=100000.0, text="中长句子"),  # 4 字
-        Segment(start=100000.0, end=200000.0, text="很长的句子啊"),  # 6 字
+        Segment(start=0.0, end=50000.0, text="短句"),       # clamp → [0, 60.5]
+        Segment(start=50000.0, end=100000.0, text="中长句子"),  # 起点越界 → 跳过
+        Segment(start=100000.0, end=200000.0, text="很长的句子啊"),  # 起点越界 → 跳过
     ]
     out = validate_timestamps(segs, duration_s=60.0)
-    # 三段都被保留
-    assert len(out) == 3
-    # 第一段起点 0
-    assert abs(out[0].start - 0.0) < 0.01
-    # 最后一段终点 = duration
-    assert abs(out[-1].end - 60.0) < 0.01
-    # 时间戳单调递增
-    for i in range(len(out) - 1):
-        assert out[i].end <= out[i + 1].start + 0.01
-    # 按字数比例：第一段 2/12=16.7% → end=10
-    assert abs(out[0].end - 10.0) < 0.5
-    # 第二段 4/12=33.3% → 累积 end=30
-    assert abs(out[1].end - 30.0) < 0.5
-    # 第三段 6/12=50% → end=60
-    assert abs(out[2].end - 60.0) < 0.5
+    # 只有起点在音频时长内的段存活，其余被跳过（不再无中生有地均分出 3 段）
+    assert len(out) == 1
+    assert out[0].text == "短句"
+    assert out[0].start == 0.0
+    assert abs(out[0].end - 60.5) < 0.01
+
+
+def test_validate_timestamps_none_duration_unchanged():
+    """P1-6 约束：duration_s=None 路径行为不变 —— 仅按 start 排序，时间戳原样保留。"""
+    segs = [
+        Segment(start=5.0, end=6.0, text="b"),
+        Segment(start=1.0, end=2.0, text="a"),
+    ]
+    out = validate_timestamps(segs, None)
+    assert [s.text for s in out] == ["a", "b"]
+    assert out[0].start == 1.0 and out[0].end == 2.0
+
+
+def test_validate_clamp_warns_per_segment():
+    """P1-6：越界段 clamp 时逐段记录 warning，正常段零警告。"""
+    from loguru import logger as _logger
+    msgs: list = []
+    sink_id = _logger.add(msgs.append, level="WARNING")
+    try:
+        segs = [
+            Segment(start=0.0, end=5.0, text="正常段"),
+            Segment(start=1.0, end=9999.0, text="越界段"),
+            Segment(start=2.0, end=7777.0, text="另一越界段"),
+        ]
+        validate_timestamps(segs, duration_s=10.0)
+    finally:
+        _logger.remove(sink_id)
+    clamp_logs = [str(m) for m in msgs if "clamp" in str(m)]
+    assert len(clamp_logs) == 2  # 每个越界段一条
+    assert "正常段" not in clamp_logs[0]
 
 
 def test_validate_timestamps_drops_invalid():
@@ -256,3 +277,17 @@ def test_validate_timestamps_drops_invalid():
     out = validate_timestamps(segs, duration_s=10.0)
     assert len(out) == 1
     assert out[0].text == "正常"
+
+
+def test_validate_only_clamps_offending_segment():
+    """P1-6：1 段越界不得连累全部段被重排。"""
+    segs = [
+        Segment(start=0.0, end=5.0, text="正常段"),
+        Segment(start=1.0, end=9999.0, text="越界段"),   # end 超时长
+        Segment(start=6.0, end=8.0, text="另一正常段"),
+    ]
+    out = validate_timestamps(segs, duration_s=10.0)
+    # 正常段时间戳必须原样保留（不被均分重排）
+    assert out[0].start == 0.0 and out[0].end == 5.0
+    assert out[-1].start == 6.0 and out[-1].end == 8.0
+    assert all(s.end <= 10.5 for s in out)              # 越界段被 clamp

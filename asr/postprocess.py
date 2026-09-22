@@ -269,10 +269,10 @@ def validate_timestamps(
     """
     校验 + 归一化时间戳。
 
-    处理两类异常：
-    1. **end > duration + 1s**（FunASR centisecond 数值溢出或长 wav 累积偏移）：
-       视为"全段覆盖"异常，把所有段**重新均分到 [0, duration]**。
-       这是粗粒度降级，但保证字幕覆盖完整音频。
+    处理两类异常（P1-6：逐段处理，越界只影响越界段本身）：
+    1. **start < 0 或 end > duration + 0.5s**：clamp 到 [0, duration+0.5s]，
+       其余段时间戳原样保留（引擎已输出字对齐时间戳，按字数全局重排
+       会毁掉正常段的正确时间戳，已删除）。
     2. **end <= start**：跳过该段。
     """
     if not segments:
@@ -280,30 +280,6 @@ def validate_timestamps(
     if duration_s is None:
         return sorted(segments, key=lambda x: (x.start, x.end))
 
-    # 检测是否存在大量 end > duration+1s 的段
-    overflow_count = sum(1 for s in segments if s.end > duration_s + 1.0)
-    if overflow_count > 0:
-        logger.warning(
-            f"检测到 {overflow_count}/{len(segments)} 段 end 超出视频时长+1s"
-            f"({duration_s:.2f}s)，全部段按字数比例均分到 [0, {duration_s:.2f}]"
-        )
-        # 按字数比例重新分配时间
-        total_chars = sum(len(s.text) for s in segments)
-        if total_chars == 0:
-            return []
-        cursor = 0.0
-        re_aligned: List[Segment] = []
-        for seg in segments:
-            ratio = len(seg.text) / total_chars
-            seg_start = cursor
-            seg_end = cursor + duration_s * ratio
-            cursor = seg_end
-            re_aligned.append(
-                Segment(start=seg_start, end=seg_end, text=seg.text, spk=seg.spk, conf=seg.conf)
-            )
-        return re_aligned
-
-    # 正常情况：仅裁剪单段越界
     cleaned: List[Segment] = []
     for seg in segments:
         s = max(0.0, seg.start)
@@ -311,6 +287,11 @@ def validate_timestamps(
         if e <= s + 0.01:
             logger.warning(f"段 end <= start + 0.01s，跳过: [{s:.2f},{e:.2f}] {seg.text!r}")
             continue
+        if s != seg.start or e != seg.end:
+            logger.warning(
+                f"段时间戳越界，clamp 到 [{s:.2f},{e:.2f}]"
+                f"(原 [{seg.start:.2f},{seg.end:.2f}]，时长 {duration_s:.2f}s): {seg.text!r}"
+            )
         cleaned.append(Segment(start=s, end=e, text=seg.text, spk=seg.spk, conf=seg.conf))
     cleaned.sort(key=lambda x: (x.start, x.end))
     return cleaned
