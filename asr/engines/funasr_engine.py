@@ -256,7 +256,7 @@ class FunASREngine(ASREngine):
                 for s in item["sentence_info"]:
                     start = normalize_time_unit(s.get("start", 0))
                     end = normalize_time_unit(s.get("end", 0))
-                    text = (s.get("text") or "").strip()
+                    text = _as_text(s.get("text"))
                     spk = s.get("spk")
                     if not text:
                         continue
@@ -274,7 +274,7 @@ class FunASREngine(ASREngine):
             #
             # 当前 P3 实现：如实保留 token-level 数据，作为 Segment 逐字符切分输出。
             # 短句合并、按标点切分 → 留给 P4 postprocess 处理。
-            text = (item.get("text") or "").strip()
+            text = _as_text(item.get("text"))
             ts = item.get("timestamp") or []
             if not text:
                 continue
@@ -303,6 +303,21 @@ class FunASREngine(ASREngine):
     def close(self) -> None:
         self._model = None
         self._loaded = False
+
+
+# ---------------------------------------------------------------------------
+# 文本归一辅助：funasr 的 text 字段可能是 str 或 list
+# ---------------------------------------------------------------------------
+def _as_text(v) -> str:
+    """funasr 返回的 text 字段可能是 str 或 list[str]（开 spk 时
+    timestamp_sentence 的空 punc 分支，timestamp_tools.py:155）。统一转 str。"""
+    if v is None:
+        return ""
+    if isinstance(v, str):
+        return v.strip()
+    if isinstance(v, (list, tuple)):
+        return "".join(str(x) for x in v).strip()
+    return str(v).strip()
 
 
 # ---------------------------------------------------------------------------

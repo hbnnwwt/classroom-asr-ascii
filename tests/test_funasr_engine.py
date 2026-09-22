@@ -103,3 +103,32 @@ def test_engine_close_idempotent(cfg):
     engine.close()
     engine.close()
     assert engine._model is None
+
+
+class TestParseResultsTextList:
+    """funasr 1.4.16 开 spk 后 sentence_info 的 text 可能是 list
+    （timestamp_tools.py:155 的空 punc_id_list 分支）。回归：任务 b5a3f6c7a552。"""
+
+    def _engine(self):
+        from asr.config import load_config
+        from asr.engines.funasr_engine import FunASREngine
+        cfg = load_config(Path(__file__).parent.parent / "config.yaml", strict_models=False)
+        return FunASREngine(cfg)
+
+    def test_sentence_info_text_list_normalized(self):
+        results = [{
+            "key": "x",
+            "sentence_info": [
+                {"start": 0, "end": 1500, "text": ["你", "好"], "spk": 0},
+                {"start": 1600, "end": 3000, "text": "今天上课。", "spk": 1},
+            ],
+        }]
+        segs = self._engine()._parse_results(results)
+        assert segs[0].text == "你好"
+        assert segs[1].text == "今天上课。"
+
+    def test_top_level_text_list_normalized(self):
+        results = [{"key": "x", "text": ["大", "家", "好"], "timestamp": [[100, 200]]}]
+        segs = self._engine()._parse_results(results)
+        assert len(segs) == 1
+        assert segs[0].text == "大家好"

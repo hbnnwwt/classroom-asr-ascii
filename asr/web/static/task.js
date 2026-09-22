@@ -107,8 +107,6 @@ async function poll() {
     updateUI(t);
     if (t.status === "done" || t.status === "failed") {
       stopPolling();
-      $("submit-btn").disabled = false;
-      $("submit-btn").textContent = "开始转写";
     }
   } catch (err) {
     showError(err.message);
