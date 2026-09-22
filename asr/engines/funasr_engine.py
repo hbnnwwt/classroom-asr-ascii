@@ -39,8 +39,10 @@ class FunASREngine(ASREngine):
     # 模型加载
     # ------------------------------------------------------------------
     def _load_model(self):
+        """加载模型（幂等）。返回 self._model——transcribe 用本地引用调用
+        generate，避免关停线程并发置空 self._model 时的 NoneType 崩溃。"""
         if self._loaded:
-            return
+            return self._model
         try:
             from funasr import AutoModel  # noqa: F401
         except ImportError as e:
@@ -110,6 +112,7 @@ class FunASREngine(ASREngine):
         )
         self._loaded = True
         logger.info("FunASR 模型加载完成")
+        return self._model
 
     @staticmethod
     def _ensure_ascii_path(p: str, alias: str) -> str:
@@ -135,25 +138,30 @@ class FunASREngine(ASREngine):
             logger.warning(
                 f"检测到非 ASCII 模型路径 {p_obj}，建立 junction 到 {tmp_dst} 规避 sentencepiece Windows 兼容性 bug"
             )
-            junction_ok = False
             if sys.platform == "win32":
-                # Windows 目录 junction：mklink /J
-                # P1-10：参数化 subprocess 替代 os.system —— 后者重定向吞掉
-                # 返回码，静默失败后走 copytree 兜底，是 tmp_models/ 膨胀的
-                # 直接诱因之一。subprocess 返回码真实可信。
+                # Windows 目录 junction：mklink /J（P1-10：参数化 subprocess
+                # 替代 os.system，返回码真实可信）。rc 只用于日志定位失败
+                # 原因；兜底与否按**事后存在**判定——并发竞争下输家 rc=1 但
+                # 目录已被赢家建好，那也是成功，绝不 copytree 到已存在目录
+                # 上（FileExistsError / WinError 183）。
                 proc = subprocess.run(
                     ["cmd", "/c", "mklink", "/J", str(tmp_dst), str(p_obj)],
                     capture_output=True,
                     creationflags=subprocess.CREATE_NO_WINDOW,
                 )
-                junction_ok = proc.returncode == 0 and tmp_dst.exists()
+                if proc.returncode != 0:
+                    stderr = proc.stderr
+                    if isinstance(stderr, bytes):
+                        stderr = stderr.decode(errors="replace")
+                    logger.warning(
+                        f"mklink rc={proc.returncode}: {(stderr or '')[-200:]}"
+                    )
             else:
                 # 非 Windows：符号链接（理论上不会走到这里）
                 os.symlink(p_obj, tmp_dst, target_is_directory=True)
-                junction_ok = tmp_dst.exists()
 
-            if not junction_ok:
-                # junction 创建失败 → 退而求其次：完整复制（占空间但能跑）
+            if not tmp_dst.exists():
+                # 事后仍不存在（真失败）→ 退而求其次：完整复制（占空间但能跑）
                 import shutil
                 logger.warning(f"junction 失败，改用复制 {p_obj} -> {tmp_dst}")
                 shutil.copytree(p_obj, tmp_dst)
@@ -173,7 +181,9 @@ class FunASREngine(ASREngine):
         on_progress(ratio: 0~1, msg: str)：FunASR 每处理完一个 batch 触发一次，
         用于 UI 显示"已识别 X%"。回调失败不影响主流程。
         """
-        self._load_model()
+        # 本地绑定：关停线程可能在我们拿到模型后并发置空 self._model，
+        # 后续 generate（含 TypeError 重试）都用这个本地引用，无锁。
+        model = self._load_model()
         wav = Path(wav)
         if not wav.exists():
             raise FileNotFoundError(f"输入 wav 不存在: {wav}")
@@ -220,7 +230,7 @@ class FunASREngine(ASREngine):
 
         # 调用模型
         try:
-            results = self._model.generate(**kwargs)
+            results = model.generate(**kwargs)
         except TypeError as e:
             # hotword 参数不支持 → 降级为"术语表后处理"
             if "hotword" in str(e):
@@ -231,7 +241,7 @@ class FunASREngine(ASREngine):
                 kwargs.pop("hotword", None)
                 if "progress_callback" in kwargs:
                     kwargs["progress_callback"] = _pcb
-                results = self._model.generate(**kwargs)
+                results = model.generate(**kwargs)
             else:
                 raise
 

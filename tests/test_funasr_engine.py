@@ -169,6 +169,76 @@ class TestEngineCache:
         # 关闭后再构建是全新实例
         assert build_engine(cfg) is not e1
 
+    def test_close_tolerates_concurrent_insert(self, cfg):
+        """关停窗口内后台线程插入新 key：迭代快照不炸（回归：
+        旧代码 RuntimeError: dict changed size during iteration）。"""
+        from asr.pipeline import _ENGINE_CACHE, close_cached_engines
+
+        class RacerEngine:
+            def close(self):
+                # 模拟后台任务线程在关停期间 build 了新引擎入缓存
+                _ENGINE_CACHE[("funasr", "racer", "m", "cpu", False)] = self
+
+        _ENGINE_CACHE[("funasr", "seed", "m", "cpu", False)] = RacerEngine()
+        close_cached_engines()          # 旧实现在此 RuntimeError
+        assert not _ENGINE_CACHE
+
+
+class TestEnsureAsciiPathJunction:
+    """P1-10 修复轮：junction 兜底按**事后存在**判定（并发竞争回归）。"""
+
+    def _nonascii_src(self, tmp_path):
+        src = tmp_path / "模型"          # 非 ASCII 源目录，触发 junction 路径
+        src.mkdir()
+        (src / "m.bin").write_text("x", encoding="utf-8")
+        return src
+
+    def test_race_loser_rc1_but_dst_exists_no_copytree(self, monkeypatch, tmp_path):
+        """竞争输家：mklink rc=1 但目录已被赢家建好 → 干净返回，
+        绝不 copytree 到已存在目录上（旧逻辑 FileExistsError / WinError 183）。"""
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from asr.engines import funasr_engine as fem
+
+        monkeypatch.chdir(tmp_path)     # tmp_root "tmp_models" 相对 CWD
+        src = self._nonascii_src(tmp_path)
+        dst = (tmp_path / "tmp_models" / "asr").resolve()
+
+        def fake_run(args, **kwargs):
+            # 模拟并发赢家在本线程 mklink 执行期间建好了目录：
+            # rc=1（already exists），但 dst 事实上已可用
+            dst.mkdir(parents=True, exist_ok=True)
+            return SimpleNamespace(
+                returncode=1,
+                stderr=b"Cannot create a file when that file already exists.",
+                stdout=b"",
+            )
+
+        with patch.object(fem.subprocess, "run", fake_run):
+            out = fem.FunASREngine._ensure_ascii_path(str(src), "asr")
+
+        assert Path(out) == dst
+        assert not (dst / "m.bin").exists()  # 没有 copytree（赢家目录无源文件）
+
+    def test_real_failure_falls_back_to_copytree(self, monkeypatch, tmp_path):
+        """真失败：rc=1 且目录始终不存在 → copytree 兜底。"""
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from asr.engines import funasr_engine as fem
+
+        monkeypatch.chdir(tmp_path)
+        src = self._nonascii_src(tmp_path)
+
+        def fake_run(args, **kwargs):
+            return SimpleNamespace(returncode=1, stderr=None, stdout=None)
+
+        with patch.object(fem.subprocess, "run", fake_run):
+            out = fem.FunASREngine._ensure_ascii_path(str(src), "asr")
+
+        dst = (tmp_path / "tmp_models" / "asr").resolve()
+        assert Path(out) == dst
+        assert (dst / "m.bin").read_text(encoding="utf-8") == "x"  # 兜底复制发生
+
 
 class TestCharLevelTimestamps:
     """P0-1：timestamp 与字符逐一对齐，按强标点切段，时间戳真实（非插值）。"""

@@ -69,8 +69,12 @@ def build_engine(cfg: AppConfig, use_cache: bool = True) -> ASREngine:
 
 
 def close_cached_engines() -> None:
-    """释放并清空引擎缓存（进程退出前调用；web lifespan 已挂）。"""
-    for eng in _ENGINE_CACHE.values():
+    """释放并清空引擎缓存（进程退出前调用；web lifespan 已挂）。
+
+    迭代快照（list()）：关停窗口内后台任务线程可能并发 build 插入新 key，
+    直接迭代活 dict 会 RuntimeError: dict changed size during iteration。
+    """
+    for eng in list(_ENGINE_CACHE.values()):
         eng.close()
     _ENGINE_CACHE.clear()
 
