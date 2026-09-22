@@ -1,0 +1,52 @@
+# 课堂录课 ASR · 默认配置（CPU）
+# 所有时间统一为秒(float)。模型路径必须是**绝对路径或相对仓库根目录**。
+device: cpu                  # cpu | cuda:0
+engine: funasr               # funasr | whisper
+language: zh
+num_workers: 4               # CPU 并发文件数；GPU 时强制为 1
+
+media:
+  sample_rate: 16000
+  channels: 1
+  loudnorm: false            # ffmpeg loudnorm 响度归一（默认关：双 pass 多花 30~60s；课堂录音音量通常已合适）
+  denoise: false             # 噪声大时开（afftdn）
+  highpass_hz: 60            # 去空调/投影低频轰鸣，0 表示关闭
+  keep_wav: false            # 调试时保留中间 wav
+  audio_track: 0             # 默认抽音轨 0；多音轨视频可通过 CLI 覆盖
+
+models:
+  funasr:
+    asr:  ./models/iic/SenseVoiceSmall
+    vad:  ./models/iic/speech_fsmn_vad_zh-cn-16k-common-pytorch
+    punc: ./models/iic/punc_ct-transformer_zh-cn-common-vad_realtime-vocab272727
+    spk:  ./models/iic/speech_campplus_sv_zh-cn_16k-common
+  whisper:
+    size: small              # tiny|base|small|medium|large-v3|large-v3-turbo
+    compute_type: int8       # CPU 用 int8；GPU 用 float16
+
+asr:
+  batch_size_s: 300          # 内部切片长度（秒），长课关键参数
+  vad_max_segment_ms: 60000
+  use_itn: true
+  hotword_enabled: true
+  # 高精度模式 --quality high 时切换此模型
+  paraformer_model: ./models/iic/speech_paraformer-large-vad-punc_asr_nat-zh-cn-16k-common-vocab8404-pytorch
+
+diarize:
+  enabled: false             # CLI --diarize 覆盖
+  max_speakers: 4
+  teacher_rule: majority     # 时长占比最大者标注为"教师"
+
+postprocess:
+  itn: true                  # 二零二五 → 2025
+  merge_short_sentences: true
+  min_sentence_chars: 6
+  max_sentence_chars: 40
+  glossary: glossary/default.txt
+
+output:
+  dir: ./out
+  formats: [txt, md, srt, vtt, json]
+  srt_max_chars_per_line: 20
+  srt_max_duration_s: 8
+  srt_encoding: utf-8-sig    # UTF-8 with BOM，Windows 播放器更友好

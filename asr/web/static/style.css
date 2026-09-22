@@ -1,0 +1,244 @@
+* { box-sizing: border-box; }
+body {
+  font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+  margin: 0;
+  padding: 24px;
+  background: #f5f5f7;
+  color: #1d1d1f;
+}
+main { max-width: 1400px; margin: 0 auto; background: #fff; padding: 24px; border-radius: 8px; }
+
+/* 两栏布局：桌面端左右分，小屏单列 */
+.layout {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 24px;
+  align-items: start;
+}
+@media (max-width: 900px) {
+  .layout { grid-template-columns: 1fr; }
+}
+.col-right { position: sticky; top: 24px; }  /* 转写框滚动时粘顶部 */
+
+h1 { margin-top: 0; }
+.hint { color: #6e6e73; margin-top: 0; }
+
+form { display: flex; flex-direction: column; gap: 12px; margin-top: 16px; }
+label { display: flex; flex-direction: column; gap: 4px; font-size: 14px; }
+label.checkbox { flex-direction: row; align-items: center; gap: 8px; }
+input[type="file"], select { padding: 8px; border: 1px solid #d2d2d7; border-radius: 6px; font-size: 14px; }
+
+button {
+  background: #0071e3; color: #fff; border: none; border-radius: 6px;
+  padding: 10px 16px; font-size: 14px; cursor: pointer;
+}
+button:disabled { background: #999; cursor: not-allowed; }
+
+#status-panel { margin-top: 24px; padding-top: 16px; border-top: 1px solid #e5e5e7; }
+.status-row { font-size: 14px; margin-bottom: 12px; }
+
+/* 阶段列表 */
+.stages {
+  list-style: none; padding: 0; margin: 0 0 16px;
+  display: flex; flex-direction: column; gap: 4px;
+}
+.stages li {
+  display: flex; align-items: center; gap: 10px;
+  padding: 6px 10px; border-radius: 6px;
+  font-size: 13px; color: #6e6e73;
+  border-left: 3px solid transparent;
+  transition: all 0.2s;
+}
+.stages li .mark {
+  display: inline-flex; width: 18px; height: 18px;
+  border-radius: 50%; background: #e5e5e7; color: transparent;
+  align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0;
+}
+.stages li .label { font-weight: 500; min-width: 100px; }
+.stages li .msg { color: #86868b; font-size: 12px; margin-left: auto; }
+
+/* 阶段状态：pending / active / done */
+.stages li.pending { opacity: 0.5; }
+.stages li.active {
+  background: #e3f2ff; border-left-color: #0071e3; color: #1d1d1f;
+}
+.stages li.active .mark { background: #0071e3; color: #fff; animation: pulse 1.2s infinite; }
+.stages li.active .label { color: #0071e3; }
+.stages li.done { color: #1d1d1f; }
+.stages li.done .mark { background: #34c759; color: #fff; }
+.stages li.done .label::after { content: ""; }
+
+/* 阶段进行中：脉冲动画 */
+@keyframes pulse {
+  0%, 100% { transform: scale(1); opacity: 1; }
+  50% { transform: scale(1.15); opacity: 0.7; }
+}
+
+/* 整体进度条 */
+.progress-bar {
+  height: 20px; background: #e5e5e7; border-radius: 4px; overflow: hidden;
+  margin-bottom: 12px;
+}
+.progress-fill {
+  height: 100%; background: #34c759; width: 0%;
+  display: flex; align-items: center; justify-content: center;
+  color: #fff; font-size: 12px; transition: width 0.3s;
+}
+
+.error { color: #d70015; background: #ffe5e9; padding: 8px; border-radius: 4px; margin-top: 8px; }
+
+/* 实时转写文本 */
+#transcript-panel {
+  margin-top: 16px;
+  border-top: 1px solid #e5e5e7;
+  padding-top: 12px;
+}
+.transcript-toolbar {
+  display: flex; justify-content: space-between; align-items: center;
+  margin-bottom: 8px;
+}
+.transcript-toolbar h3 { margin: 0; font-size: 14px; color: #6e6e73; }
+.transcript-toolbar button {
+  background: #f5f5f7; color: #0071e3; border: 1px solid #d2d2d7;
+  border-radius: 6px; padding: 4px 10px; font-size: 12px; cursor: pointer;
+}
+.transcript-toolbar button:hover { background: #e5e5e7; }
+
+.transcript {
+  height: 50vh; overflow-y: auto;  /* 固定视口高度的一半 */
+  background: #fafafa; border: 1px solid #e5e5e7; border-radius: 6px;
+  padding: 10px 12px; font-size: 13px; line-height: 1.7;
+  font-family: -apple-system, "Microsoft YaHei", monospace;
+}
+.transcript .line {
+  margin: 0 0 4px; opacity: 0;
+  animation: fade-in 0.5s forwards;
+}
+.transcript .line .ts { color: #86868b; font-size: 11px; margin-right: 8px; font-family: monospace; }
+.transcript .line .txt { color: #1d1d1f; }
+.transcript .line.current { background: #e3f2ff; padding: 2px 4px; border-radius: 3px; }
+.transcript .collapsed-placeholder {
+  text-align: center; color: #86868b; font-size: 11px;
+  padding: 4px 0;
+  border-bottom: 1px dashed #d2d2d7; margin-bottom: 6px;
+}
+@keyframes fade-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.download-list { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+.btn {
+  background: #f5f5f7; color: #0071e3; text-decoration: none;
+  padding: 8px 14px; border-radius: 6px; border: 1px solid #d2d2d7; font-size: 13px;
+}
+.btn:hover { background: #e5e5e7; }
+
+/* ---------------------------------------------------------------------------
+   管理界面：项目列表
+   --------------------------------------------------------------------------- */
+.page-header {
+  display: flex; justify-content: space-between; align-items: center;
+  margin-bottom: 16px; padding-bottom: 12px;
+  border-bottom: 1px solid #e5e5e7;
+}
+.page-header h1 { margin: 0; }
+.back-link {
+  color: #0071e3; text-decoration: none; font-size: 13px;
+  display: inline-block; margin-bottom: 8px;
+}
+.back-link:hover { text-decoration: underline; }
+
+button.primary {
+  background: #0071e3; color: #fff; border: none;
+  padding: 10px 18px; border-radius: 6px; font-size: 14px; cursor: pointer;
+}
+button.primary:hover { background: #005bb5; }
+
+#upload-panel {
+  background: #fafafa; border: 1px solid #e5e5e7; border-radius: 8px;
+  padding: 16px; margin-bottom: 16px;
+}
+.form-row { display: flex; gap: 24px; flex-wrap: wrap; }
+.form-actions { display: flex; gap: 8px; margin-top: 4px; }
+.form-actions button[type="button"] {
+  background: #f5f5f7; color: #1d1d1f; border: 1px solid #d2d2d7;
+}
+
+#toolbar {
+  display: flex; gap: 12px; align-items: center;
+  margin-bottom: 16px;
+}
+#search-input { flex: 1; padding: 8px 12px; border: 1px solid #d2d2d7; border-radius: 6px; font-size: 14px; }
+#status-filter { padding: 8px 12px; border: 1px solid #d2d2d7; border-radius: 6px; font-size: 14px; }
+#total-count { color: #6e6e73; font-size: 13px; }
+
+#projects-table {
+  width: 100%; border-collapse: collapse; font-size: 13px;
+}
+#projects-table th, #projects-table td {
+  text-align: left; padding: 10px 8px;
+  border-bottom: 1px solid #e5e5e7;
+}
+#projects-table th {
+  background: #fafafa; color: #6e6e73; font-weight: 500;
+  font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px;
+}
+#projects-table tbody tr:hover { background: #fafafa; }
+.filename-cell { color: #6e6e73; font-family: monospace; font-size: 12px; }
+.time-cell { color: #6e6e73; font-size: 12px; white-space: nowrap; }
+.actions-cell { white-space: nowrap; display: flex; gap: 4px; }
+.action-btn {
+  background: #f5f5f7; color: #0071e3; border: 1px solid #d2d2d7;
+  padding: 4px 10px; border-radius: 4px; font-size: 12px;
+  text-decoration: none; cursor: pointer; display: inline-block;
+}
+.action-btn:hover { background: #e5e5e7; }
+.action-btn.danger { color: #d70015; }
+.action-btn.danger:hover { background: #ffe5e9; }
+
+.status-badge {
+  display: inline-block; padding: 2px 8px; border-radius: 10px;
+  font-size: 11px; font-weight: 500;
+}
+.status-badge.status-pending { background: #f5f5f7; color: #6e6e73; }
+.status-badge.status-running { background: #e3f2ff; color: #0071e3; }
+.status-badge.status-done { background: #e3f9e9; color: #28a745; }
+.status-badge.status-failed { background: #ffe5e9; color: #d70015; }
+
+.project-link {
+  color: #0071e3; text-decoration: none; font-weight: 500;
+}
+.project-link:hover { text-decoration: underline; }
+
+#empty-state {
+  text-align: center; padding: 60px 20px; color: #6e6e73;
+}
+
+.meta { color: #6e6e73; font-size: 12px; margin-left: 12px; }
+.meta code { background: #f5f5f7; padding: 1px 6px; border-radius: 3px; font-size: 12px; }
+
+@media (max-width: 700px) {
+  #projects-table th:nth-child(2),
+  #projects-table td:nth-child(2),
+  #projects-table th:nth-child(6),
+  #projects-table td:nth-child(6) { display: none; }
+}
+
+/* ---------------------------------------------------------------------------
+   批量管理
+   --------------------------------------------------------------------------- */
+.col-check { width: 32px; text-align: center !important; }
+#projects-table td.col-check { text-align: center; }
+#projects-table input[type="checkbox"] {
+  cursor: pointer; width: 16px; height: 16px;
+}
+
+#batch-toolbar {
+  display: flex; align-items: center; gap: 12px;
+  background: #e3f2ff; border: 1px solid #0071e3;
+  border-radius: 6px; padding: 8px 12px;
+  margin-bottom: 12px;
+}
+.batch-info { color: #0071e3; font-size: 13px; }
+.batch-info strong { font-size: 15px; margin: 0 4px; }

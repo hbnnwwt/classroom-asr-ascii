@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+models/
+tmp_models/
+asr/web/uploads/
+asr/web/outputs/
+asr/web/web_state.db*
+out*/
+*.log
+tmp_repro_*.wav
+lecture.mp4
+.pytest_cache/
+.superpowers/

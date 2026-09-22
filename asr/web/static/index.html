@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <title>Classroom ASR · 项目管理</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <main>
+    <header class="page-header">
+      <h1>Classroom ASR</h1>
+      <button id="new-project-btn" type="button" class="primary">+ 新建项目</button>
+    </header>
+
+    <!-- 新建项目表单（默认折叠） -->
+    <section id="upload-panel" hidden>
+      <form id="upload-form">
+        <label>
+          项目名称（可选，留空用文件名）
+          <input type="text" id="project-name-input" placeholder="如：第3章 神经网络" maxlength="80" />
+        </label>
+        <label>
+          音视频文件
+          <input type="file" id="file-input" name="file" accept="video/*,audio/*" required />
+        </label>
+        <div class="form-row">
+          <label>
+            质量档
+            <select id="quality" name="quality">
+              <option value="fast">fast（最快）</option>
+              <option value="balanced" selected>balanced（默认）</option>
+              <option value="high">high</option>
+            </select>
+          </label>
+          <label class="checkbox">
+            <input type="checkbox" id="diarize" name="diarize" />
+            启用说话人分离
+          </label>
+        </div>
+        <div class="form-actions">
+          <button type="submit" id="submit-btn" class="primary">开始转写</button>
+          <button type="button" id="cancel-upload-btn">取消</button>
+        </div>
+      </form>
+    </section>
+
+    <!-- 搜索 + 筛选 -->
+    <section id="toolbar">
+      <input type="search" id="search-input" placeholder="搜索项目名 / 文件名..." />
+      <select id="status-filter">
+        <option value="">全部状态</option>
+        <option value="pending">等待中</option>
+        <option value="running">处理中</option>
+        <option value="done">已完成</option>
+        <option value="failed">失败</option>
+      </select>
+      <span id="total-count" class="meta"></span>
+    </section>
+
+    <!-- 批量操作工具栏（默认隐藏） -->
+    <section id="batch-toolbar" hidden>
+      <span class="batch-info">已选 <strong id="selected-count">0</strong> 项</span>
+      <button id="batch-export-btn" type="button" class="action-btn">📦 导出 ZIP</button>
+      <button id="batch-delete-btn" type="button" class="action-btn danger">🗑 批量删除</button>
+      <button id="batch-clear-btn" type="button" class="action-btn">取消选择</button>
+    </section>
+
+    <!-- 项目列表 -->
+    <section id="projects-panel">
+      <table id="projects-table">
+        <thead>
+          <tr>
+            <th class="col-check"><input type="checkbox" id="select-all" /></th>
+            <th>项目名</th>
+            <th>文件名</th>
+            <th>状态</th>
+            <th>进度</th>
+            <th>段数</th>
+            <th>创建时间</th>
+            <th>操作</th>
+          </tr>
+        </thead>
+        <tbody id="projects-body">
+        </tbody>
+      </table>
+      <div id="empty-state" hidden>
+        <p>暂无项目。点击右上角"+ 新建项目"开始。</p>
+      </div>
+    </section>
+  </main>
+
+  <script src="/static/list.js"></script>
+</body>
+</html>

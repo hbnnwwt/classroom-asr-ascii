@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <title>项目详情 - Classroom ASR</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <main>
+    <header class="page-header">
+      <a href="/" class="back-link">← 返回项目列表</a>
+      <h1 id="project-name">项目详情</h1>
+    </header>
+
+    <div class="layout">
+      <!-- 左栏：状态 + 下载 -->
+      <div class="col-left">
+        <section id="status-panel">
+          <div class="status-row">
+            状态：<strong id="status">-</strong>
+            <span class="meta">· 已用 <strong id="task-elapsed">-</strong></span>
+            <span class="meta">· ID: <code id="task-id"></code></span>
+          </div>
+
+          <ol class="stages" id="stages">
+            <li data-stage="probe"><span class="mark">·</span><span class="label">探测音视频</span><span class="msg"></span></li>
+            <li data-stage="extract"><span class="mark">·</span><span class="label">提取音轨</span><span class="msg"></span></li>
+            <li data-stage="denoise"><span class="mark">·</span><span class="label">降噪</span><span class="msg"></span></li>
+            <li data-stage="asr"><span class="mark">·</span><span class="label">语音识别</span><span class="msg"></span></li>
+            <li data-stage="postprocess"><span class="mark">·</span><span class="label">后处理</span><span class="msg"></span></li>
+            <li data-stage="write"><span class="mark">·</span><span class="label">写输出文件</span><span class="msg"></span></li>
+            <li data-stage="done"><span class="mark">·</span><span class="label">完成</span><span class="msg"></span></li>
+          </ol>
+
+          <div class="progress-bar">
+            <div class="progress-fill" id="progress-fill">0%</div>
+          </div>
+
+          <div id="error" class="error" hidden></div>
+
+          <div id="downloads" hidden>
+            <h3>下载输出</h3>
+            <div class="download-list">
+              <a class="btn" data-fmt="srt">SRT</a>
+              <a class="btn" data-fmt="vtt">VTT</a>
+              <a class="btn" data-fmt="md">MD</a>
+              <a class="btn" data-fmt="txt">TXT</a>
+              <a class="btn" data-fmt="json">JSON</a>
+              <a class="btn" data-fmt="replace.log">replace.log</a>
+            </div>
+          </div>
+        </section>
+      </div>
+
+      <!-- 右栏：实时转写 -->
+      <div class="col-right">
+        <section id="transcript-panel" hidden>
+          <div class="transcript-toolbar">
+            <h3>实时转写 <span id="transcript-count" class="count"></span></h3>
+            <button id="live-toggle" type="button">⏸ 暂停滚动</button>
+          </div>
+          <div id="transcript" class="transcript"></div>
+        </section>
+      </div>
+    </div>
+  </main>
+
+  <script src="/static/task.js"></script>
+</body>
+</html>
