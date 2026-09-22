@@ -11,3 +11,4 @@ tmp_repro_*.wav
 lecture.mp4
 .pytest_cache/
 .superpowers/
+.workbuddy/
