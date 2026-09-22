@@ -21,8 +21,9 @@ from .engines.base import Segment
 # ---------------------------------------------------------------------------
 # ITN 正则兜底（引擎 ITN 不覆盖的部分）
 # ---------------------------------------------------------------------------
-# 二零二五 / 二〇二五 → 2025
-_YEAR_CN_RE = re.compile(r"二[零〇一二三四五六七八九]{3}年?")
+_CN_DIGIT = {"零": "0", "〇": "0", "一": "1", "二": "2", "三": "3", "四": "4",
+             "五": "5", "六": "6", "七": "7", "八": "8", "九": "9"}
+_YEAR_CN_RE = re.compile(r"([零〇一二三四五六七八九]{4})年")
 # 百分号读法："百分之三十" → "30%"
 _PERCENT_CN_RE = re.compile(r"百分之([零〇一二三四五六七八九十百]+)")
 
@@ -58,16 +59,14 @@ def _cn_num_to_int(s: str) -> int | None:
 
 
 def apply_itn(text: str) -> str:
-    """对单条文本做 ITN 正则兜底。引擎已做 ITN 时，多数规则不会触发。"""
-    def _year_sub(m: re.Match) -> str:
-        return "2025"  # 占位：实际年份动态化留作 TODO
-    text = _YEAR_CN_RE.sub(_year_sub, text)
+    """对单条文本做 ITN 正则兜底。只做有把握的转换，宁可不动也不写错。"""
+    text = _YEAR_CN_RE.sub(
+        lambda m: "".join(_CN_DIGIT[c] for c in m.group(1)) + "年", text)
 
     def _pct_sub(m: re.Match) -> str:
         n = _cn_num_to_int(m.group(1))
         return f"{n}%" if n is not None else m.group(0)
-    text = _PERCENT_CN_RE.sub(_pct_sub, text)
-    return text
+    return _PERCENT_CN_RE.sub(_pct_sub, text)
 
 
 # ---------------------------------------------------------------------------

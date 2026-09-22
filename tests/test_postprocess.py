@@ -25,6 +25,17 @@ def test_itn_year_basic():
     assert "2025" in apply_itn("二〇二五年")
 
 
+def test_itn_year_real_conversion():
+    """P0-5：中文年份逐位转换，禁止硬编码。"""
+    assert apply_itn("二〇二三年") == "2023年"
+    assert apply_itn("一九九九年") == "1999年"      # 旧正则不覆盖，一并修
+    assert apply_itn("今年是二零二五年。") == "今年是2025年。"
+
+def test_itn_year_no_false_positive():
+    assert apply_itn("三四千年历史") == "三四千年历史"  # 非 4 位数字串不动
+    assert apply_itn("二五年度") == "二五年度"
+
+
 def test_itn_percent():
     """百分之X → X%"""
     assert apply_itn("增长了百分之三十") == "增长了30%"
