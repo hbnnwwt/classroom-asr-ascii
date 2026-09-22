@@ -324,6 +324,9 @@ def apply(segments: List[Segment], cfg: AppConfig, *, duration_s: float | None =
     应用全部后处理，返回 (新段列表, 替换日志)。
     """
     segs = segments
+    # 0. 换行清洗：段内 \r\n 会破坏 SRT/MD 块结构，入口统一替换为空格
+    segs = [replace(s, text=re.sub(r"[\r\n]+", " ", s.text)) for s in segs]
+
     # 1. ITN
     if cfg.postprocess.itn:
         segs = [replace(s, text=apply_itn(s.text)) for s in segs]

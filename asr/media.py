@@ -58,7 +58,12 @@ def probe(path: Path) -> MediaInfo:
     ]
     proc = run_cmd(cmd, timeout=60, check=True)
     data = json.loads(proc.stdout)
-    duration_s = float(data.get("format", {}).get("duration", 0.0) or 0.0)
+    # duration 可能是 "N/A"/缺失/非法字符串（如 m3u8、损坏文件），统一降级 0.0 不抛异常
+    raw_dur = data.get("format", {}).get("duration")
+    try:
+        duration_s = float(raw_dur) if raw_dur not in (None, "N/A") else 0.0
+    except (TypeError, ValueError):
+        duration_s = 0.0
     audios, videos = [], []
     for s in data.get("streams", []):
         if s.get("codec_type") == "audio":

@@ -94,16 +94,17 @@ def run(
     _progress("probe", 0.05, "探测音视频")
     info = probe(input_path)
 
-    # 2. 抽音轨（视频时）
+    # 2. 音频准备（视频抽轨 / 非 wav 音频转码 / wav 直拷）
     tmpdir = make_tmpdir(prefix="asr-")
     wav: Optional[Path] = None
     try:
-        if input_path.suffix.lower() in {".mp4", ".mkv", ".mov", ".flv", ".ts", ".avi", ".m4v"}:
+        suffix = input_path.suffix.lower()
+        if suffix in {".mp4", ".mkv", ".mov", ".flv", ".ts", ".avi", ".m4v"}:
             audio_track = overrides.get("audio_track", cfg.media.audio_track)
             _progress("extract", 0.10, "提取音轨")
             wav = extract_audio(input_path, tmpdir / "audio.wav", cfg, audio_track=audio_track)
-        else:
-            # 已经是音频，复制到临时 wav 以保证 16k mono
+        elif suffix == ".wav":
+            # wav：复制到临时目录；采样率/通道不符时再转码
             wav = tmpdir / "audio.wav"
             import shutil
             shutil.copy2(input_path, wav)
@@ -112,11 +113,13 @@ def run(
                 import soundfile as sf
                 meta = sf.info(str(wav))
                 if meta.samplerate != cfg.media.sample_rate or meta.channels != cfg.media.channels:
-                    from .media import extract_audio as _ea
-                    # 音频"抽音轨"等价于转码到目标格式
-                    wav = _ea(input_path, wav, cfg, audio_track=0)
+                    wav = extract_audio(input_path, wav, cfg, audio_track=0)
             except Exception:
                 pass
+        else:
+            # mp3/m4a 等音频：ffmpeg 直接转码统一 16k mono（旧 copy2+sf.info 猜测路径不可靠）
+            _progress("extract", 0.10, "转码音频")
+            wav = extract_audio(input_path, tmpdir / "audio.wav", cfg, audio_track=0)
 
         # 3. 可选降噪
         if overrides.get("denoise", cfg.media.denoise):

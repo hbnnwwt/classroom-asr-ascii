@@ -95,7 +95,7 @@ AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg"}
 def iter_inputs(paths: Iterable[Path]) -> List[Path]:
     """
     接受单文件或目录路径，返回所有支持的视频/音频文件（按文件名排序）。
-    - 目录时递归扫描一层（不深入子目录，避免误处理）。
+    - 目录时只扫描第一层（非递归）。
     """
     out: List[Path] = []
     for p in paths:

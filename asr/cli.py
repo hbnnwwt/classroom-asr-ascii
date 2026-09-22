@@ -90,7 +90,7 @@ def check(config: str, with_gpu: bool, strict: bool):
         if cuda_avail:
             click.echo(f"     GPU: {torch.cuda.get_device_name(0)}")
     except ImportError:
-        click.echo("[WARN] torch 未安装（FunASR/Whisper 都需要）")
+        click.echo("[WARN] torch 未安装（FunASR 需要）")
 
     # 4. Python 路径
     click.echo(f"[OK] Python: {sys.version.split()[0]}")
@@ -105,7 +105,7 @@ def check(config: str, with_gpu: bool, strict: bool):
 @main.command()
 @click.argument("input_path", type=click.Path(exists=True, path_type=Path))
 @click.option("-o", "--output-dir", type=click.Path(path_type=Path), default=None)
-@click.option("--engine", type=click.Choice(["funasr", "whisper"]), default=None)
+@click.option("--engine", type=click.Choice(["funasr"]), default=None)
 @click.option("--device", default=None, help="cpu | cuda:0")
 @click.option("--quality", type=click.Choice(["fast", "balanced", "high"]), default=None)
 @click.option("--diarize/--no-diarize", default=None)
@@ -166,7 +166,7 @@ def run(
 @click.argument("inputs", nargs=-1, required=True, type=click.Path(path_type=Path))
 @click.option("-o", "--output-dir", type=click.Path(path_type=Path), required=True)
 @click.option("--workers", type=int, default=None)
-@click.option("--engine", type=click.Choice(["funasr", "whisper"]), default=None)
+@click.option("--engine", type=click.Choice(["funasr"]), default=None)
 @click.option("--quality", type=click.Choice(["fast", "balanced", "high"]), default=None)
 @click.option("--diarize/--no-diarize", default=None)
 @click.option("--formats", default=None)

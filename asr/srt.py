@@ -138,8 +138,8 @@ def write_md(segments: List[Segment], path: Path, *, with_speaker: bool = False)
     for seg in segments:
         ts = fmt_ts(seg.start, srt=True)
         if with_speaker and seg.spk:
-            # spk0 → "说话人0"
-            label = f"说话人{seg.spk.replace('spk', '')}"
+            # spk3 → "说话人3"；diarize 后已是角色名（如"教师"）则原样输出
+            label = seg.spk if not seg.spk.startswith("spk") else f"说话人{seg.spk[3:]}"
             out_lines.append(f"**[{ts}] {label}：** {seg.text}")
         else:
             out_lines.append(f"**[{ts}]** {seg.text}")

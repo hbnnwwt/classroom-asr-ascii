@@ -198,6 +198,16 @@ def test_pipeline_diarize_guard_passes():
     assert any(s.spk for s in out)
 
 
+def test_newline_sanitized_in_apply():
+    """P1-12：段内换行写入 SRT 破坏块结构，入口统一清洗。"""
+    from asr.postprocess import apply as apply_postprocess
+    segs = [Segment(start=0.0, end=1.0, text="第一行\n第二行\r\n第三行")]
+    out, _ = apply_postprocess(segs, _test_cfg(), duration_s=10.0)
+    assert "\n" not in out[0].text
+    assert "\r" not in out[0].text
+    assert "第一行 第二行" in out[0].text
+
+
 def test_validate_timestamps_clamps_overflow():
     """时间戳超出视频时长 → 单段被重新分配到 [0, duration]。"""
     segs = [Segment(start=0.0, end=999.0, text="异常段")]

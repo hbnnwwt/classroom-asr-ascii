@@ -156,6 +156,21 @@ def test_write_md_with_speaker(tmp_path):
     assert "老师好" in text
 
 
+def test_md_label_role_names(tmp_path):
+    """P1-13：spk 已是角色名（教师），不得输出"说话人教师"；spk3 → "说话人3"。"""
+    segs = [Segment(start=0.0, end=1.0, text="上课", spk="教师")]
+    out = tmp_path / "t.md"
+    write_md(segs, out, with_speaker=True)
+    content = out.read_text(encoding="utf-8")
+    assert "说话人教师" not in content and "教师" in content
+    # spkN 形式仍正常映射
+    segs2 = [Segment(start=0.0, end=1.0, text="上课", spk="spk3")]
+    out2 = tmp_path / "t2.md"
+    write_md(segs2, out2, with_speaker=True)
+    content2 = out2.read_text(encoding="utf-8")
+    assert "说话人3" in content2 and "spk3" not in content2
+
+
 def test_write_json_structure(tmp_path):
     out = tmp_path / "test.json"
     segs = [Segment(start=1.0, end=3.0, text="hello", spk="spk0")]
