@@ -6,7 +6,7 @@ FunASR 引擎（默认引擎，**唯一启用**的引擎）。
 - 优先使用 sentence_info（带字级别时间戳 + spk），拿不到退回顶层 timestamp。
 - hotword 参数在 FunASR 1.1+ 已移除，捕获 TypeError 自动降级（不报错）。
 - 高精度模式 --quality high 时把 model 切换到 paraformer_model。
-- 时间戳统一通过 normalize_time_unit 归一为秒。
+- 字符级 timestamp 与文本逐字对齐、按强标点切段；单位（厘秒/秒）用音频总时长交叉验证。
 """
 from __future__ import annotations
 
@@ -18,7 +18,6 @@ from loguru import logger
 
 from .base import ASREngine, Segment
 from ..config import AppConfig
-from ..utils import normalize_time_unit
 
 
 class FunASREngine(ASREngine):
@@ -232,71 +231,58 @@ class FunASREngine(ASREngine):
             except Exception:  # noqa: BLE001
                 pass
 
-        return self._parse_results(results)
+        return self._parse_results(results, duration_s=duration_total)
 
     # ------------------------------------------------------------------
     # 结果解析（统一为 List[Segment]，时间戳归一为秒）
     # ------------------------------------------------------------------
-    def _parse_results(self, results) -> List[Segment]:
-        """
-        FunASR 返回结构（典型）：
-        - results: List[dict]
-        - 每个 dict 含：
-          - "sentence_info": List[{start, end, text, spk?, ...}]   ← 优先
-          - "timestamp": List[[s_ms, e_ms], ...]                    ← 顶层毫秒
-          - "text": str                                            ← 全文文本
+    def _parse_results(self, results, duration_s: float | None = None) -> List[Segment]:
+        """解析 funasr generate() 返回 → List[Segment]（秒）。
+
+        三种形状（funasr 1.4.16）：
+        1. sentence_info（开 spk 时；text 可能为 list，_as_text 归一；
+           start/end 毫秒）
+        2. text + 字符级 timestamp（默认；timestamp 厘秒，逐字对应）
+        3. 仅 text（SenseVoice fast；占满 [0, duration] 由后处理分摊）
         """
         segments: List[Segment] = []
-        if not results:
-            return segments
-
-        for item in results:
-            # 1) 优先 sentence_info（带 spk）
+        for item in results or []:
             if "sentence_info" in item and item["sentence_info"]:
                 for s in item["sentence_info"]:
-                    start = normalize_time_unit(s.get("start", 0))
-                    end = normalize_time_unit(s.get("end", 0))
                     text = _as_text(s.get("text"))
-                    spk = s.get("spk")
                     if not text:
                         continue
-                    segments.append(
-                        Segment(start=start, end=end, text=text, spk=spk)
-                    )
+                    segments.append(Segment(
+                        start=float(s.get("start", 0)) / 1000.0,
+                        end=float(s.get("end", 0)) / 1000.0,
+                        text=text,
+                        spk=_as_spk(s.get("spk")),
+                    ))
                 continue
 
-            # 2) sentence_info 不存在 → 用顶层 text + token-level timestamp
-            #
-            # Paraformer-large-vad-punc 实测行为（funasr 1.4.16）：
-            # - timestamp 数组长度 = 文本字符数（去标点后），单位是 centisecond（1/100秒）
-            # - 例：[150, 350] = 1.50s ~ 3.50s
-            # - 不带 token→char 对齐；无法精确映射回原文本标点位置
-            #
-            # 当前 P3 实现：如实保留 token-level 数据，作为 Segment 逐字符切分输出。
-            # 短句合并、按标点切分 → 留给 P4 postprocess 处理。
             text = _as_text(item.get("text"))
             ts = item.get("timestamp") or []
             if not text:
                 continue
-
             if not ts:
-                logger.warning("FunASR 返回无时间戳，使用 0 占位")
-                segments.append(Segment(start=0.0, end=0.0, text=text))
+                logger.warning("FunASR 返回无时间戳（fast 模式），整段占满时长")
+                segments.append(Segment(start=0.0, end=duration_s or 0.0, text=text))
                 continue
 
-            # 单位探测：centisecond vs 秒
-            unit_div = _detect_time_unit(ts, text)
+            n_text = sum(1 for c in text if c not in _NO_TS_CHARS and c not in _HARD_PUNCT)
+            if abs(len(ts) - n_text) > 3:
+                logger.warning(
+                    f"timestamp 数({len(ts)})与字符数({n_text})不齐，退回单段"
+                )
+                div = _detect_unit_div(ts, duration_s)
+                segments.append(Segment(
+                    start=float(ts[0][0]) / div,
+                    end=float(ts[-1][1]) / div,
+                    text=text,
+                ))
+                continue
+            segments.extend(_split_by_char_ts(text, ts, duration_s))
 
-            # 字符级 timestamp 是 token 级，无法精确回贴到带标点的原文本。
-            # 当前 P3 实现：整段文本作为 1 个 Segment，时间戳取首尾 token。
-            # 真正的"按标点切分 + 时间戳插值"留 P4 postprocess 处理。
-            start_tok = ts[0]
-            end_tok = ts[-1]
-            start = float(start_tok[0]) / unit_div
-            end = float(end_tok[1]) / unit_div
-            segments.append(Segment(start=start, end=end, text=text))
-
-        # 排序 + 校验
         segments.sort(key=lambda s: (s.start, s.end))
         return segments
 
@@ -321,24 +307,70 @@ def _as_text(v) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 时间单位探测辅助：centisecond vs 秒
+# 说话人归一：funasr 的 spk 可能是 int 或 "spk0" 字符串
 # ---------------------------------------------------------------------------
-def _detect_time_unit(timestamps, text: str) -> float:
+def _as_spk(v) -> Optional[str]:
+    if v is None:
+        return None
+    return str(v) if str(v).startswith("spk") else f"spk{v}"
+
+
+# 强标点：切段边界；弱标点与空白：无 timestamp，对齐时跳过
+_HARD_PUNCT = "。？！；\n"
+_NO_TS_CHARS = set("，、：“”‘’（）()《》\n\r\t ")
+
+
+def _split_by_char_ts(text: str, ts: list, duration_s: float | None) -> List[Segment]:
+    """token 级 timestamp 与字符逐一对齐，按强标点切段。
+
+    funasr 1.4.16 Paraformer 实测（scripts/repro_text_list.py）：timestamp
+    长度 = 去标点后字符数，每项 [start,end] 对应一个汉字。对齐失败的容差
+    由调用方（_parse_results）预检，这里只做逐字消费。
     """
-    探测 Paraformer 返回的 timestamp 单位。
-    - Paraformer-large-vad-punc 实测返回 centisecond（1/100 秒）
-    - 启发式：取所有值的均值，> 30 视为 centisecond（因为 30s 以上的课程极少见）
-      否则视为秒
+    div = _detect_unit_div(ts, duration_s)
+    out: List[Segment] = []
+    buf: list[str] = []
+    t0 = t1 = None
+    ti = 0
+    for ch in text:
+        if ch in _HARD_PUNCT:
+            if buf:
+                buf.append(ch)
+                out.append(Segment(start=t0 / div, end=t1 / div, text="".join(buf)))
+                buf, t0 = [], None
+            continue
+        if ch in _NO_TS_CHARS:
+            continue
+        if ti >= len(ts):
+            buf.append(ch)              # 时间戳耗尽：残余文本留给收尾并入
+            continue
+        s, e = ts[ti]
+        ti += 1
+        if t0 is None:
+            t0 = s
+        t1 = e
+        buf.append(ch)
+    if buf and t0 is not None:
+        out.append(Segment(start=t0 / div, end=t1 / div, text="".join(buf)))
+    elif buf and out:                   # 时间戳耗尽的残余并入末段，不丢文本
+        last = out[-1]
+        out[-1] = Segment(start=last.start, end=last.end, text=last.text + "".join(buf))
+    return [s for s in out if s.text.strip()]
+
+
+def _detect_unit_div(ts: list, duration_s: float | None) -> float:
+    """证据判定 timestamp 单位：厘秒(100) 还是秒(1)。
+
+    Paraformer-large 实测返回厘秒（[5080,5320] = 50.80s）。用音频总时长做
+    交叉验证，取代旧的"均值>30"启发式（P1-5：前 30 秒静音即误判）。
     """
-    if not timestamps:
+    if not ts:
         return 1.0
-    vals = []
-    for s, e in timestamps[:20]:  # 抽前 20 段足够
-        vals.append(float(s))
-        vals.append(float(e))
-    if not vals:
-        return 1.0
-    avg = sum(vals) / len(vals)
-    if avg > 30:
-        return 100.0   # centisecond
-    return 1.0         # 已是秒
+    last_end = float(ts[-1][1])
+    if duration_s and duration_s > 0:
+        # 原值本身 ≤ 时长×1.5 → 只能是秒（厘秒原值 ≈ 秒数×100，读成厘秒
+        # 会比时长小两个数量级但也"放得下"，故以"按秒读放得下"优先判秒）
+        if last_end <= duration_s * 1.5:
+            return 1.0
+        return 100.0                    # 厘秒为实测默认；两者皆超界也按厘秒兜底
+    return 100.0 if last_end > 3600 else 1.0

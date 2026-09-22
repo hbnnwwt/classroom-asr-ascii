@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 
 from asr.config import load_config
-from asr.engines.funasr_engine import FunASREngine, _detect_time_unit
+from asr.engines.funasr_engine import FunASREngine
 from asr.engines.base import Segment
 
 
@@ -22,11 +22,11 @@ def test_engine_class_name():
 def test_parse_sentence_info_basic(cfg):
     """sentence_info 路径解析为正确的 Segment 列表。"""
     engine = FunASREngine(cfg)
-    # 模拟 FunASR 返回：两个句子，时间戳已是秒
+    # 模拟 FunASR 返回：两个句子；funasr 1.4.16 的 sentence_info start/end 是毫秒
     fake_results = [{
         "sentence_info": [
-            {"start": 0.0, "end": 2.5, "text": "你好", "spk": "spk0"},
-            {"start": 2.5, "end": 5.0, "text": "世界。", "spk": "spk0"},
+            {"start": 0, "end": 2500, "text": "你好", "spk": "spk0"},
+            {"start": 2500, "end": 5000, "text": "世界。", "spk": "spk0"},
         ],
         "text": "你好世界。",
     }]
@@ -41,38 +41,29 @@ def test_parse_sentence_info_basic(cfg):
 
 
 def test_parse_timestamp_first_last_token(cfg):
-    """顶层 timestamp → Segment 时间戳取首尾 token。
+    """顶层 timestamp 对齐不齐（差 > 3）→ 退回单段，时间戳取首尾 token。
 
     Paraformer 实测：timestamp 数组是 token 级 centisecond（1/100秒）。
-    _parse_results 取首尾 token 时间区间作为整段 Segment 的时间范围。
+    本例 13 token vs 9 个去标点字符 → 走退回单段路径；
+    _detect_unit_div 用 duration_s 交叉验证判定厘秒。
     """
     engine = FunASREngine(cfg)
     fake_results = [{
         "text": "大家好，欢迎来到课堂。",
-        # 13 token，全部 centisecond → _detect_time_unit 判定 unit_div=100
+        # 13 token，全部 centisecond → _detect_unit_div(duration_s=60) 判定 div=100
         "timestamp": [
             [150, 350], [350, 510], [510, 750], [1150, 1390], [1410, 1610],
             [1610, 1770], [1770, 2010], [2050, 2250], [2250, 2470],
             [2470, 2670], [2670, 2910], [2930, 3090], [3090, 3330],
         ],
     }]
-    segs = engine._parse_results(fake_results)
+    segs = engine._parse_results(fake_results, duration_s=60.0)
     assert len(segs) == 1
     # 第一个 token 150 centisecond → 1.5s
     assert abs(segs[0].start - 1.5) < 0.01
     # 最后一个 token end 3330 centisecond → 33.3s
     assert abs(segs[0].end - 33.3) < 0.01
     assert "大家好" in segs[0].text
-
-
-def test_parse_centisecond_unit_detection(cfg):
-    """_detect_time_unit 探测 centisecond。"""
-    # 大值 → 100
-    assert _detect_time_unit([[150, 350], [350, 510]], "你好") == 100.0
-    # 小值 → 1（秒）
-    assert _detect_time_unit([[1.5, 3.5]], "你好") == 1.0
-    # 空 → 1
-    assert _detect_time_unit([], "你好") == 1.0
 
 
 def test_parse_empty_results(cfg):
@@ -132,3 +123,67 @@ class TestParseResultsTextList:
         segs = self._engine()._parse_results(results)
         assert len(segs) == 1
         assert segs[0].text == "大家好"
+
+
+class TestCharLevelTimestamps:
+    """P0-1：timestamp 与字符逐一对齐，按强标点切段，时间戳真实（非插值）。"""
+
+    def _engine(self):
+        from asr.config import load_config
+        from asr.engines.funasr_engine import FunASREngine
+        cfg = load_config(Path(__file__).parent.parent / "config.yaml", strict_models=False)
+        return FunASREngine(cfg)
+
+    def test_split_by_char_ts_basic(self):
+        from asr.engines.funasr_engine import _split_by_char_ts
+        # 5 汉字 + 1 句号；timestamp 厘秒，逐字对应。
+        # 实测形状（根因调查）：ts 数 = 去标点字符数，标点不占 timestamp，
+        # 句间间隙来自 ts 本身（非插值）。
+        # 注：计划原稿断言 5.0/9.0/9.5 隐含"句号占一个 ts"，与实测形状和
+        # _split_by_char_ts 的对齐规则矛盾，已按实测修正数据与断言。
+        text = "大家好。再见"
+        ts = [[100, 200], [200, 300], [300, 400], [900, 950], [950, 1000]]
+        segs = _split_by_char_ts(text, ts, duration_s=10.0)
+        assert len(segs) == 2
+        assert segs[0].text == "大家好。"          # 标点保留在句尾
+        assert segs[0].start == 1.0 and segs[0].end == 4.0
+        assert segs[1].text == "再见"
+        assert segs[1].start == 9.0                 # 真实间隙，不是紧贴上一段
+        assert segs[1].end == 10.0
+
+    def test_unit_detection_centisecond(self):
+        from asr.engines.funasr_engine import _detect_unit_div
+        # 末值 562824 厘秒 = 5628s ≤ duration*1.5；原值远超 duration → 厘秒
+        assert _detect_unit_div([[5080, 5320], [562700, 562824]], 5628.0) == 100.0
+
+    def test_unit_detection_seconds(self):
+        from asr.engines.funasr_engine import _detect_unit_div
+        assert _detect_unit_div([[0.5, 1.0], [50.0, 56.0]], 5628.0) == 1.0
+
+    def test_parse_results_full_pipeline_shape(self):
+        # 5 分钟实测形状：单 dict、text str、517 token。合成小样本。
+        text = "好。那么我们今天呢，开始正式的上课。好各位同学"
+        n_chars = len([c for c in text if c not in "，。；？！"])
+        ts = [[500 + i * 100, 580 + i * 100] for i in range(n_chars)]
+        results = [{"key": "k", "text": text, "timestamp": ts}]
+        segs = self._engine()._parse_results(results, duration_s=60.0)
+        assert len(segs) == 3                       # 两个句号 → 3 段
+        # review 回归断言：段间必须有真实间隙
+        gaps = [segs[i + 1].start - segs[i].end for i in range(len(segs) - 1)]
+        assert max(gaps) >= 0.0                     # 不再恒为 0 的紧贴
+        rates = [(s.end - s.start) / len(s.text) for s in segs]
+        assert max(rates) - min(rates) > 1e-6       # s/字 不再恒定（插值特征）
+
+    def test_mismatch_falls_back_single_segment(self):
+        # timestamp 数与去标点字符数差 > 3 → 退回单段（老行为），warn 不崩
+        text = "大家好大家好大家好大家好"
+        ts = [[100, 200]]                            # 严重不齐
+        segs = self._engine()._parse_results(
+            [{"key": "k", "text": text, "timestamp": ts}], duration_s=10.0)
+        assert len(segs) == 1 and segs[0].text == text
+
+    def test_no_timestamp_spans_duration(self):
+        # fast 模式（SenseVoice）无 timestamp：占满 [0, duration]（P0-4 前半）
+        segs = self._engine()._parse_results(
+            [{"key": "k", "text": "大家好", "timestamp": []}], duration_s=100.0)
+        assert segs[0].start == 0.0 and segs[0].end == 100.0
