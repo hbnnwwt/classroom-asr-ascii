@@ -1,5 +1,6 @@
 """Web UI 单测（FastAPI TestClient + SQLite）。"""
 import json
+from contextlib import closing
 from pathlib import Path
 from unittest.mock import patch
 
@@ -713,3 +714,38 @@ def test_watchdog_updates_last_cb_time(isolated_db):
     assert row["status"] == "running"
     assert abs(row["progress"] - 0.4) < 0.001
     assert row["stage"] == "asr"
+
+
+# ---------------------------------------------------------------------------
+# P0-6：看门狗终态守卫（done 任务不可被改写为 failed）
+# ---------------------------------------------------------------------------
+class TestWatchdog:
+    def test_done_task_not_flipped_by_watchdog(self, isolated_db):
+        """P0-6：任务已 done，看门狗不得改写为 failed。"""
+        from asr.web import _update_task_failed_if_running
+
+        with closing(_db()) as conn:
+            conn.execute("DELETE FROM tasks")
+            conn.execute(
+                "INSERT INTO tasks (id, filename, input_path, output_dir, status, created_at)"
+                " VALUES ('t1','f','i','o','done','2026-01-01')"
+            )
+        flipped = _update_task_failed_if_running("t1", "watchdog fired")
+        assert flipped is False
+        with closing(_db()) as conn:
+            assert conn.execute("SELECT status FROM tasks WHERE id='t1'").fetchone()[0] == "done"
+
+    def test_running_task_flipped_by_watchdog(self, isolated_db):
+        """P0-6：任务 running，看门狗守卫可原子标 failed（SQL 级 WHERE status='running'）。"""
+        from asr.web import _update_task_failed_if_running
+
+        with closing(_db()) as conn:
+            conn.execute("DELETE FROM tasks")
+            conn.execute(
+                "INSERT INTO tasks (id, filename, input_path, output_dir, status, created_at)"
+                " VALUES ('t2','f','i','o','running','2026-01-01')"
+            )
+        flipped = _update_task_failed_if_running("t2", "watchdog fired")
+        assert flipped is True
+        with closing(_db()) as conn:
+            assert conn.execute("SELECT status FROM tasks WHERE id='t2'").fetchone()[0] == "failed"

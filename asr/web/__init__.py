@@ -14,7 +14,7 @@ import json
 import sqlite3
 import threading
 import uuid
-from contextlib import closing
+from contextlib import asynccontextmanager, closing
 from datetime import datetime
 from pathlib import Path
 
@@ -119,6 +119,17 @@ def _update_task(task_id: str, **fields) -> None:
         conn.execute(f"UPDATE tasks SET {cols} WHERE id=?", vals)
 
 
+def _update_task_failed_if_running(task_id: str, error: str) -> bool:
+    """SQL 级终态守卫：仅 running 可被标 failed（done 等终态不可污染）。"""
+    with closing(_db()) as conn:
+        cur = conn.execute(
+            "UPDATE tasks SET status='failed', error=?, ended_at=? "
+            "WHERE id=? AND status='running'",
+            (error, datetime.now().isoformat(timespec="seconds"), task_id),
+        )
+        return cur.rowcount > 0
+
+
 def _read_transcript(json_path) -> str:
     """从 pipeline 输出的 .json 读 segments → JSON 编码（每段含 start/end/text）。
     失败 → 空串。前端伪实时渲染时拿这个数组逐段 fade-in。
@@ -139,15 +150,16 @@ def _read_transcript(json_path) -> str:
 # ---------------------------------------------------------------------------
 # FastAPI app
 # ---------------------------------------------------------------------------
-app = FastAPI(title="Classroom ASR", version="1.0")
-
-
-@app.on_event("startup")
-def _startup() -> None:
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
     _init_db()
     logger.info(f"[web] 数据库: {DB_PATH}")
+    yield
+
+
+app = FastAPI(title="Classroom ASR", version="1.0", lifespan=lifespan)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -502,6 +514,7 @@ def _run_pipeline(
     import time as _t
     last_cb_time = [_t.time()]
     watchdog_exc: list[Exception | None] = [None]
+    stop = threading.Event()
 
     last_stage = [""]  # 闭包：记录上次 callback 的 stage，变了就更新时间戳
 
@@ -515,20 +528,13 @@ def _run_pipeline(
         _update_task(task_id, **fields)
 
     def _watchdog() -> None:
-        while True:
-            _t.sleep(60)
+        while not stop.wait(60):          # wait 兼做 sleep + 可中断
             elapsed = _t.time() - last_cb_time[0]
             if elapsed >= ASR_STALL_TIMEOUT_S:
-                watchdog_exc[0] = RuntimeError(
-                    f"ASR 阶段无回调超过 {int(elapsed // 60)} 分钟，主动终止（防止 FunASR 死锁）"
-                )
-                logger.error(f"[web] 任务 {task_id} 看门狗触发: {watchdog_exc[0]}")
-                _update_task(
-                    task_id,
-                    status="failed",
-                    error=str(watchdog_exc[0]),
-                    ended_at=datetime.now().isoformat(timespec="seconds"),
-                )
+                err = f"ASR 阶段无回调超过 {int(elapsed // 60)} 分钟，主动终止"
+                watchdog_exc[0] = RuntimeError(err)
+                logger.error(f"[web] 任务 {task_id} 看门狗触发: {err}")
+                _update_task_failed_if_running(task_id, str(watchdog_exc[0]))
                 return
 
     threading.Thread(target=_watchdog, daemon=True).start()
@@ -597,6 +603,8 @@ def _run_pipeline(
             error=f"Unexpected: {type(e).__name__}: {e}",
             ended_at=datetime.now().isoformat(timespec="seconds"),
         )
+    finally:
+        stop.set()  # pipeline 结束（成功/失败都算）：停掉看门狗线程
 
 
 def _stream_transcript(task_id: str, segs: list) -> None:
