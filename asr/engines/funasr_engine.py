@@ -6,7 +6,7 @@ FunASR 引擎（默认引擎，**唯一启用**的引擎）。
 - 优先使用 sentence_info（带字级别时间戳 + spk），拿不到退回顶层 timestamp。
 - hotword 参数在 FunASR 1.1+ 已移除，捕获 TypeError 自动降级（不报错）。
 - 高精度模式 --quality high 时把 model 切换到 paraformer_model。
-- 字符级 timestamp 与文本逐字对齐、按强标点切段；单位（厘秒/秒）用音频总时长交叉验证。
+- 字符级 timestamp 与文本逐字对齐、按强标点切段；单位（毫秒/秒）用音频总时长交叉验证。
 """
 from __future__ import annotations
 
@@ -263,7 +263,7 @@ class FunASREngine(ASREngine):
         三种形状（funasr 1.4.16）：
         1. sentence_info（开 spk 时；text 可能为 list，_as_text 归一；
            start/end 毫秒）
-        2. text + 字符级 timestamp（默认；timestamp 厘秒，逐字对应）
+        2. text + 字符级 timestamp（默认；timestamp 毫秒（R12），逐字对应）
         3. 仅 text（SenseVoice fast；占满 [0, duration] 由后处理分摊）
         """
         segments: List[Segment] = []
@@ -345,8 +345,8 @@ def _split_by_char_ts(text: str, ts: list, duration_s: float | None) -> List[Seg
     """token 级 timestamp 与字符逐一对齐，按强标点切段。
 
     funasr 1.4.16 Paraformer 实测（scripts/repro_text_list.py）：timestamp
-    长度 = 去标点后字符数，每项 [start,end] 对应一个汉字。对齐失败的容差
-    由调用方（_parse_results）预检，这里只做逐字消费。
+    长度 = 去标点后字符数，每项 [start,end] 对应一个汉字，单位毫秒（R12）。
+    对齐失败的容差由调用方（_parse_results）预检，这里只做逐字消费。
     """
     div = _detect_unit_div(ts, duration_s)
     out: List[Segment] = []
@@ -380,18 +380,18 @@ def _split_by_char_ts(text: str, ts: list, duration_s: float | None) -> List[Seg
 
 
 def _detect_unit_div(ts: list, duration_s: float | None) -> float:
-    """证据判定 timestamp 单位：厘秒(100) 还是秒(1)。
+    """证据判定 timestamp 单位：毫秒(1000) 还是秒(1)。
 
-    Paraformer-large 实测返回厘秒（[5080,5320] = 50.80s）。用音频总时长做
-    交叉验证，取代旧的"均值>30"启发式（P1-5：前 30 秒静音即误判）。
+    funasr 1.4.16 实测毫秒（R12：300.5s 真机冒烟末值 285440 → 285.44s，
+    全部段落在时长内且单调；旧"厘秒"结论是对老版本带 bug 输出的循环验证，
+    厘秒档从未在真实数据出现，R12 后删除）。
     """
     if not ts:
         return 1.0
     last_end = float(ts[-1][1])
     if duration_s and duration_s > 0:
-        # 原值本身 ≤ 时长×1.5 → 只能是秒（厘秒原值 ≈ 秒数×100，读成厘秒
-        # 会比时长小两个数量级但也"放得下"，故以"按秒读放得下"优先判秒）
+        # 原值 ≤ 时长×1.5 → 按秒读放得下，只能是秒；超界 → 毫秒
         if last_end <= duration_s * 1.5:
             return 1.0
-        return 100.0                    # 厘秒为实测默认；两者皆超界也按厘秒兜底
-    return 100.0 if last_end > 3600 else 1.0
+        return 1000.0
+    return 1.0 if last_end <= 3600 else 1000.0
