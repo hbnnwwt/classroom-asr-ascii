@@ -46,6 +46,20 @@ def build_engine(cfg: AppConfig) -> ASREngine:
     raise RuntimeError(f"未知引擎: {cfg.engine}（当前仅支持 funasr）")
 
 
+def _apply_overrides(cfg: AppConfig, overrides: dict) -> None:
+    """
+    把 CLI 覆盖项中直接影响 AppConfig 顶层的三个键落到 cfg：device / engine / language。
+
+    - None（CLI 未传）跳过，不用 None 覆盖 cfg；
+    - 未知键忽略（既有契约，静默）；
+    - 必须在 build_engine 之前调用，engine 覆盖才能生效。
+    """
+    for key in ("device", "engine", "language"):
+        value = overrides.get(key)
+        if value is not None:
+            setattr(cfg, key, value)
+
+
 def run(
     input_path: Path,
     cfg: AppConfig,
@@ -54,13 +68,14 @@ def run(
 ) -> Result:
     """
     端到端跑一个输入文件。
-    overrides 可覆盖 CLI 临时项：device, quality, diarize, glossary, formats, audio_track, denoise, keep_wav
+    overrides 可覆盖 CLI 临时项：device, engine, language, quality, diarize, glossary, formats, audio_track, denoise, keep_wav
     on_progress(stage, ratio, msg) 可选回调：用于 Web 进度条。
       stage: "probe" | "extract" | "denoise" | "asr" | "postprocess" | "write" | "done"
       ratio: 0.0 - 1.0
       msg:   人类可读的状态描述
     """
     overrides = overrides or {}
+    _apply_overrides(cfg, overrides)  # device/engine/language 落 cfg；须在 build_engine 前
     input_path = Path(input_path)
     if not input_path.exists():
         raise FileNotFoundError(f"输入文件不存在: {input_path}")

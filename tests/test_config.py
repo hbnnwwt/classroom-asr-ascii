@@ -52,3 +52,28 @@ def test_strict_models_missing(tmp_path):
     )
     with pytest.raises(ConfigLoadError):
         load_config(bad, strict_models=True)
+
+
+# ---------------------------------------------------------------------------
+# P0-7：CLI --device/--engine/--language overrides 落到 cfg
+# CLI（asr/cli.py run）组装的 overrides 键即 "device"/"engine"/"language"，
+# 值为字符串；未传的键在 CLI 侧已被 None 过滤，web 侧可能传 None。
+# ---------------------------------------------------------------------------
+def test_overrides_device_engine_language_applied():
+    """P0-7：overrides 里 device/engine/language 必须落到 cfg。"""
+    from asr.pipeline import _apply_overrides
+    cfg = load_config("config.yaml", strict_models=False)
+    assert (cfg.device, cfg.engine, cfg.language) == ("cpu", "funasr", "zh")  # config.yaml 基线
+    _apply_overrides(cfg, {"device": "cuda:0", "engine": "whisper", "language": "en"})
+    assert cfg.device == "cuda:0"
+    assert cfg.engine == "whisper"
+    assert cfg.language == "en"
+
+
+def test_overrides_none_and_unknown_keys_ignored():
+    """P0-7 契约：None（CLI 未传）不覆盖 cfg；未知键静默忽略。"""
+    from asr.pipeline import _apply_overrides
+    cfg = load_config("config.yaml", strict_models=False)
+    _apply_overrides(cfg, {"device": None, "language": None, "nonsense": "x", "quality": "fast"})
+    assert cfg.device == "cpu"
+    assert cfg.language == "zh"
