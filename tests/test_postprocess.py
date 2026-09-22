@@ -156,6 +156,37 @@ def test_merge_short_sentences_merges_leading_soft_punct():
     assert out[0].end == 30.0
 
 
+def _test_cfg():
+    """P0-2 测试用最小 postprocess 配置（复用本文件既有 cfg 构造方式）。"""
+    cfg = load_config("config.yaml", strict_models=False)
+    cfg.postprocess.itn = False
+    cfg.postprocess.merge_short_sentences = True
+    cfg.postprocess.min_sentence_chars = 10
+    cfg.postprocess.max_sentence_chars = 30
+    cfg.postprocess.glossary = ""  # 不读术语表，测试与仓库数据解耦
+    return cfg
+
+
+def test_merge_preserves_spk():
+    """P0-2：merge_short_sentences 不得抹掉 spk，否则 diarize 永不生效。"""
+    segs = [
+        Segment(start=0.0, end=2.0, text="好。", spk="spk0"),
+        Segment(start=2.5, end=5.0, text="老师好。", spk="spk1"),
+    ]
+    out = merge_short_sentences(segs, min_chars=10, max_chars=30)
+    assert any(s.spk for s in out), "postprocess 抹掉了 spk"
+    # 合并段 spk 取字数多数者："老师好。"(4字) > "好。"(2字) → spk1
+    assert out[0].spk == "spk1"
+
+
+def test_pipeline_diarize_guard_passes():
+    """pipeline.py:147 守卫 any(s.spk ...) 在 postprocess 之后仍为 True。"""
+    from asr.postprocess import apply as apply_postprocess
+    segs = [Segment(start=0.0, end=2.0, text="好。", spk="spk0")]
+    out, _ = apply_postprocess(segs, _test_cfg(), duration_s=10.0)
+    assert any(s.spk for s in out)
+
+
 def test_validate_timestamps_clamps_overflow():
     """时间戳超出视频时长 → 单段被重新分配到 [0, duration]。"""
     segs = [Segment(start=0.0, end=999.0, text="异常段")]

@@ -10,7 +10,7 @@ from __future__ import annotations
 import re
 from dataclasses import replace
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 from loguru import logger
 
@@ -182,25 +182,26 @@ def merge_short_sentences(
     segments = cleaned
 
     # 1) 先按强标点切分
-    pieces: List[Tuple[str, float, float]] = []  # (text, seg_start, seg_end)
+    pieces: List[Tuple[str, float, float, Optional[str]]] = []  # (text, seg_start, seg_end, spk)
     for seg in segments:
         for ph in split_by_punct(seg.text):
-            pieces.append((ph, seg.start, seg.end))
+            pieces.append((ph, seg.start, seg.end, seg.spk))
 
-    # 2) 合并过短句
-    merged: List[Tuple[str, float, float]] = []
-    for text, s, e in pieces:
+    # 2) 合并过短句（合并段 spk 取字数多数者）
+    merged: List[Tuple[str, float, float, Optional[str]]] = []
+    for text, s, e, spk in pieces:
         if merged and len(merged[-1][0]) < min_chars:
-            old_text, old_s, old_e = merged[-1]
-            merged[-1] = (old_text + text, old_s, e)
+            old_text, old_s, old_e, old_spk = merged[-1]
+            new_spk = old_spk if len(old_text) >= len(text) else spk
+            merged[-1] = (old_text + text, old_s, e, new_spk)
         else:
-            merged.append((text, s, e))
+            merged.append((text, s, e, spk))
 
-    # 3) 切分过长句（按弱标点）
-    final: List[Tuple[str, float, float]] = []
-    for text, s, e in merged:
+    # 3) 切分过长句（按弱标点）；子片继承原段 spk 不变
+    final: List[Tuple[str, float, float, Optional[str]]] = []
+    for text, s, e, spk in merged:
         if len(text) <= max_chars:
-            final.append((text, s, e))
+            final.append((text, s, e, spk))
             continue
         # 按弱标点切
         parts = re.split(r"([，、])", text)
@@ -211,10 +212,10 @@ def merge_short_sentences(
             if not buf:
                 return
             if buf[0] in _SOFT_PUNCT and final and final[-1][1] == s and final[-1][2] == e:
-                last_text, last_s, last_e = final[-1]
-                final[-1] = (last_text + buf, last_s, last_e)
+                last_text, last_s, last_e, last_spk = final[-1]
+                final[-1] = (last_text + buf, last_s, last_e, last_spk)
             else:
-                final.append((buf, s, e))
+                final.append((buf, s, e, spk))
 
         for p in parts:
             if p in _SOFT_PUNCT:
@@ -241,19 +242,20 @@ def merge_short_sentences(
         while j < len(final) and final[j][1] == orig_s and final[j][2] == orig_e:
             j += 1
         group = final[i:j]
-        total = sum(len(t) for t, _, _ in group)
+        spk = group[0][3]
+        total = sum(len(t) for t, _, _, _ in group)
         if total == 0:
-            for t, _, _ in group:
-                out.append(Segment(start=orig_s, end=orig_e, text=t))
+            for t, _, _, _ in group:
+                out.append(Segment(start=orig_s, end=orig_e, text=t, spk=spk))
         else:
             cursor = orig_s
             span = orig_e - orig_s
-            for t, _, _ in group:
+            for t, _, _, _ in group:
                 ratio = len(t) / total
                 seg_start = cursor
                 seg_end = cursor + span * ratio
                 cursor = seg_end
-                out.append(Segment(start=seg_start, end=seg_end, text=t))
+                out.append(Segment(start=seg_start, end=seg_end, text=t, spk=spk))
         i = j
     return out
 
