@@ -159,6 +159,30 @@ class TestEngineCache:
         cfg_fast._quality_override = "fast"
         assert build_engine(cfg) is not build_engine(cfg_fast)
 
+    def test_different_use_itn_is_different_key(self, cfg):
+        """R15：use_itn/hotword_enabled/batch_size_s/num_workers 影响 generate
+        行为，必须进缓存键——长驻 web 进程改这些配置不需重启即生效。"""
+        from asr.pipeline import build_engine
+        cfg2 = load_config("config.yaml", strict_models=False)
+        cfg2.asr.use_itn = not cfg.asr.use_itn
+        assert build_engine(cfg) is not build_engine(cfg2)
+
+    def test_asr_model_path_mirrors_engine_selection(self, cfg):
+        """R15：_asr_model_path 必须镜像 FunASREngine._load_model 的路径选择
+        （fast → SenseVoice；有 paraformer_model → Paraformer；否则回退），
+        防两侧漂移。"""
+        from asr.pipeline import _asr_model_path
+        # balanced + paraformer_model 已配置 → paraformer（与旧键元素一致）
+        assert _asr_model_path(cfg) == str(cfg.asr.paraformer_model)
+        # fast → 无视 paraformer，直接 SenseVoice（旧键会错记 paraformer 路径）
+        cfg_fast = load_config("config.yaml", strict_models=False)
+        cfg_fast._quality_override = "fast"
+        assert _asr_model_path(cfg_fast) == str(cfg_fast.models.funasr.asr)
+        # 非 fast 且 paraformer 未配置 → 回退 SenseVoice
+        cfg_nop = load_config("config.yaml", strict_models=False)
+        cfg_nop.asr.paraformer_model = None
+        assert _asr_model_path(cfg_nop) == str(cfg_nop.models.funasr.asr)
+
     def test_close_cached_engines_clears_and_rebuilds(self, cfg):
         from asr.pipeline import _ENGINE_CACHE, build_engine, close_cached_engines
         e1 = build_engine(cfg)
@@ -181,6 +205,39 @@ class TestEngineCache:
         _ENGINE_CACHE[("funasr", "seed", "m", "cpu", False)] = RacerEngine()
         close_cached_engines()          # 旧实现在此 RuntimeError
         assert not _ENGINE_CACHE
+
+
+class TestTranscribeGenerateKwargs:
+    """R14：--language 必须真实落到 generate 参数，而不是只改输出元数据。
+
+    不加载真实模型：_loaded=True + 假 model 对象让 _load_model 直接返回；
+    get_wav_duration_s 在 transcribe 内部 from ..media import，patch 模块属性即生效。
+    """
+
+    def test_generate_receives_cfg_language(self, cfg, tmp_path):
+        from unittest.mock import patch
+
+        wav = tmp_path / "a.wav"
+        wav.write_bytes(b"RIFF-fake")
+
+        captured: dict = {}
+
+        class FakeModel:
+            def generate(self, **kwargs):
+                captured.update(kwargs)
+                return [{"text": "大家好", "timestamp": [[0, 300], [300, 600], [600, 900]]}]
+
+        cfg.language = "en"
+        engine = FunASREngine(cfg)
+        engine._model = FakeModel()
+        engine._loaded = True                     # 跳过真实模型加载
+
+        with patch("asr.media.get_wav_duration_s", return_value=5.0):
+            engine.transcribe(wav)
+
+        assert captured["language"] == "en"       # 旧代码硬编码 "zh"
+        assert captured["use_itn"] is cfg.asr.use_itn
+        assert captured["batch_size_s"] == cfg.asr.batch_size_s
 
 
 class TestEnsureAsciiPathJunction:

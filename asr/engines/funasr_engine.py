@@ -219,7 +219,7 @@ class FunASREngine(ASREngine):
         kwargs = dict(
             input=str(wav),
             batch_size_s=self.cfg.asr.batch_size_s,
-            language="zh",
+            language=self.cfg.language,  # R14：--language 真实生效（默认 zh 不变）
             use_itn=self.cfg.asr.use_itn,
             return_spk_res=self.cfg.diarize.enabled,
         )

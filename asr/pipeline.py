@@ -37,26 +37,50 @@ class Result:
     segments_count: int
 
 
-# P1-1 引擎缓存：key = (engine, quality, asr 模型, device, diarize)
+# P1-1 引擎缓存：key = (engine, quality, asr 模型, device, diarize, itn, hotword, batch, workers)
 _ENGINE_CACHE: dict[tuple, ASREngine] = {}
+
+
+def _asr_model_path(cfg: AppConfig) -> str:
+    """与 FunASREngine._load_model 的模型选择完全一致的实际加载路径。
+
+    镜像 funasr_engine._load_model 的三分支：fast → SenseVoice
+    （models.funasr.asr）；否则配了 paraformer_model → Paraformer；
+    都没有 → 回退 SenseVoice。不直接复用引擎内逻辑是刻意的：pipeline
+    已模块级 import engines，反向 import 会成环（也倒置分层）；
+    改动任一侧必须同步另一侧（test_asr_model_path_mirrors_engine_selection 钉住）。
+    """
+    quality = getattr(cfg, "_quality_override", "balanced")
+    if quality == "fast":
+        return str(cfg.models.funasr.asr)
+    if cfg.asr.paraformer_model:
+        return str(cfg.asr.paraformer_model)
+    return str(cfg.models.funasr.asr)
 
 
 def build_engine(cfg: AppConfig, use_cache: bool = True) -> ASREngine:
     """
     按 cfg.engine 创建引擎实例。当前仅支持 funasr。
 
-    P1-1：进程内按 (engine, quality, asr 模型, device, diarize) 缓存引擎，
-    批量/连续上传不再每个文件重载 2GB 模型。FunASREngine 惰性加载
-    （构造函数不碰模型），缓存未加载实例无内存代价；缓存实例的 close()
-    统一由 close_cached_engines() 负责（web lifespan 退出时调用），run()
-    不 close。多线程并发 build 同 key 的良性竞争（后写覆盖）可接受，不加锁。
+    P1-1：进程内按 (engine, quality, asr 模型, device, diarize,
+    use_itn, hotword_enabled, batch_size_s, num_workers) 缓存引擎，
+    批量/连续上传不再每个文件重载 2GB 模型。R15：后四项直接影响
+    generate 行为，必须进键——长驻 web 进程改这些配置即时生效，
+    不需重启。FunASREngine 惰性加载（构造函数不碰模型），缓存未
+    加载实例无内存代价；缓存实例的 close() 统一由 close_cached_engines()
+    负责（web lifespan 退出时调用），run() 不 close。多线程并发 build
+    同 key 的良性竞争（后写覆盖）可接受，不加锁。
     """
     key = (
         cfg.engine,
         getattr(cfg, "_quality_override", "balanced"),
-        str(cfg.asr.paraformer_model or cfg.models.funasr.asr),
+        _asr_model_path(cfg),
         cfg.device,
         cfg.diarize.enabled,
+        cfg.asr.use_itn,
+        cfg.asr.hotword_enabled,
+        cfg.asr.batch_size_s,
+        cfg.num_workers,
     )
     if use_cache and key in _ENGINE_CACHE:
         return _ENGINE_CACHE[key]
