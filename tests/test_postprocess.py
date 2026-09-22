@@ -83,11 +83,16 @@ def test_apply_glossary_no_match_unchanged():
 # ---------------------------------------------------------------------------
 # 断句合并
 # ---------------------------------------------------------------------------
-def test_split_by_punct_hard():
-    """强切分标点：句号/问号/感叹号。"""
-    assert split_by_punct("你好。今天") == ["你好", "今天"]
-    assert split_by_punct("什么？是吗？") == ["什么", "是吗"]
-    assert split_by_punct("没有标点") == ["没有标点"]
+def test_split_by_punct_keeps_punct():
+    """P0-3：强标点必须保留在句尾（旧实现丢弃，转写不可读）。"""
+    assert split_by_punct("你好。今天天气怎么样？") == ["你好。", "今天天气怎么样？"]
+
+def test_split_by_punct_no_trailing_punct():
+    assert split_by_punct("大家好") == ["大家好"]
+
+def test_split_by_punct_leading_punct_dropped():
+    # 句首孤立标点（异常输入）不产生空段/纯标点段
+    assert split_by_punct("。你好") == ["你好"]
 
 
 def test_merge_short_sentences_combines():

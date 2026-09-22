@@ -139,19 +139,22 @@ _SOFT_PUNCT = "，、"
 
 
 def split_by_punct(text: str) -> List[str]:
-    """按强切分标点把文本切成短句。返回的短句**不含**切分标点本身。"""
+    """按强切分标点切段，标点保留在句尾（P0-3：标点是可读性的一部分）。"""
     out: List[str] = []
-    buf = []
+    buf: list[str] = []
     for ch in text:
+        buf.append(ch)
         if ch in _HARD_PUNCT:
-            if buf:
-                out.append("".join(buf).strip())
-                buf = []
-        else:
-            buf.append(ch)
+            piece = "".join(buf).strip()
+            # 纯标点残余（如句首孤立标点）不产出
+            if piece and any(c not in _HARD_PUNCT + _SOFT_PUNCT + " \n" for c in piece):
+                out.append(piece)
+            buf = []
     if buf:
-        out.append("".join(buf).strip())
-    return [s for s in out if s]
+        piece = "".join(buf).strip()
+        if piece:
+            out.append(piece)
+    return out
 
 
 def merge_short_sentences(
@@ -229,14 +232,6 @@ def merge_short_sentences(
 
     # 4) 时间戳按字数比例在 (s, e) 内插值
     out: List[Segment] = []
-    for text, s, e in final:
-        # 简化：等分时间区间（合并后整段按字数线性分配）
-        # 由于多段可能共享 (s, e)，这里只在段内累计比例
-        pass  # 见下方改进
-
-    # 改进版：按段内字数累计插值
-    out = []
-    cur_seg_start_idx = 0
     i = 0
     while i < len(final):
         # 找出属于同一原始段的片段
