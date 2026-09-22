@@ -6,12 +6,15 @@
 """
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 from typing import Literal
 
 import yaml
 from pydantic import BaseModel, Field, field_validator
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -167,16 +170,21 @@ def load_config(
 
 
 def _check_model_paths(cfg: AppConfig) -> None:
-    """启动时校验：缺失就报明确错。"""
-    missing = []
-    for name, p in [
+    """启动时校验：缺失就报明确错。spk（2GB）仅在开启 diarize 时才用得上，按需校验。"""
+    required = [
         ("funasr.asr", cfg.models.funasr.asr),
         ("funasr.vad", cfg.models.funasr.vad),
         ("funasr.punc", cfg.models.funasr.punc),
-        ("funasr.spk", cfg.models.funasr.spk),
-    ]:
-        if not p.exists():
-            missing.append(f"  - {name}: {p}")
+    ]
+    if cfg.diarize.enabled:
+        required.append(("funasr.spk", cfg.models.funasr.spk))
+    elif not cfg.models.funasr.spk.exists():
+        logger.warning(
+            "funasr.spk 模型缺失（%s）。当前未开启 diarize，不阻断；"
+            "如需说话人分离，请先运行 `python scripts/download_models.py` 下载。",
+            cfg.models.funasr.spk,
+        )
+    missing = [f"  - {name}: {p}" for name, p in required if not p.exists()]
     if missing:
         raise ConfigLoadError(
             "模型路径缺失，请先运行 `python scripts/download_models.py` 下载：\n"

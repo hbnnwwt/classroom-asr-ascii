@@ -55,6 +55,67 @@ def test_strict_models_missing(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# P2-8：spk 模型按需校验——只有开启 diarize 才强校验 spk
+# 用户故事：Web 上传可按次关 diarize，没下 2GB spk 模型的用户必须能跑。
+# ---------------------------------------------------------------------------
+def _write_cfg(tmp_path, spk: str, diarize_enabled: bool):
+    """写一个 asr/vad/punc 目录真实存在、spk 可控的 config。"""
+    for name in ("asr", "vad", "punc"):
+        (tmp_path / name).mkdir(exist_ok=True)
+    diarize_block = "diarize:\n  enabled: true\n" if diarize_enabled else ""
+    cfg = tmp_path / "cfg.yaml"
+    cfg.write_text(
+        "models:\n"
+        "  funasr:\n"
+        f"    asr:  {tmp_path / 'asr'}\n"
+        f"    vad:  {tmp_path / 'vad'}\n"
+        f"    punc: {tmp_path / 'punc'}\n"
+        f"    spk:  {spk}\n"
+        "  whisper:\n"
+        "    size: small\n"
+        "    compute_type: int8\n"
+        + diarize_block,
+        encoding="utf-8",
+    )
+    return cfg
+
+
+def test_strict_spk_missing_diarize_off_passes(tmp_path, caplog):
+    """P2-8：strict + diarize 关 + spk 缺失 → 加载成功，只 warning 不阻断。"""
+    import logging
+    cfg_path = _write_cfg(tmp_path, spk=str(tmp_path / "no_spk"), diarize_enabled=False)
+    with caplog.at_level(logging.WARNING, logger="asr.config"):
+        cfg = load_config(cfg_path, strict_models=True)  # 不应抛错
+    assert cfg.diarize.enabled is False
+    warnings = [r for r in caplog.records
+                if r.levelno == logging.WARNING and "spk" in r.getMessage()]
+    assert warnings, "spk 缺失且未开 diarize 时应有一条 warning 日志"
+
+
+def test_strict_spk_missing_diarize_on_raises(tmp_path):
+    """P2-8：strict + diarize 开 + spk 缺失 → 仍抛 ConfigLoadError（行为保留）。"""
+    cfg_path = _write_cfg(tmp_path, spk=str(tmp_path / "no_spk"), diarize_enabled=True)
+    with pytest.raises(ConfigLoadError, match="funasr.spk"):
+        load_config(cfg_path, strict_models=True)
+
+
+def test_strict_spk_present_diarize_on_passes(tmp_path):
+    """P2-8：strict + diarize 开 + spk 存在 → 正常通过。"""
+    spk_dir = tmp_path / "spk"
+    spk_dir.mkdir()
+    cfg_path = _write_cfg(tmp_path, spk=str(spk_dir), diarize_enabled=True)
+    cfg = load_config(cfg_path, strict_models=True)
+    assert cfg.diarize.enabled is True
+
+
+def test_no_strict_all_missing_still_passes(tmp_path):
+    """P2-8（回归）：非 strict 模式完全不校验，路径全缺也不抛。"""
+    cfg_path = _write_cfg(tmp_path, spk=str(tmp_path / "no_spk"), diarize_enabled=True)
+    cfg = load_config(cfg_path, strict_models=False)
+    assert cfg is not None
+
+
+# ---------------------------------------------------------------------------
 # P0-7：CLI --device/--engine/--language overrides 落到 cfg
 # CLI（asr/cli.py run）组装的 overrides 键即 "device"/"engine"/"language"，
 # 值为字符串；未传的键在 CLI 侧已被 None 过滤，web 侧可能传 None。
