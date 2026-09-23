@@ -355,10 +355,12 @@ def _split_by_char_ts(text: str, ts: list, duration_s: float | None) -> List[Seg
     ti = 0
     for ch in text:
         if ch in _HARD_PUNCT:
-            if buf:
+            if buf and t0 is not None:
                 buf.append(ch)
                 out.append(Segment(start=t0 / div, end=t1 / div, text="".join(buf)))
                 buf, t0 = [], None
+            else:
+                buf.append(ch)   # R16：无时间锚的孤立标点并入待收尾处置，不崩不丢
             continue
         if ch in _NO_TS_CHARS:
             buf.append(ch)   # R13：保留字符；不消费 ts 槽位（n_text 对齐口径一致）

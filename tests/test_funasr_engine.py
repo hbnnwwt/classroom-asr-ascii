@@ -394,3 +394,32 @@ class TestCharLevelTimestamps:
         n_out = sum(1 for s in segs for c in s.text if c in soft)
         assert n_in == 5                            # ，：（）、
         assert n_out == n_in
+
+    def test_leading_soft_punct_then_hard_punct_no_crash(self):
+        """终审复审回归：句首孤立软标点（R13 后会进 buf）遇强标点时
+        buf 非空但 t0 is None——旧 flush 直接 t0/div → TypeError（web 500）。
+        期望：不崩、字符守恒、锚定首个 ts。"""
+        from asr.engines.funasr_engine import _split_by_char_ts
+        ts = [[1000, 1200], [2000, 2200], [3000, 3200]]   # 毫秒，div=1000
+        segs = _split_by_char_ts("，。大家好", ts, duration_s=5.0)
+        assert len(segs) == 1
+        assert segs[0].text == "，。大家好"         # 字符守恒
+        assert segs[0].start == 1.0                 # 锚定 ts[0][0] = 1000ms
+
+    def test_unanchored_trailing_punct_merges_into_last(self):
+        """终审复审：句界 flush 后的孤立标点（。，。）无时间锚——走既有
+        收尾并入语义，末段文本以 "。，。" 结尾，不崩不丢。"""
+        from asr.engines.funasr_engine import _split_by_char_ts
+        ts = [[1000, 1200], [2000, 2200], [3000, 3200]]
+        segs = _split_by_char_ts("大家好。，。", ts, duration_s=5.0)
+        assert len(segs) == 1
+        assert segs[0].text == "大家好。，。"        # 并入末段，无丢字
+
+    def test_pure_punct_text_returns_empty(self):
+        """终审复审：纯标点文本（无任何可锚字符）→ 空列表，不崩、
+        不产空段/纯标点段（既有收尾语义对 empty-out 的自然结果）。"""
+        from asr.engines.funasr_engine import _split_by_char_ts
+        ts = [[1000, 1200], [2000, 2200], [3000, 3200]]
+        segs = _split_by_char_ts("，，。", ts, duration_s=5.0)
+        assert segs == []
+        assert all(s.text.strip() for s in segs)    # 不产空文本段
