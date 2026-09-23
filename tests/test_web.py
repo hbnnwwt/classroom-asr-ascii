@@ -198,6 +198,10 @@ def test_static_files(client):
     assert r.status_code == 200
     assert "loadProjects" in r.text
     assert "no-cache" in r.headers.get("Cache-Control", "")
+    r = client.get("/static/theme.js")
+    assert r.status_code == 200
+    assert "theme-toggle" in r.text
+    assert "no-cache" in r.headers.get("Cache-Control", "")
 
 
 def test_static_file_not_found(client):

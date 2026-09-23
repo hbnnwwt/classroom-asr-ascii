@@ -2,8 +2,14 @@
    Classroom ASR —— 设计系统（浅色 / 内网工具 / 离线优先）
    不引外部字体与图标 CDN：系统字体栈 + 内联 SVG。
    =========================================================================== */
+/* ===========================================================================
+   主题机制（三态）：
+   - 无 data-theme          → auto：跟随系统 prefers-color-scheme
+   - data-theme="light/dark" → 用户手动选择（localStorage 记忆），覆盖系统
+   深色变量块有两处（媒体查询 + 强制选择器），CSS 无 mixin，改色需同步。
+   =========================================================================== */
 :root {
-  color-scheme: light dark;  /* 原生控件（select/checkbox/滚动条）跟随主题 */
+  color-scheme: light dark;  /* 原生控件（select/checkbox/滚动条）跟随 */
   --bg: #f5f5f7;            /* 页面底 */
   --surface: #ffffff;       /* 卡片 */
   --surface-2: #fafafa;     /* 次级面 */
@@ -28,10 +34,9 @@
   --focus-ring: 0 0 0 3px rgba(0, 113, 227, 0.25);
 }
 
-/* 深色主题：柔和深灰（笔记应用式），跟随系统 prefers-color-scheme。
-   非终端黑：底色 #161618 起步，不追纯黑 + 荧光色。 */
+/* 深色主题：柔和深灰（笔记应用式）。非终端黑：底 #161618 起步。 */
 @media (prefers-color-scheme: dark) {
-  :root {
+  :root:not([data-theme="light"]) {
     --bg: #161618;
     --surface: #232326;
     --surface-2: #2a2a2e;
@@ -54,6 +59,34 @@
     --focus-ring: 0 0 0 3px rgba(64, 156, 255, 0.35);
   }
 }
+
+/* 手动深色（无视系统设置）——变量与上面媒体查询块同步维护 */
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #161618;
+  --surface: #232326;
+  --surface-2: #2a2a2e;
+  --border: #38383c;
+  --border-strong: #4a4a4f;
+  --text: #f5f5f7;
+  --text-2: #a1a1a6;
+  --text-3: #98989d;
+  --accent: #409cff;
+  --accent-btn: #2b7fd4;
+  --accent-hover: #1a66b0;
+  --accent-bg: #1a2f45;
+  --ok: #30d158;
+  --ok-bg: #1d3326;
+  --ok-strong: #248a3d;
+  --err: #ff6961;
+  --err-bg: #3d2224;
+  --disabled-bg: #55555a;
+  --shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
+  --focus-ring: 0 0 0 3px rgba(64, 156, 255, 0.35);
+}
+
+/* 手动浅色（系统深色时强制浅）——变量继承 :root 默认，只需锁控件配色 */
+:root[data-theme="light"] { color-scheme: light; }
 
 * { box-sizing: border-box; }
 
@@ -264,6 +297,16 @@ button.primary:hover:not(:disabled) { background: var(--accent-hover); }
   border-bottom: 1px solid var(--border);
 }
 .page-header h1 { margin: 0; font-size: 22px; }
+/* header 右侧操作组（主题切换 + 主按钮） */
+.header-actions { display: flex; align-items: center; gap: 8px; }
+/* 主题切换：图标幽灵按钮（默认内容是 HTML 里的显示器图标，JS 按当前态替换） */
+.theme-toggle {
+  background: var(--bg); color: var(--accent);
+  border: 1px solid var(--border-strong);
+  width: 40px; min-height: 40px; padding: 0;
+}
+.theme-toggle:hover { background: var(--border); }
+.theme-toggle svg.icon { width: 18px; height: 18px; }
 .back-link {
   color: var(--accent); text-decoration: none; font-size: 13px;
   display: inline-flex; align-items: center; gap: 5px;

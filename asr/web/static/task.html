@@ -5,6 +5,13 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>项目详情 - Classroom ASR</title>
   <link rel="stylesheet" href="/static/style.css" />
+  <!-- 首帧前应用已存的主题选择，避免闪一下错误配色（theme.js 见 body 末尾） -->
+  <script>
+    try {
+      var t = localStorage.getItem("theme");
+      if (t === "dark" || t === "light") document.documentElement.setAttribute("data-theme", t);
+    } catch (e) { /* localStorage 不可用就跟随系统 */ }
+  </script>
 </head>
 <body>
   <main>
@@ -15,6 +22,11 @@
           返回项目列表
         </a>
         <h1 id="project-name">项目详情</h1>
+      </div>
+      <div class="header-actions">
+        <button id="theme-toggle" type="button" class="theme-toggle" aria-label="切换主题">
+          <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8"/><path d="M12 17v4"/></svg>
+        </button>
       </div>
     </header>
 
@@ -77,6 +89,7 @@
     </div>
   </main>
 
+  <script src="/static/theme.js"></script>
   <script src="/static/task.js"></script>
 </body>
 </html>
