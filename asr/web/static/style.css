@@ -3,6 +3,7 @@
    不引外部字体与图标 CDN：系统字体栈 + 内联 SVG。
    =========================================================================== */
 :root {
+  color-scheme: light dark;  /* 原生控件（select/checkbox/滚动条）跟随主题 */
   --bg: #f5f5f7;            /* 页面底 */
   --surface: #ffffff;       /* 卡片 */
   --surface-2: #fafafa;     /* 次级面 */
@@ -11,17 +12,47 @@
   --text: #1d1d1f;
   --text-2: #6e6e73;
   --text-3: #86868b;
-  --accent: #0071e3;
+  --accent: #0071e3;        /* 文字/链接用 */
+  --accent-btn: #0071e3;    /* 填充底用（深色下与 --accent 分离保白字对比） */
   --accent-hover: #005bb5;
   --accent-bg: #e3f2ff;
   --ok: #28a745;
   --ok-bg: #e8f9ee;
+  --ok-strong: #34c759;     /* 白字填充底（进度条/完成勾） */
   --err: #d70015;
   --err-bg: #ffe5e9;
+  --disabled-bg: #999;
   --radius: 10px;
   --radius-sm: 6px;
   --shadow: 0 1px 3px rgba(0, 0, 0, 0.06);
   --focus-ring: 0 0 0 3px rgba(0, 113, 227, 0.25);
+}
+
+/* 深色主题：柔和深灰（笔记应用式），跟随系统 prefers-color-scheme。
+   非终端黑：底色 #161618 起步，不追纯黑 + 荧光色。 */
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #161618;
+    --surface: #232326;
+    --surface-2: #2a2a2e;
+    --border: #38383c;
+    --border-strong: #4a4a4f;
+    --text: #f5f5f7;
+    --text-2: #a1a1a6;
+    --text-3: #98989d;
+    --accent: #409cff;      /* 深底上的链接/图标：亮一档保 4.5:1 */
+    --accent-btn: #2b7fd4;  /* 按钮填充底：压暗一档保白字对比 */
+    --accent-hover: #1a66b0;
+    --accent-bg: #1a2f45;
+    --ok: #30d158;
+    --ok-bg: #1d3326;
+    --ok-strong: #248a3d;
+    --err: #ff6961;
+    --err-bg: #3d2224;
+    --disabled-bg: #55555a;
+    --shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
+    --focus-ring: 0 0 0 3px rgba(64, 156, 255, 0.35);
+  }
 }
 
 * { box-sizing: border-box; }
@@ -82,13 +113,13 @@ input[type="text"]:focus, input[type="search"]:focus, select:focus {
 }
 
 button {
-  background: var(--accent); color: #fff; border: none;
+  background: var(--accent-btn); color: #fff; border: none;
   border-radius: var(--radius-sm);
   padding: 10px 16px; font-size: 14px; cursor: pointer;
   display: inline-flex; align-items: center; gap: 7px; justify-content: center;
   transition: background 0.15s, box-shadow 0.15s;
 }
-button:disabled { background: #999; cursor: not-allowed; }
+button:disabled { background: var(--disabled-bg); cursor: not-allowed; }
 button.primary { font-weight: 500; }
 button.primary:hover:not(:disabled) { background: var(--accent-hover); }
 
@@ -129,10 +160,10 @@ button.primary:hover:not(:disabled) { background: var(--accent-hover); }
 .stages li.active {
   background: var(--accent-bg); border-left-color: var(--accent); color: var(--text);
 }
-.stages li.active .mark { background: var(--accent); color: #fff; animation: pulse 1.2s infinite; }
+.stages li.active .mark { background: var(--accent-btn); color: #fff; animation: pulse 1.2s infinite; }
 .stages li.active .label { color: var(--accent); }
 .stages li.done { color: var(--text); }
-.stages li.done .mark { background: #34c759; color: #fff; }
+.stages li.done .mark { background: var(--ok-strong); color: #fff; }
 
 /* 阶段进行中：脉冲动画 */
 @keyframes pulse {
@@ -146,7 +177,7 @@ button.primary:hover:not(:disabled) { background: var(--accent-hover); }
   margin-bottom: 12px;
 }
 .progress-fill {
-  height: 100%; background: #34c759; width: 0%;
+  height: 100%; background: var(--ok-strong); width: 0%;
   display: flex; align-items: center; justify-content: center;
   color: #fff; font-size: 12px; transition: width 0.3s;
 }
@@ -219,7 +250,7 @@ button.primary:hover:not(:disabled) { background: var(--accent-hover); }
 .btn:hover { background: var(--border); }
 /* 主下载（SRT 是字幕场景的默认产物，视觉提级） */
 .btn.btn-primary {
-  background: var(--accent); color: #fff; border-color: var(--accent);
+  background: var(--accent-btn); color: #fff; border-color: var(--accent-btn);
   font-weight: 500; padding: 9px 16px;
 }
 .btn.btn-primary:hover { background: var(--accent-hover); border-color: var(--accent-hover); }
@@ -259,10 +290,10 @@ button.primary:hover:not(:disabled) { background: var(--accent-hover); }
 .dropzone.dragover {
   border-color: var(--accent); background: var(--accent-bg);
 }
-.dropzone.has-file { border-style: solid; border-color: #34c759; background: var(--ok-bg); }
+.dropzone.has-file { border-style: solid; border-color: var(--ok-strong); background: var(--ok-bg); }
 .dropzone svg.icon { width: 28px; height: 28px; color: var(--text-3); }
 .dropzone.dragover svg.icon, .dropzone:hover svg.icon { color: var(--accent); }
-.dropzone.has-file svg.icon { color: #34c759; }
+.dropzone.has-file svg.icon { color: var(--ok-strong); }
 .dz-main { font-size: 14px; color: var(--text); }
 .dz-sub { font-size: 12px; color: var(--text-3); }
 .dropzone input[type="file"] {
@@ -282,6 +313,8 @@ button.primary:hover:not(:disabled) { background: var(--accent-hover); }
   margin-bottom: 16px;
 }
 #search-input { flex: 1; }
+/* 搜索框与下拉高度对齐（原生 select 内容高不同，min-height 统一） */
+#toolbar input, #toolbar select { min-height: 40px; }
 
 #projects-table {
   width: 100%; border-collapse: collapse; font-size: 13px;
