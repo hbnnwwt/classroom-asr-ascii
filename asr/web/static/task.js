@@ -291,12 +291,25 @@ function renderStages(stage, msg, stageStartedAt, taskStartedAt) {
 }
 
 /**
+ * "现在"的有效值：任务终态（done/failed）后时间冻结在 ended_at，
+ * 所有计时（任务级 + 阶段级）随之停走，不再随真实时间增长。
+ */
+function effectiveNowMs() {
+  return taskEndTimeMs || Date.now();
+}
+
+/**
  * 当前阶段消息区显示：原始消息 + 已用秒数。
  * 例如："提取音轨 · 已用 5s"
  * 阶段切换时由 renderStages 重置计时。
  */
 function updateStageMsg(li, baseMsg) {
-  const secs = Math.floor((Date.now() - stageStartTime) / 1000);
+  const secs = Math.max(0, Math.floor((effectiveNowMs() - stageStartTime) / 1000));
+  if (secs <= 0) {
+    // 没有可展示的已用时间（阶段刚开始，或终态后 0 时长的 done 阶段）：只显示消息
+    li.querySelector(".msg").textContent = baseMsg || "";
+    return;
+  }
   const elapsed = secs < 60 ? `${secs}s` : `${Math.floor(secs / 60)}m${secs % 60}s`;
   li.querySelector(".msg").textContent = baseMsg ? `${baseMsg} · ${elapsed}` : elapsed;
 }
@@ -309,8 +322,7 @@ function updateTaskElapsed(t) {
   if (taskElapsedTimer) clearInterval(taskElapsedTimer);
   if (taskStartTimeMs > 0) {
     const render = () => {
-      const endMs = taskEndTimeMs || Date.now();
-      const secs = Math.max(0, Math.floor((endMs - taskStartTimeMs) / 1000));
+      const secs = Math.max(0, Math.floor((effectiveNowMs() - taskStartTimeMs) / 1000));
       $("task-elapsed").textContent = formatDuration(secs);
     };
     render();
@@ -331,6 +343,12 @@ function startElapsedTicker() {
   if (elapsedTimer) clearInterval(elapsedTimer);
   elapsedTimer = setInterval(() => {
     if (!currentStage) return;
+    // 终态：阶段计时已冻结，ticker 自停（否则 done 阶段的 li 永远 active，永不退出）
+    if (taskStatus === "done" || taskStatus === "failed") {
+      clearInterval(elapsedTimer);
+      elapsedTimer = null;
+      return;
+    }
     const li = document.querySelector(`#stages li[data-stage="${currentStage}"]`);
     if (li && li.classList.contains("active")) {
       // 保留 baseMsg：通过 dataset 缓存
