@@ -216,7 +216,9 @@ def write_all(
 ) -> dict[str, Path]:
     """根据 cfg.formats 写出一组文件，返回 {format: path}。"""
     base_path = Path(base_path)
-    ensure_dir(base_path.parent if base_path.suffix else base_path)
+    # 只需保证父目录存在。base 无后缀时旧代码 ensure_dir(base_path) 会在
+    # 输出目录里建一个与文件同名的空目录（outputs/<task>/<stem>/），纯垃圾。
+    ensure_dir(base_path.parent)
     written: dict[str, Path] = {}
     if "srt" in cfg.formats:
         p = base_path.with_suffix(".srt")

@@ -170,11 +170,96 @@ class FunASREngine(ASREngine):
     # ------------------------------------------------------------------
     # 转写主入口
     # ------------------------------------------------------------------
+    # 长音频切片长度（秒）。funasr AutoModel 的长音频合并路径不可信：
+    # 实测 94 分钟整跑 → 全文无标点 + timestamp 与字符数严重不齐（退回单段）；
+    # 15 分钟同一音频两次运行 ts 数 2778/517 随机跳变。≤300s 短路径
+    # （每字 ts + PUNC + 对齐）经真机冒烟反复验证稳定。故长音频在引擎侧
+    # 自行切片、逐片走短路径、时间戳按偏移拼接。代价：每 5 分钟一个切缝，
+    # 切缝处可能损失约一个词。
+    CHUNK_S = 300
+
     def transcribe(
         self,
         wav: Path,
         hotwords: Optional[List[str]] = None,
         on_progress: Optional["Callable[[float, str], None]"] = None,
+    ) -> List[Segment]:
+        """
+        转写一个 wav 文件。超过 CHUNK_S 自动切片转写（见 CHUNK_S 注释）。
+        on_progress(ratio: 0~1, msg)：FunASR 每处理完一个 batch 触发一次，
+        用于 UI 显示"已识别 X%"。回调失败不影响主流程。
+        """
+        wav = Path(wav)
+        if not wav.exists():
+            raise FileNotFoundError(f"输入 wav 不存在: {wav}")
+
+        from ..media import get_wav_duration_s
+        duration_total = get_wav_duration_s(wav)
+
+        if duration_total > self.CHUNK_S:
+            return self._transcribe_chunked(wav, duration_total, hotwords, on_progress)
+        return self._transcribe_one(wav, duration_total, hotwords, on_progress)
+
+    def _transcribe_chunked(
+        self,
+        wav: Path,
+        duration_total: float,
+        hotwords: Optional[List[str]],
+        on_progress: Optional["Callable[[float, str], None]"],
+    ) -> List[Segment]:
+        """按 CHUNK_S 切片：每片独立跑短路径，时间戳加片偏移后拼接。"""
+        import wave
+
+        try:
+            wf = wave.open(str(wav), "rb")
+        except (wave.Error, EOFError) as e:
+            # 非 PCM wave（理论不应出现）：退回整文件转写，保住可用性
+            logger.warning(f"wave 切片失败（{e}），退回整文件转写: {wav}")
+            return self._transcribe_one(wav, duration_total, hotwords, on_progress)
+
+        segments: List[Segment] = []
+        with wf as w:
+            params = w.getparams()
+            frames_per_chunk = int(params.framerate * self.CHUNK_S)
+            n_chunks = (params.nframes + frames_per_chunk - 1) // frames_per_chunk
+            for ci in range(n_chunks):
+                w.setpos(ci * frames_per_chunk)
+                nfr = min(frames_per_chunk, params.nframes - ci * frames_per_chunk)
+                raw = w.readframes(nfr)
+                chunk_path = wav.with_name(f"{wav.stem}.part{ci}.wav")
+                with wave.open(str(chunk_path), "wb") as ow:
+                    ow.setparams(params._replace(nframes=nfr))
+                    ow.writeframes(raw)
+
+                chunk_dur = nfr / params.framerate
+                offset_s = ci * self.CHUNK_S
+
+                def _cb(ratio: float, msg: str, _off=offset_s, _dur=chunk_dur) -> None:
+                    # 片内 ratio → 全片 ratio；msg 重算成全片口径
+                    if on_progress:
+                        done_s = _off + ratio * _dur
+                        on_progress(
+                            done_s / duration_total,
+                            f"已识别 {int(done_s / duration_total * 100)}%"
+                            f" · ~{int(done_s)}s / {int(duration_total)}s",
+                        )
+
+                try:
+                    part = self._transcribe_one(chunk_path, chunk_dur, hotwords, _cb)
+                finally:
+                    chunk_path.unlink(missing_ok=True)
+                segments.extend(
+                    Segment(start=s.start + offset_s, end=s.end + offset_s, text=s.text, spk=s.spk)
+                    for s in part
+                )
+        return segments
+
+    def _transcribe_one(
+        self,
+        wav: Path,
+        duration_total: float,
+        hotwords: Optional[List[str]],
+        on_progress: Optional["Callable[[float, str], None]"],
     ) -> List[Segment]:
         """
         转写一个 wav 文件。
@@ -211,10 +296,6 @@ class FunASREngine(ASREngine):
                 on_progress(ratio, f"已识别 {int(ratio * 100)}% · ~{secs_done}s / {int(duration_total)}s")
             except Exception:  # noqa: BLE001
                 pass
-
-        # 提前算好总时长（回调里要用）
-        from ..media import get_wav_duration_s
-        duration_total = get_wav_duration_s(wav)
 
         kwargs = dict(
             input=str(wav),
@@ -291,7 +372,10 @@ class FunASREngine(ASREngine):
                 continue
 
             n_text = sum(1 for c in text if c not in _NO_TS_CHARS and c not in _HARD_PUNCT)
-            if abs(len(ts) - n_text) > 3:
+            # 容差：真实课堂语音存在口吃重复/BPE 合并（两字共享一个 ts），
+            # 实测 5 分钟片差 8~26（≈2%）。绝对 3 只对极短音频成立；
+            # 相对 3%（下限 3）覆盖实测分布，超出才退回单段。
+            if abs(len(ts) - n_text) > max(3, int(n_text * 0.03)):
                 logger.warning(
                     f"timestamp 数({len(ts)})与字符数({n_text})不齐，退回单段"
                 )

@@ -423,3 +423,68 @@ class TestCharLevelTimestamps:
         segs = _split_by_char_ts("，，。", ts, duration_s=5.0)
         assert segs == []
         assert all(s.text.strip() for s in segs)    # 不产空文本段
+
+    def test_mismatch_within_relative_tolerance_splits(self):
+        """长音频回归（94 分钟无分段根因之二）：真实课堂语音的 ts 数与
+        字符数存在 ~2% 固有差（口吃重复/BPE 合并两字一 ts）。绝对阈值 3
+        会把 10 分钟以上内容整体打成单段。相对容差 3%（下限 3）内必须
+        正常切段。"""
+        # 1000 汉字、每 20 字一个句号 → n_text=1000（句号不占 ts）
+        unit = "一二三四五六七八九十一二三四五六七八九十"
+        text = "。".join([unit] * 50) + "。"
+        n_text = 50 * 20
+        ts = [[i * 100, i * 100 + 80] for i in range(n_text - 26)]  # 差 26（2.6%）
+        segs = self._engine()._parse_results(
+            [{"key": "k", "text": text, "timestamp": ts}], duration_s=120.0)
+        assert len(segs) == 49                       # 正常切段，不退回单段
+        # （49 而非 50：ts 在 974 处耗尽，最后一个 unit 无时间锚，
+        #  按收尾语义并入前一段——正是设计行为，字符守恒不丢字）
+        assert sum(len(s.text) for s in segs) == len(text)
+
+    def test_transcribe_chunks_long_audio(self, monkeypatch, tmp_path):
+        """长音频回归（94 分钟无标点+单段根因之一）：时长 > CHUNK_S 时
+        引擎侧按 CHUNK_S 切片、逐片转写、时间戳加偏移拼接。
+        不加载真模型：monkeypatch _transcribe_one。"""
+        import wave
+        eng = self._engine()
+        # 造 2 秒 16k 单声道静音 wav
+        wav = tmp_path / "in.wav"
+        with wave.open(str(wav), "wb") as w:
+            w.setnchannels(1); w.setsampwidth(2); w.setframerate(16000)
+            w.writeframes(b"\x00\x00" * 16000 * 2)
+        monkeypatch.setattr(type(eng), "CHUNK_S", 1)
+
+        from asr.engines.funasr_engine import Segment
+        calls = []
+        def fake_one(w, dur, hotwords, cb):
+            calls.append((str(w), dur))
+            cb(1.0, "识别完成")
+            return [Segment(start=0.0, end=0.5, text="甲")]
+        monkeypatch.setattr(eng, "_transcribe_one", fake_one)
+
+        segs = eng.transcribe(wav)
+        assert len(calls) == 2                        # 2s / 1s = 2 片
+        assert [round(c[1], 1) for c in calls] == [1.0, 1.0]
+        assert len(segs) == 2
+        assert segs[0].start == 0.0 and segs[1].start == 1.0   # 偏移拼接
+        assert not list(tmp_path.glob("*.part*.wav"))           # 切片临时文件已清理
+
+    def test_transcribe_short_audio_no_chunking(self, monkeypatch, tmp_path):
+        """>CHUNK_S 才切片：短音频必须直接走单片路径（不产生 .part 文件）。"""
+        import wave
+        eng = self._engine()
+        wav = tmp_path / "in.wav"
+        with wave.open(str(wav), "wb") as w:
+            w.setnchannels(1); w.setsampwidth(2); w.setframerate(16000)
+            w.writeframes(b"\x00\x00" * 16000)        # 1 秒
+
+        from asr.engines.funasr_engine import Segment
+        calls = []
+        def fake_one(w, dur, hotwords, cb):
+            calls.append(str(w))
+            return [Segment(start=0.0, end=0.5, text="乙")]
+        monkeypatch.setattr(eng, "_transcribe_one", fake_one)
+
+        segs = eng.transcribe(wav)
+        assert len(calls) == 1 and calls[0] == str(wav)   # 原文件直达，无切片
+        assert segs[0].text == "乙"
