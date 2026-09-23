@@ -349,10 +349,9 @@ function fmtTs(sec) {
   if (sec == null || isNaN(sec)) return "--:--";
   const h = Math.floor(sec / 3600);
   const m = Math.floor((sec % 3600) / 60);
-  const s = Math.floor(sec % 60);
-  return h > 0
-    ? `${pad(h)}:${pad(m)}:${pad(s)}`
-    : `${pad(m)}:${pad(s)}`;
+  // 十分位精度：相邻段起点常在同 1 秒内（如 60.51/60.81），秒级分不开
+  const s = (sec % 60).toFixed(1).padStart(4, "0");   // "05.3"
+  return h > 0 ? `${pad(h)}:${pad(m)}:${s}` : `${pad(m)}:${s}`;
 }
 const pad = (n) => String(n).padStart(2, "0");
 

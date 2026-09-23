@@ -20,7 +20,8 @@ def test_engine_class_name():
 
 
 def test_parse_sentence_info_basic(cfg):
-    """sentence_info 路径解析为正确的 Segment 列表。"""
+    """sentence_info 降级路径（无字级 timestamp 时，如 fast+diarize）：
+    按句级 start/end 解析为 Segment 列表（毫秒 → 秒）。"""
     engine = FunASREngine(cfg)
     # 模拟 FunASR 返回：两个句子；funasr 1.4.16 的 sentence_info start/end 是毫秒
     fake_results = [{
@@ -64,6 +65,49 @@ def test_parse_timestamp_extra_slots_unconsumed(cfg):
     # 第 9 个（最后消费的）token end 2470 ms → 2.47s；多余 4 槽不消费
     assert abs(segs[0].end - 2.47) < 0.01
     assert "大家好" in segs[0].text
+
+
+def test_parse_diarize_uses_char_ts_with_spk_annotation(cfg):
+    """diarize 主路径回归（真机：勾说话人分离 → 页面 60s 巨段 + 无标点 +
+    字间空格）。开 spk 时顶层 text/timestamp 与 sentence_info **并存**
+    （真机实测），必须走字级 ts 主路径（有标点、正常切段），spk 按时间
+    重叠贴标；不得把 sentence_info 的 VAD 句级粗时间戳 + 无标点 token
+    文本当段来源。"""
+    engine = FunASREngine(cfg)
+    fake_results = [{
+        # 顶层：punc 后文本（_transcribe_vad_sliced 已施加）+ 字级 ts（毫秒）
+        "text": "苹果树把摄像头关了。嗯想一想。",
+        "timestamp": [
+            [5080, 5320], [5320, 5560], [5560, 5800], [5800, 6040], [6040, 6280],
+            [6280, 6520], [6520, 6760], [6760, 7000], [7000, 7240],   # 苹果树把摄像头关了
+            [11800, 12040], [12040, 12280], [12280, 12520],           # 嗯想一想
+        ],
+        "sentence_info": [
+            {"start": 4190, "end": 8800, "text": "苹 果 树", "spk": 0},
+            {"start": 10320, "end": 12280, "text": "把 摄 像 头 关 了", "spk": 1},
+        ],
+    }]
+    segs = engine._parse_results(fake_results, duration_s=60.0)
+    # 主路径切段：强标点分 2 段，文本来自顶层（有标点无空格）
+    assert [s.text for s in segs] == ["苹果树把摄像头关了。", "嗯想一想。"]
+    # spk 按重叠：段1 [5.08,7.24] 落句1 [4.19,8.8] → spk0
+    assert segs[0].spk == "spk0"
+    # 段2 [11.8,12.52] 与句2 [10.32,12.28] 重叠 0.48s（句1 零重叠）→ spk1
+    assert segs[1].spk == "spk1"
+
+
+def test_spk_at_max_overlap():
+    """_spk_at：跨句段取重叠最大的说话人；零重叠返回 None。"""
+    from asr.engines.funasr_engine import _spk_at
+    si = [
+        {"start": 0, "end": 3000, "spk": 0},
+        {"start": 3000, "end": 9000, "spk": 1},
+    ]
+    assert _spk_at(si, 0.5, 2.0) == "spk0"       # 全在句1
+    assert _spk_at(si, 4.0, 6.0) == "spk1"       # 全在句2
+    assert _spk_at(si, 2.9, 3.4) == "spk1"       # 跨界：与句2 重叠 0.4 > 句1 0.1
+    assert _spk_at(si, 9.5, 10.0) is None        # 零重叠
+    assert _spk_at([], 0.0, 1.0) is None         # 空 sentence_info
 
 
 def test_parse_empty_results(cfg):

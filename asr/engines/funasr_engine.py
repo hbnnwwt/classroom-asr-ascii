@@ -9,7 +9,8 @@ FunASR 引擎（默认引擎，**唯一启用**的引擎）。
 - punc 独立调用而非入栈：流式 ct-punc 对特定形状输入会崩（1 字文本两条独立
   死路），独立调用可捕获降级；无 punc 栈输出的原始文本是空格分隔 token 流，
   punc 负责去空格+插标点，_punct_ok 校验字符守恒。
-- 优先使用 sentence_info（带字级别时间戳 + spk），拿不到退回顶层 timestamp。
+- diarize 与否同一条主路径（text+字级 timestamp 切段）；sentence_info
+  仅作 spk 标注层（按时间重叠贴标签）与无字级 ts 时的降级段来源。
 - hotword 参数在 FunASR 1.1+ 已移除，捕获 TypeError 自动降级（不报错）。
 - 高精度模式 --quality high 时把 model 切换到 paraformer_model。
 - 字符级 timestamp 与文本逐字对齐、按强标点切段；单位（毫秒/秒）用音频总时长交叉验证。
@@ -331,8 +332,9 @@ class FunASREngine(ASREngine):
             if not raw:
                 n_empty += 1  # 内层 VAD 丢弃的极短语音（孤字语气词等）
                 continue
-            # punc 在文本层施加；sentence_info（diarize）保留原样——已知局限：
-            # diarize 开启时句文本无标点、说话人标签按片独立编号
+            # punc 在文本层施加（去空格+插标点）；diarize 时 sentence_info
+            # 与顶层 text/timestamp 并存，spk 由 _parse_results 按时间重叠
+            # 贴到主路径切出的段上
             item["text"] = self._punctuate(raw)
             part_segs = self._parse_results([item], duration_s=b - a)
             segments.extend(
@@ -476,34 +478,42 @@ class FunASREngine(ASREngine):
     def _parse_results(self, results, duration_s: float | None = None) -> List[Segment]:
         """解析 funasr generate() 返回 → List[Segment]（秒）。
 
-        三种形状（funasr 1.4.16）：
-        1. sentence_info（开 spk 时；text 可能为 list，_as_text 归一；
-           start/end 毫秒）
-        2. text + 字符级 timestamp（默认；timestamp 毫秒（R12），逐字对应）
-        3. 仅 text（SenseVoice fast；占满 [0, duration] 由后处理分摊）
+        主路径只有一条：text + 字符级 timestamp（timestamp 毫秒（R12），
+        逐字对应）。开 spk（diarize）时顶层 text/timestamp **同样返回**
+        （真机实测 sentence_info 与之并存），spk 作为标注层按时间重叠
+        贴到主路径切出的段上（_spk_at）。
+
+        不用 sentence_info 做段来源：句边界=内层 VAD 段，切片后组内无长
+        静音时整组钉成一"句"（真机 60s 巨段），句文本还是无标点的
+        字间空格 token 流。仅当顶层 timestamp 缺失（fast 模式）时才降级
+        用它的句级时间戳。
+
+        降级链：字级 ts 切段 → sentence_info 句级切段 → 整段占满时长。
         """
         segments: List[Segment] = []
         for item in results or []:
-            if "sentence_info" in item and item["sentence_info"]:
-                for s in item["sentence_info"]:
-                    text = _as_text(s.get("text"))
-                    if not text:
-                        continue
-                    segments.append(Segment(
-                        start=float(s.get("start", 0)) / 1000.0,
-                        end=float(s.get("end", 0)) / 1000.0,
-                        text=text,
-                        spk=_as_spk(s.get("spk")),
-                    ))
-                continue
-
             text = _as_text(item.get("text"))
             ts = item.get("timestamp") or []
-            if not text:
-                continue
+            si = item.get("sentence_info") or []
             if not ts:
-                logger.warning("FunASR 返回无时间戳（fast 模式），整段占满时长")
-                segments.append(Segment(start=0.0, end=duration_s or 0.0, text=text))
+                # 降级：无字级 timestamp（fast 模式，或开 spk 但顶层 text 缺失
+                # 的形状）→ sentence_info 句级时间戳；再没有则整段占满时长
+                if si:
+                    for s in si:
+                        t = _as_text(s.get("text"))
+                        if not t:
+                            continue
+                        segments.append(Segment(
+                            start=float(s.get("start", 0)) / 1000.0,
+                            end=float(s.get("end", 0)) / 1000.0,
+                            text=t,
+                            spk=_as_spk(s.get("spk")),
+                        ))
+                elif text:
+                    logger.warning("FunASR 返回无时间戳（fast 模式），整段占满时长")
+                    segments.append(Segment(start=0.0, end=duration_s or 0.0, text=text))
+                continue
+            if not text:
                 continue
 
             # 旧"ts 数与字符数不齐退回单段"门禁已删：切片架构下 ts 与 text
@@ -511,7 +521,15 @@ class FunASREngine(ASREngine):
             # 拒切会把整片钉成一条 35s 字幕；逐字对齐的漂移 ≤ 失配数×字宽
             # （约 1.5s），远好于不切。ts 耗尽的残余由 _split_by_char_ts
             # 收尾并入末段（守恒不丢字）。
-            segments.extend(_split_by_char_ts(text, ts, duration_s))
+            part = _split_by_char_ts(text, ts, duration_s)
+            if si:
+                # spk 标注层：按时间重叠取最大覆盖句的说话人
+                part = [
+                    Segment(start=s.start, end=s.end, text=s.text,
+                            spk=_spk_at(si, s.start, s.end))
+                    for s in part
+                ]
+            segments.extend(part)
 
         segments.sort(key=lambda s: (s.start, s.end))
         return segments
@@ -547,6 +565,22 @@ def _as_spk(v) -> Optional[str]:
     if v is None:
         return None
     return str(v) if str(v).startswith("spk") else f"spk{v}"
+
+
+def _spk_at(sentences: list, seg_start: float, seg_end: float) -> Optional[str]:
+    """段 [start,end]（秒）的说话人：取 sentence_info 中重叠最大的句子。
+
+    sentence_info 的 start/end 为毫秒（funasr 1.4.16 实测）。段边界来自
+    字级 ts，句子边界来自内层 VAD——一个段可跨句（句间停顿 < _GAP_CUT_S
+    不断段），取重叠最大者即可，零重叠（不应发生）返回 None。
+    """
+    best: Optional[str] = None
+    best_ov = 0.0
+    for s in sentences:
+        ov = min(seg_end, s.get("end", 0) / 1000.0) - max(seg_start, s.get("start", 0) / 1000.0)
+        if ov > best_ov:
+            best, best_ov = _as_spk(s.get("spk")), ov
+    return best
 
 
 # 强标点：切段边界；弱标点与空白：无 timestamp，对齐时不消费 ts 槽位但保留在文本（R13）
