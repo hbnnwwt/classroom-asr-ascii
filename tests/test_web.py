@@ -683,7 +683,7 @@ def test_run_pipeline_writes_transcript_atomically_with_done(isolated_db, monkey
     out_dir = wm.OUTPUT_ROOT / "atom1"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    def _fake_run(input_path, cfg, overrides, on_progress=None):
+    def _fake_run(input_path, cfg, overrides, on_progress=None, on_segments=None):
         """写真实形状的 .json（pipeline 实际产物），返回最小 Result。"""
         j = out_dir / "fake.json"
         j.write_text(json.dumps({"segments": segs}, ensure_ascii=False), encoding="utf-8")
@@ -713,6 +713,66 @@ def test_run_pipeline_writes_transcript_atomically_with_done(isolated_db, monkey
         row = c.execute("SELECT status, transcript FROM tasks WHERE id='atom1'").fetchone()
     assert row["status"] == "done"
     assert json.loads(row["transcript"]) == segs
+
+
+def test_run_pipeline_streams_transcript_incrementally(isolated_db, monkeypatch):
+    """渐进交付：引擎 on_segments 每交付一组 → DB transcript 立即增长
+    （任务 running 时前端轮询就能拿到已识别文字）；done 时最终 .json
+    覆盖（后处理 ITN 改写前缀文本），DB 收敛到最终版。"""
+    import asr.web as wm
+
+    out_dir = wm.OUTPUT_ROOT / "inc1"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    snapshots: list[str] = []          # 每次交付后的 DB transcript 快照
+
+    def _fake_run(input_path, cfg, overrides, on_progress=None, on_segments=None):
+        # 模拟引擎逐组交付两组，随后 pipeline 写最终 json（ITN 改写段0 文本）
+        from asr.engines.base import Segment
+        if on_segments:
+            on_segments([Segment(start=0.1, end=0.9, text="二零二五年。")])
+            with _db() as c:
+                snapshots.append(c.execute(
+                    "SELECT transcript, status FROM tasks WHERE id='inc1'").fetchone()["transcript"])
+            on_segments([Segment(start=2.8, end=3.6, text="第二组。")])
+            with _db() as c:
+                snapshots.append(c.execute(
+                    "SELECT transcript, status FROM tasks WHERE id='inc1'").fetchone()["transcript"])
+        j = out_dir / "fake.json"
+        j.write_text(json.dumps({"segments": [
+            {"start": 0.1, "end": 0.9, "text": "2025年。"},   # ITN 改写
+            {"start": 2.8, "end": 3.6, "text": "第二组。"},
+        ]}, ensure_ascii=False), encoding="utf-8")
+        (out_dir / "fake.srt").write_text("1\n00:00:00,000 --> 00:00:01,000\nx\n", encoding="utf-8")
+        from asr.pipeline import Result
+        return Result(
+            input_path=Path("/tmp/x"), output_dir=out_dir, duration_s=3.6,
+            elapsed_s=0.1, rtf=0.03,
+            written={"srt": out_dir / "fake.srt", "json": j},
+            replace_log=[], segments_count=2,
+        )
+
+    monkeypatch.setattr(wm, "pipeline_run", _fake_run)
+
+    with _db() as c:
+        c.execute(
+            """INSERT INTO tasks (id, filename, input_path, output_dir, status, created_at)
+               VALUES (?, ?, ?, ?, 'pending', ?)""",
+            ("inc1", "x.mp4", "/in/x", str(out_dir), "2026-09-22T00:00:00"),
+        )
+
+    cfg_path = str(Path(__file__).parent.parent / "config.yaml")
+    wm._run_pipeline("inc1", Path("/in/x"), out_dir, cfg_path, diarize=False, quality="balanced")
+
+    # 识别过程中 DB 已有增量文字（前端轮询可见）
+    assert len(json.loads(snapshots[0])) == 1
+    assert json.loads(snapshots[0])[0]["text"] == "二零二五年。"
+    assert len(json.loads(snapshots[1])) == 2
+    # done 后：最终版覆盖（段0 被 ITN 改写）
+    with _db() as c:
+        row = c.execute("SELECT status, transcript FROM tasks WHERE id='inc1'").fetchone()
+    assert row["status"] == "done"
+    final = json.loads(row["transcript"])
+    assert [s["text"] for s in final] == ["2025年。", "第二组。"]
 
 
 def test_read_transcript_missing_file_returns_empty():

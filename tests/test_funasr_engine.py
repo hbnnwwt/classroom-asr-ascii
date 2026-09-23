@@ -634,6 +634,101 @@ class TestVadSlicedTranscribe:
         assert abs(segs[1].start - 2.8) < 0.01 and abs(segs[1].end - 3.6) < 0.01
         assert segs[0].text == "大家好。"
 
+    def test_on_segments_fires_per_group_with_absolute_time(self, tmp_path):
+        """渐进交付：每完成一个 VAD 组，on_segments 收到该组偏移到全片
+        时间轴的段落（组结果即最终结果，可直接渲染）。"""
+        wav = tmp_path / "in.wav"
+        self._make_wav(wav, 4.0)
+
+        class FakeAsr:
+            def generate(self, **kw):
+                return [{"text": "大家好。",
+                         "timestamp": [[100, 400], [400, 700], [700, 900]]}]
+
+        class FakeVad:
+            def generate(self, **kw):
+                # 两组：0-0.5s 与 3.0-3.5s（间隙 2.5s > 2 → 两组）
+                return [{"value": [[0, 500], [3000, 3500]]}]
+
+        class FakePunc:
+            def generate(self, **kw):
+                return [{"text": kw["input"]}]
+
+        eng = self._engine()
+        eng._model = FakeAsr()
+        eng._loaded = True
+        eng._load_vad_model = lambda: FakeVad()
+        eng._load_punc_model = lambda: FakePunc()
+
+        batches: list[list] = []
+        segs = eng.transcribe(wav, on_segments=batches.append)
+
+        assert len(batches) == 2                       # 每组交付一次
+        # 组0：a=0.0 → 局部 [0.1,0.9] 即绝对时间；组1：a=2.7 → [2.8,3.6]
+        assert abs(batches[0][0].start - 0.1) < 0.01 and abs(batches[0][0].end - 0.9) < 0.01
+        assert abs(batches[1][0].start - 2.8) < 0.01 and abs(batches[1][0].end - 3.6) < 0.01
+        assert batches[0][0].text == "大家好。"
+        # 交付累计 == 最终返回（组结果不回炉）
+        assert [s for b in batches for s in b] == segs
+
+    def test_on_segments_exception_does_not_kill_transcription(self, tmp_path):
+        """回调失败不影响主流程（转写照常返回全量段落）。"""
+        wav = tmp_path / "in.wav"
+        self._make_wav(wav, 4.0)
+
+        class FakeAsr:
+            def generate(self, **kw):
+                return [{"text": "大家好。",
+                         "timestamp": [[100, 400], [400, 700], [700, 900]]}]
+
+        class FakeVad:
+            def generate(self, **kw):
+                return [{"value": [[0, 500], [3000, 3500]]}]
+
+        class FakePunc:
+            def generate(self, **kw):
+                return [{"text": kw["input"]}]
+
+        eng = self._engine()
+        eng._model = FakeAsr()
+        eng._loaded = True
+        eng._load_vad_model = lambda: FakeVad()
+        eng._load_punc_model = lambda: FakePunc()
+
+        def boom(segs):
+            raise RuntimeError("callback boom")
+
+        segs = eng.transcribe(wav, on_segments=boom)
+        assert len(segs) == 2                           # 转写未被回调异常杀死
+
+    def test_on_segments_not_fired_on_parachute(self, tmp_path):
+        """降落伞路径（整文件单次转写）无组边界，不触发渐进交付。"""
+        wav = tmp_path / "in.wav"
+        self._make_wav(wav, 1.0)
+
+        class FakeAsr:
+            def generate(self, **kw):
+                return [{"text": "大家好。",
+                         "timestamp": [[100, 400], [400, 700], [700, 900]]}]
+
+        class FakePunc:
+            def generate(self, **kw):
+                return [{"text": kw["input"]}]
+
+        def boom():
+            raise RuntimeError("vad model boom")
+
+        eng = self._engine()
+        eng._model = FakeAsr()
+        eng._loaded = True
+        eng._load_vad_model = boom
+        eng._load_punc_model = lambda: FakePunc()
+
+        batches: list[list] = []
+        segs = eng.transcribe(wav, on_segments=batches.append)
+        assert batches == []                            # 降落伞不交付
+        assert len(segs) == 1                           # 但结果照常返回
+
     def test_transcribe_empty_vad_returns_empty(self, tmp_path):
         """纯静音：VAD 无语音段 → 空结果（不报错、不进降落伞）。"""
         wav = tmp_path / "in.wav"

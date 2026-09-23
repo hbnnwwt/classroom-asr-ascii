@@ -247,6 +247,7 @@ class FunASREngine(ASREngine):
         wav: Path,
         hotwords: Optional[List[str]] = None,
         on_progress: Optional["Callable[[float, str], None]"] = None,
+        on_segments: Optional["Callable[[List[Segment]], None]"] = None,
     ) -> List[Segment]:
         """
         转写一个 wav 文件。统一走 VAD 预切路径（见类常量注释）；
@@ -254,6 +255,10 @@ class FunASREngine(ASREngine):
         单次转写——老合并路径有已知缺陷，但保住可用性。
         on_progress(ratio: 0~1, msg)：转写过程中多次触发，
         用于 UI 显示"已识别 X%"。回调失败不影响主流程。
+        on_segments(segs)：**渐进交付**——VAD 预切路径每完成一个组（约
+        30s 墙钟）就把该组段落（已偏移到全片时间轴）交给调用方，组的
+        结果即最终结果不回炉；降落伞路径无组边界，不触发。
+        回调失败不影响主流程。
         """
         wav = Path(wav)
         if not wav.exists():
@@ -263,7 +268,8 @@ class FunASREngine(ASREngine):
         duration_total = get_wav_duration_s(wav)
 
         try:
-            return self._transcribe_vad_sliced(wav, duration_total, hotwords, on_progress)
+            return self._transcribe_vad_sliced(
+                wav, duration_total, hotwords, on_progress, on_segments)
         except Exception as e:  # noqa: BLE001 降落伞：任何预切失败都不让任务归零
             logger.error(
                 f"VAD 预切路径失败（{type(e).__name__}: {e}），退回整文件转写: {wav}"
@@ -276,6 +282,7 @@ class FunASREngine(ASREngine):
         duration_total: float,
         hotwords: Optional[List[str]],
         on_progress: Optional["Callable[[float, str], None]"],
+        on_segments: Optional["Callable[[List[Segment]], None]"] = None,
     ) -> List[Segment]:
         """VAD 预切主路径：独立 VAD 全文检测 → 分组切片 → 逐片转写 → 偏移拼接。"""
         import wave
@@ -337,10 +344,16 @@ class FunASREngine(ASREngine):
             # 贴到主路径切出的段上
             item["text"] = self._punctuate(raw)
             part_segs = self._parse_results([item], duration_s=b - a)
-            segments.extend(
-                Segment(start=s.start + a, end=s.end + a, text=s.text, spk=s.spk)
-                for s in part_segs
-            )
+            part_segs = [Segment(start=s.start + a, end=s.end + a, text=s.text, spk=s.spk)
+                         for s in part_segs]
+            segments.extend(part_segs)
+            if on_segments and part_segs:
+                # 渐进交付：组结果即最终结果（后续只做 postprocess 文本替换，
+                # 不回炉重切），交出去的段落直接可渲染。回调失败不杀转写。
+                try:
+                    on_segments(part_segs)
+                except Exception:  # noqa: BLE001
+                    logger.warning("on_segments 回调失败，忽略", exc_info=True)
 
         if n_empty:
             logger.info(f"{n_empty} 组无有效语音内容（内层 VAD 丢弃，多为孤字语气词）")

@@ -122,6 +122,7 @@ def run(
     cfg: AppConfig,
     overrides: dict | None = None,
     on_progress: Optional["Callable[[str, float, str], None]"] = None,
+    on_segments: Optional["Callable[[list], None]"] = None,
 ) -> Result:
     """
     端到端跑一个输入文件。
@@ -130,6 +131,9 @@ def run(
       stage: "probe" | "extract" | "denoise" | "asr" | "postprocess" | "write" | "done"
       ratio: 0.0 - 1.0
       msg:   人类可读的状态描述
+    on_segments(segs) 可选回调：ASR 渐进交付——引擎每完成一个 VAD 组就
+      交付该组段落（全片时间轴，结果即最终，不回炉）。Web 层用它增量
+      写 transcript，页面在识别过程中就能看到文字。
     """
     overrides = overrides or {}
     _apply_overrides(cfg, overrides)  # device/engine/language 落 cfg；须在 build_engine 前
@@ -204,7 +208,8 @@ def run(
             total_ratio = 0.20 + 0.70 * ratio
             _progress("asr", total_ratio, msg)
 
-        segs = engine.transcribe(wav, hotwords=hotwords, on_progress=_asr_progress)
+        segs = engine.transcribe(wav, hotwords=hotwords, on_progress=_asr_progress,
+                                 on_segments=on_segments)
         elapsed_asr = time.time() - t_asr
         logger.info(f"[pipeline] ASR 完成: {len(segs)} 段, {elapsed_asr:.1f}s")
 

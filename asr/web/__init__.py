@@ -549,7 +549,20 @@ def _run_pipeline(
             "diarize": diarize,
             "quality": quality,
         }
-        result = pipeline_run(input_path, cfg, overrides, on_progress=_cb)
+        # 渐进 transcript：引擎每交付一个 VAD 组的段落就累积写库，前端
+        # 轮询 /status 时在识别过程中就能看到文字（94 分钟课约 2~3 分钟
+        # 出第一段，之后每 ~10s 滚出一组）。组结果即最终结果，无回炉；
+        # done 时仍用最终 .json 覆盖（后处理 ITN/术语替换可能改写文本）。
+        acc: list[dict] = []
+
+        def _on_segs(new_segs) -> None:
+            acc.extend(
+                {"start": s.start, "end": s.end, "text": s.text} for s in new_segs
+            )
+            _update_task(task_id, transcript=json.dumps(acc, ensure_ascii=False))
+
+        result = pipeline_run(input_path, cfg, overrides, on_progress=_cb,
+                              on_segments=_on_segs)
         # pipeline_run 返回前再检查一次看门狗：可能在最后一次 callback 之后卡住
         if watchdog_exc[0] is not None:
             raise watchdog_exc[0]

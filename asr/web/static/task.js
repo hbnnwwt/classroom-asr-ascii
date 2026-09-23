@@ -144,15 +144,22 @@ function updateUI(t) {
 /**
  * 收到新的 transcript JSON：解析成 segments，把未渲染的段全部补上。
  *
- * 后端在任务 done 的同一笔 UPDATE 里写入全量 transcript（见
- * asr/web/__init__.py _run_pipeline），done 即停轮询也不会漏段——
- * 旧版"逐段 fade-in 伪直播"后端线程与前端 done 即停轮询构成竞态，
- * 页面会冻在第一段，已删除。
+ * 识别进行中后端逐组增量写 transcript（见 asr/web/__init__.py _on_segs），
+ * 轮询到的数组 append-only 增长；任务 done 时改用最终 .json 整体覆盖
+ * （后处理 ITN/术语替换可能改写已渲染的文本，甚至丢段）——检测到前缀
+ * 变化就整体重置重绘，否则只补尾部。
  */
 function handleTranscript(transcriptJson) {
   let segs;
   try { segs = JSON.parse(transcriptJson); } catch { return; }
   if (!Array.isArray(segs) || segs.length === 0) return;
+
+  // 前缀变化检测：新数组比已渲染的短，或已渲染位置文本不一致 → done 覆盖
+  let prefixIntact = segs.length >= streamRendered;
+  for (let i = 0; prefixIntact && i < streamRendered; i++) {
+    if (!segs[i] || segs[i].text !== streamSegments[i].text) prefixIntact = false;
+  }
+  if (!prefixIntact) resetTranscriptDom();
 
   streamSegments = segs;
   $("transcript-panel").hidden = false;
@@ -163,6 +170,13 @@ function handleTranscript(transcriptJson) {
   // 渲染完毕：去掉末段的 current 高亮（旧流式路径由停表时清理）
   const cur = document.querySelector(".transcript .line.current");
   if (cur) cur.classList.remove("current");
+}
+
+/** 清空 transcript DOM 与渲染计数（done 覆盖改写前缀时整体重绘用）。 */
+function resetTranscriptDom() {
+  $("transcript").innerHTML = "";
+  streamRendered = 0;
+  collapsedShown = 0;
 }
 
 function renderNextSegment() {
