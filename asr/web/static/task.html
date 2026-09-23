@@ -2,14 +2,20 @@
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>项目详情 - Classroom ASR</title>
   <link rel="stylesheet" href="/static/style.css" />
 </head>
 <body>
   <main>
     <header class="page-header">
-      <a href="/" class="back-link">← 返回项目列表</a>
-      <h1 id="project-name">项目详情</h1>
+      <div>
+        <a href="/" class="back-link">
+          <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M19 12H5"/><path d="m12 19-7-7 7-7"/></svg>
+          返回项目列表
+        </a>
+        <h1 id="project-name">项目详情</h1>
+      </div>
     </header>
 
     <div class="layout">
@@ -41,12 +47,15 @@
           <div id="downloads" hidden>
             <h3>下载输出</h3>
             <div class="download-list">
-              <a class="btn" data-fmt="srt">SRT</a>
+              <a class="btn btn-primary" data-fmt="srt">
+                <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m7 10 5 5 5-5"/><path d="M12 15V3"/></svg>
+                SRT 字幕
+              </a>
+              <a class="btn" data-fmt="txt">TXT</a>
               <a class="btn" data-fmt="vtt">VTT</a>
               <a class="btn" data-fmt="md">MD</a>
-              <a class="btn" data-fmt="txt">TXT</a>
               <a class="btn" data-fmt="json">JSON</a>
-              <a class="btn" data-fmt="replace.log">replace.log</a>
+              <a class="btn" data-fmt="replace.log" title="术语替换日志（调试用）">replace.log</a>
             </div>
           </div>
         </section>
@@ -57,7 +66,10 @@
         <section id="transcript-panel" hidden>
           <div class="transcript-toolbar">
             <h3>实时转写 <span id="transcript-count" class="count"></span></h3>
-            <button id="live-toggle" type="button">⏸ 暂停滚动</button>
+            <button id="live-toggle" type="button" aria-label="暂停或恢复自动滚动">
+              <svg class="icon" viewBox="0 0 24 24" fill="currentColor" stroke="none" aria-hidden="true"><path d="M6 4h4v16H6zM14 4h4v16h-4z"/></svg>
+              暂停滚动
+            </button>
           </div>
           <div id="transcript" class="transcript"></div>
         </section>

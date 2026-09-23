@@ -2,6 +2,7 @@
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Classroom ASR · 项目管理</title>
   <link rel="stylesheet" href="/static/style.css" />
 </head>
@@ -9,7 +10,10 @@
   <main>
     <header class="page-header">
       <h1>Classroom ASR</h1>
-      <button id="new-project-btn" type="button" class="primary">+ 新建项目</button>
+      <button id="new-project-btn" type="button" class="primary">
+        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+        新建项目
+      </button>
     </header>
 
     <!-- 新建项目表单（默认折叠） -->
@@ -19,8 +23,10 @@
           项目名称（可选，留空用文件名）
           <input type="text" id="project-name-input" placeholder="如：第3章 神经网络" maxlength="80" />
         </label>
-        <label>
-          音视频文件
+        <label class="dropzone" id="dropzone">
+          <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m17 8-5-5-5 5"/><path d="M12 3v12"/></svg>
+          <span class="dz-main" id="dz-main">点击选择文件，或拖拽到此处</span>
+          <span class="dz-sub" id="dz-sub">支持 mp4 / mov / mp3 / wav 等音视频</span>
           <input type="file" id="file-input" name="file" accept="video/*,audio/*" required />
         </label>
         <div class="form-row">
@@ -46,8 +52,8 @@
 
     <!-- 搜索 + 筛选 -->
     <section id="toolbar">
-      <input type="search" id="search-input" placeholder="搜索项目名 / 文件名..." />
-      <select id="status-filter">
+      <input type="search" id="search-input" placeholder="搜索项目名 / 文件名..." aria-label="搜索项目" />
+      <select id="status-filter" aria-label="按状态筛选">
         <option value="">全部状态</option>
         <option value="pending">等待中</option>
         <option value="running">处理中</option>
@@ -60,8 +66,14 @@
     <!-- 批量操作工具栏（默认隐藏） -->
     <section id="batch-toolbar" hidden>
       <span class="batch-info">已选 <strong id="selected-count">0</strong> 项</span>
-      <button id="batch-export-btn" type="button" class="action-btn">📦 导出 ZIP</button>
-      <button id="batch-delete-btn" type="button" class="action-btn danger">🗑 批量删除</button>
+      <button id="batch-export-btn" type="button" class="action-btn">
+        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="3" width="20" height="5" rx="1"/><path d="M4 8v11a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8"/><path d="M10 12h4"/></svg>
+        导出 ZIP
+      </button>
+      <button id="batch-delete-btn" type="button" class="action-btn danger">
+        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6h18"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+        批量删除
+      </button>
       <button id="batch-clear-btn" type="button" class="action-btn">取消选择</button>
     </section>
 
@@ -70,7 +82,7 @@
       <table id="projects-table">
         <thead>
           <tr>
-            <th class="col-check"><input type="checkbox" id="select-all" /></th>
+            <th class="col-check"><input type="checkbox" id="select-all" aria-label="全选" /></th>
             <th>项目名</th>
             <th>文件名</th>
             <th>状态</th>
@@ -84,7 +96,12 @@
         </tbody>
       </table>
       <div id="empty-state" hidden>
-        <p>暂无项目。点击右上角"+ 新建项目"开始。</p>
+        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/><path d="M16 13H8"/><path d="M16 17H8"/><path d="M10 9H8"/></svg>
+        <p>还没有转写项目<br />上传一段课堂录音，约 2~3 分钟后就能看到第一段文字。</p>
+        <button type="button" class="primary" id="empty-new-btn">
+          <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+          新建第一个项目
+        </button>
       </div>
     </section>
   </main>

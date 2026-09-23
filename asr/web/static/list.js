@@ -73,12 +73,15 @@ function renderProjects(items) {
     const tdStatus = document.createElement("td");
     tdStatus.innerHTML = `<span class="status-badge status-${p.status}">${STATUS_LABEL[p.status] || p.status}</span>`;
 
-    // 进度
+    // 进度（running/pending 行内迷你进度条；done 全量；failed 无进度）
     const tdProgress = document.createElement("td");
     const pct = Math.round((p.progress || 0) * 100);
     if (p.status === "done") tdProgress.textContent = "100%";
     else if (p.status === "failed") tdProgress.textContent = "—";
-    else tdProgress.textContent = `${pct}%`;
+    else {
+      tdProgress.innerHTML =
+        `<div class="mini-progress"><div class="track"><div class="fill" style="width:${pct}%"></div></div><span class="pct">${pct}%</span></div>`;
+    }
 
     // 段数
     const tdSegs = document.createElement("td");
@@ -96,7 +99,7 @@ function renderProjects(items) {
     if (p.status === "done") {
       const dl = document.createElement("a");
       dl.href = `/download/${p.id}/srt`;
-      dl.textContent = "↓ SRT";
+      dl.innerHTML = '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m7 10 5 5 5-5"/><path d="M12 15V3"/></svg>SRT';
       dl.className = "action-btn";
       dl.title = "下载 SRT 字幕";
       tdActions.appendChild(dl);
@@ -108,9 +111,11 @@ function renderProjects(items) {
       tdActions.appendChild(view);
     }
     const del = document.createElement("button");
-    del.textContent = "🗑";
-    del.className = "action-btn danger";
+    del.type = "button";
+    del.innerHTML = '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6h18"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>';
+    del.className = "action-btn danger icon-only";
     del.title = "删除项目";
+    del.setAttribute("aria-label", `删除项目 ${p.name || p.filename}`);
     del.onclick = () => deleteProject(p);
     tdActions.appendChild(del);
 
@@ -144,20 +149,70 @@ function showError(msg) {
 // ---------------------------------------------------------------------------
 // 新建项目（表单提交）
 // ---------------------------------------------------------------------------
+function openUploadPanel() {
+  $("upload-panel").hidden = false;
+  $("project-name-input").focus();
+}
+
 $("new-project-btn").addEventListener("click", () => {
   const panel = $("upload-panel");
-  panel.hidden = !panel.hidden;
-  if (!panel.hidden) $("file-input").focus();
+  if (panel.hidden) openUploadPanel();
+  else { panel.hidden = true; $("upload-form").reset(); resetDropzone(); }
 });
+
+// 空状态的 CTA 与顶栏按钮同行为
+$("empty-new-btn").addEventListener("click", openUploadPanel);
 
 $("cancel-upload-btn").addEventListener("click", () => {
   $("upload-panel").hidden = true;
   $("upload-form").reset();
+  resetDropzone();
+});
+
+// ---------------------------------------------------------------------------
+// 拖放上传：整个 dropzone 区域可拖可点，选中后展示文件名与大小
+// ---------------------------------------------------------------------------
+const dz = $("dropzone");
+const fileInput = $("file-input");
+
+function fmtSize(bytes) {
+  if (bytes >= 1024 ** 3) return `${(bytes / 1024 ** 3).toFixed(1)} GB`;
+  if (bytes >= 1024 ** 2) return `${(bytes / 1024 ** 2).toFixed(1)} MB`;
+  return `${Math.max(1, Math.round(bytes / 1024))} KB`;
+}
+
+function showFile(file) {
+  $("dz-main").textContent = file ? file.name : "点击选择文件，或拖拽到此处";
+  $("dz-sub").textContent = file ? `${fmtSize(file.size)} · 可重新拖拽替换` : "支持 mp4 / mov / mp3 / wav 等音视频";
+  dz.classList.toggle("has-file", Boolean(file));
+}
+
+function resetDropzone() { showFile(null); }
+
+fileInput.addEventListener("change", () => showFile(fileInput.files[0]));
+
+dz.addEventListener("dragover", (e) => {
+  e.preventDefault();
+  dz.classList.add("dragover");
+});
+dz.addEventListener("dragleave", () => dz.classList.remove("dragover"));
+dz.addEventListener("drop", (e) => {
+  e.preventDefault();
+  dz.classList.remove("dragover");
+  const file = e.dataTransfer.files && e.dataTransfer.files[0];
+  if (!file) return;
+  // 拖入的文件写回 input（类型校验走 accept 同款口径）
+  if (file.type.startsWith("video/") || file.type.startsWith("audio/") || /\.(mp4|mov|mkv|avi|mp3|wav|m4a|aac|flac)$/i.test(file.name)) {
+    fileInput.files = e.dataTransfer.files;
+    showFile(file);
+  } else {
+    alert("不支持的文件类型，请拖入音视频文件");
+  }
 });
 
 $("upload-form").addEventListener("submit", async (e) => {
   e.preventDefault();
-  const file = $("file-input").files[0];
+  const file = fileInput.files[0];
   if (!file) return;
 
   const form = new FormData();
@@ -167,7 +222,7 @@ $("upload-form").addEventListener("submit", async (e) => {
   form.append("diarize", $("diarize").checked ? "true" : "false");
 
   $("submit-btn").disabled = true;
-  $("submit-btn").textContent = "上传中...";
+  $("submit-btn").innerHTML = '<span class="spinner" aria-hidden="true"></span>上传中…';
   try {
     const resp = await fetch("/api/projects", { method: "POST", body: form });
     if (!resp.ok) throw new Error(`上传失败: ${resp.status}`);
@@ -175,6 +230,7 @@ $("upload-form").addEventListener("submit", async (e) => {
     // 收起表单 + 跳到详情
     $("upload-panel").hidden = true;
     $("upload-form").reset();
+    resetDropzone();
     window.location.href = `/task/${data.task_id}`;
   } catch (err) {
     alert(err.message);

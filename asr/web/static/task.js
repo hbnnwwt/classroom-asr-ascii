@@ -1,6 +1,10 @@
 // Vanilla JS：上传 → 轮询 → 阶段可视化 → 转写展示 → 下载
 const $ = (id) => document.getElementById(id);
 
+// 滚动开关按钮的两态内容（内联 SVG 图标 + 文字）
+const LIVE_ON = '<svg class="icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M6 4h4v16H6zM14 4h4v16h-4z"/></svg>暂停滚动';
+const LIVE_OFF = '<svg class="icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M6 4l14 8-14 8z"/></svg>恢复滚动';
+
 const STAGE_ORDER = ["probe", "extract", "denoise", "asr", "postprocess", "write", "done"];
 const MAX_VISIBLE_LINES = 80;    // DOM 中最多保留的段数（防长 transcript 把页面撑爆）
 
@@ -64,7 +68,7 @@ async function restoreLastTask() {
   streamRendered = 0;
   collapsedShown = 0;
   liveMode = true;
-  $("live-toggle").textContent = "⏸ 暂停滚动";
+  $("live-toggle").innerHTML = LIVE_ON;
   startPolling();
 }
 
@@ -234,7 +238,7 @@ function renderNextSegment() {
 /** 暂停/恢复自动滚动 */
 $("live-toggle").addEventListener("click", () => {
   liveMode = !liveMode;
-  $("live-toggle").textContent = liveMode ? "⏸ 暂停滚动" : "▶ 恢复滚动";
+  $("live-toggle").innerHTML = liveMode ? LIVE_ON : LIVE_OFF;
   if (liveMode) {
     // 恢复时立即滚到底
     $("transcript").scrollTop = $("transcript").scrollHeight;
