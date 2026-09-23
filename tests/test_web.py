@@ -221,8 +221,7 @@ def _wait_done(client, task_id, timeout_s=5.0):
 
 def test_upload_creates_task(client, monkeypatch):
     """POST /upload 创建任务并返回 task_id（轮询直到完成）。"""
-    import asr.web as wm
-    monkeypatch.setattr(wm, "_run_pipeline", _run_pipeline_sync_patch)
+    _install_sync_pipeline(monkeypatch)
 
     r = client.post(
         "/upload",
@@ -246,8 +245,7 @@ def test_status_404_unknown_task(client):
 
 def test_download_returns_file(client, monkeypatch):
     """done 任务的输出文件可下载。"""
-    import asr.web as wm
-    monkeypatch.setattr(wm, "_run_pipeline", _run_pipeline_sync_patch)
+    _install_sync_pipeline(monkeypatch)
 
     r = client.post("/upload", files={"file": ("a.mp4", b"X", "video/mp4")})
     task_id = r.json()["task_id"]
@@ -397,8 +395,7 @@ def test_get_project_not_found(client):
 
 def test_create_project(client, monkeypatch):
     """POST /api/projects 创建项目并启动后台任务。"""
-    import asr.web as wm
-    monkeypatch.setattr(wm, "_run_pipeline", _run_pipeline_sync_patch)
+    _install_sync_pipeline(monkeypatch)
 
     r = client.post(
         "/api/projects",
@@ -419,8 +416,7 @@ def test_create_project(client, monkeypatch):
 
 def test_create_project_default_name(client, monkeypatch):
     """不传 name → 用文件名去后缀。"""
-    import asr.web as wm
-    monkeypatch.setattr(wm, "_run_pipeline", _run_pipeline_sync_patch)
+    _install_sync_pipeline(monkeypatch)
 
     r = client.post(
         "/api/projects",
@@ -620,6 +616,34 @@ def test_batch_export_empty_ids(client):
 # ---------------------------------------------------------------------------
 # Helper：同步跑 _run_pipeline（不走后台线程）
 # ---------------------------------------------------------------------------
+class _InlineThread:
+    """threading.Thread 替身：start() 在当前线程直接执行 target。
+
+    端点用 threading.Thread 起 _run_pipeline 后台线程；测试若让线程真跑，
+    它可能活过测试边界，把 UPDATE 写到下一个测试刚切换的 tmp DB
+    （顺序型偶发 sqlite3.OperationalError: no such table）。内联执行后
+    请求返回即全部写完，线程不可能泄漏。
+    """
+
+    def __init__(self, target=None, args=(), daemon=None):
+        self._target, self._args = target, args
+
+    def start(self):
+        self._target(*self._args)
+
+
+def _install_sync_pipeline(monkeypatch):
+    """端点测试统一注入：_run_pipeline 换同步假实现 + asr.web 的 Thread 内联。
+
+    只替换 asr.web 命名空间内的 threading（不动全局 threading 模块，
+    避免影响 TestClient 的 anyio 工作线程）。
+    """
+    import types
+    import asr.web as wm
+    monkeypatch.setattr(wm, "_run_pipeline", _run_pipeline_sync_patch)
+    monkeypatch.setattr(wm, "threading", types.SimpleNamespace(Thread=_InlineThread))
+
+
 def _run_pipeline_sync_patch(task_id, input_path, output_dir, config_path, diarize, quality):
     """monkey-patch 用的同步版：把 _task_id 注入到 overrides 让 fake pipeline_run 能更新 DB。"""
     import asr.web as wm
@@ -644,39 +668,58 @@ def _run_pipeline_sync_patch(task_id, input_path, output_dir, config_path, diari
 
 
 # ---------------------------------------------------------------------------
-# 流式 transcript 推送
+# transcript 与 done 原子写入（回归：页面冻在第一段）
 # ---------------------------------------------------------------------------
-def test_stream_transcript_incremental(isolated_db):
-    """_stream_transcript 应渐进把 segments 写入 DB，最终等于完整数组。
-
-    用最小段数（5）+ monkeypatch 让 interval=0，跑完只花 5×0=0 秒。
+def test_run_pipeline_writes_transcript_atomically_with_done(isolated_db, monkeypatch):
+    """回归（真机：页面只显示第 1 段"(0/1)"，SRT 却完整）：
+    旧版先标 done、再开 _stream_transcript 线程逐段"伪直播"（1004 段要推
+    ~150s），而前端见 done 即停轮询——_run_pipeline 返回时 DB 里只剩
+    推流线程已写到的部分前缀。现在 transcript 与 done 同一笔 UPDATE，
+    _run_pipeline 同步返回时 DB 必须已是终态全量。
     """
     import asr.web as wm
 
-    # 准备 task 记录
+    segs = [{"start": i * 1.0, "end": (i + 1) * 1.0, "text": f"第{i}段。"} for i in range(3)]
+    out_dir = wm.OUTPUT_ROOT / "atom1"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    def _fake_run(input_path, cfg, overrides, on_progress=None):
+        """写真实形状的 .json（pipeline 实际产物），返回最小 Result。"""
+        j = out_dir / "fake.json"
+        j.write_text(json.dumps({"segments": segs}, ensure_ascii=False), encoding="utf-8")
+        (out_dir / "fake.srt").write_text("1\n00:00:00,000 --> 00:00:01,000\nx\n", encoding="utf-8")
+        from asr.pipeline import Result
+        return Result(
+            input_path=Path("/tmp/x"), output_dir=out_dir, duration_s=3.0,
+            elapsed_s=0.1, rtf=0.03,
+            written={"srt": out_dir / "fake.srt", "json": j},
+            replace_log=[], segments_count=len(segs),
+        )
+
+    monkeypatch.setattr(wm, "pipeline_run", _fake_run)
+
     with _db() as c:
         c.execute(
             """INSERT INTO tasks (id, filename, input_path, output_dir, status, created_at)
-               VALUES (?, ?, ?, ?, 'done', ?)""",
-            ("stream1", "x.mp4", "/in/x", "/out/s1", "2026-09-22T00:00:00"),
+               VALUES (?, ?, ?, ?, 'pending', ?)""",
+            ("atom1", "x.mp4", "/in/x", str(out_dir), "2026-09-22T00:00:00"),
         )
 
-    segs = [{"start": i * 1.0, "end": (i + 1) * 1.0, "text": f"段{i}"} for i in range(5)]
+    cfg_path = str(Path(__file__).parent.parent / "config.yaml")
+    wm._run_pipeline("atom1", Path("/in/x"), out_dir, cfg_path, diarize=False, quality="balanced")
 
-    # 替换 _stream_transcript 内部的 time.sleep 跳过等待
-    import time as _time
-    orig_sleep = _time.sleep
-    _time.sleep = lambda s: None  # 跳过所有 sleep
-    try:
-        wm._stream_transcript("stream1", segs)
-    finally:
-        _time.sleep = orig_sleep
-
-    # 跑完：transcript 应为完整 JSON
+    # 同步返回即查：done 与全量 transcript 必须同时可见（无后补窗口）
     with _db() as c:
-        row = c.execute("SELECT transcript FROM tasks WHERE id='stream1'").fetchone()
-    parsed = json.loads(row["transcript"])
-    assert len(parsed) == 5
+        row = c.execute("SELECT status, transcript FROM tasks WHERE id='atom1'").fetchone()
+    assert row["status"] == "done"
+    assert json.loads(row["transcript"]) == segs
+
+
+def test_read_transcript_missing_file_returns_empty():
+    """_read_transcript：json 路径缺失/不存在 → 空串（不抛）。"""
+    from asr.web import _read_transcript
+    assert _read_transcript(None) == ""
+    assert _read_transcript(Path("Z:/nonexistent/x.json")) == ""
 
 
 # ---------------------------------------------------------------------------

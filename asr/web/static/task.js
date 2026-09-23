@@ -1,13 +1,11 @@
-// Vanilla JS：上传 → 轮询 → 阶段可视化 → 伪实时转写 → 下载
+// Vanilla JS：上传 → 轮询 → 阶段可视化 → 转写展示 → 下载
 const $ = (id) => document.getElementById(id);
 
 const STAGE_ORDER = ["probe", "extract", "denoise", "asr", "postprocess", "write", "done"];
-const STREAM_INTERVAL_MS = 600;  // 伪实时：每段间隔
 const MAX_VISIBLE_LINES = 80;    // DOM 中最多保留的段数（防长 transcript 把页面撑爆）
 
 let currentTaskId = null;
 let pollTimer = null;
-let streamTimer = null;
 let streamSegments = [];      // 当前任务的全部分段
 let streamRendered = 0;       // 已渲染到 DOM 的分段数
 let collapsedShown = 0;       // DOM 因 MAX_VISIBLE 被折叠掉的段数
@@ -144,10 +142,12 @@ function updateUI(t) {
 }
 
 /**
- * 收到新的 transcript JSON：
- * - 解析成 segments 数组
- * - 若比已渲染的多，启动 setInterval 逐段 fade-in
- * - 段与段间隔 STREAM_INTERVAL_MS，体验上像流式
+ * 收到新的 transcript JSON：解析成 segments，把未渲染的段全部补上。
+ *
+ * 后端在任务 done 的同一笔 UPDATE 里写入全量 transcript（见
+ * asr/web/__init__.py _run_pipeline），done 即停轮询也不会漏段——
+ * 旧版"逐段 fade-in 伪直播"后端线程与前端 done 即停轮询构成竞态，
+ * 页面会冻在第一段，已删除。
  */
 function handleTranscript(transcriptJson) {
   let segs;
@@ -157,36 +157,15 @@ function handleTranscript(transcriptJson) {
   streamSegments = segs;
   $("transcript-panel").hidden = false;
 
-  if (taskStatus === "done") {
-    // 已完成任务：一次性渲染所有段（不表演流式）
-    while (streamRendered < streamSegments.length) {
-      renderNextSegment();
-    }
-    stopStreaming();
-  } else {
-    // 进行中：流式追加新段
-    if (streamRendered >= segs.length) return;
-    if (!streamTimer) startStreaming();
+  while (streamRendered < streamSegments.length) {
+    renderNextSegment();
   }
-}
-
-function startStreaming() {
-  if (streamTimer) return;
-  streamTimer = setInterval(renderNextSegment, STREAM_INTERVAL_MS);
-}
-
-function stopStreaming() {
-  if (streamTimer) { clearInterval(streamTimer); streamTimer = null; }
+  // 渲染完毕：去掉末段的 current 高亮（旧流式路径由停表时清理）
+  const cur = document.querySelector(".transcript .line.current");
+  if (cur) cur.classList.remove("current");
 }
 
 function renderNextSegment() {
-  if (streamRendered >= streamSegments.length) {
-    stopStreaming();
-    // 最后一段去掉 current 高亮
-    const last = document.querySelector(".transcript .line.current");
-    if (last) last.classList.remove("current");
-    return;
-  }
   const seg = streamSegments[streamRendered];
   const div = document.createElement("div");
   div.className = "line";
@@ -232,11 +211,10 @@ function renderNextSegment() {
     container.scrollTop = container.scrollHeight;
   }
 
-  // 顶部计数器：已显示 / 总段数
+  // 顶部计数器：已显示 / 总段数（先自增再显示，终态 (N/N) 而非差一的 (N-1/N)）
   const total = streamSegments.length;
-  $("transcript-count").textContent = `(${streamRendered}/${total})`;
-
   streamRendered++;
+  $("transcript-count").textContent = `(${streamRendered}/${total})`;
 }
 
 /** 暂停/恢复自动滚动 */

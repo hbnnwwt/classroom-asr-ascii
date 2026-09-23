@@ -562,14 +562,13 @@ def _run_pipeline(
             "formats": list(result.written.keys()),
         }
 
-        # 抽 transcript（从 .json 读 segments 数组）
+        # 抽 transcript（从 .json 读 segments 数组）。必须与 done 同一笔 UPDATE：
+        # 前端见 done 即停止轮询，done 之后再后补的段永远到不了页面。
+        # （旧版 _stream_transcript 线程每 0.15~0.5s 逐段"伪直播"——94 分钟课
+        #  1004 段要推 ~150s，前端早就停轮询，页面冻在第一段。）
         transcript_json = _read_transcript(result.written.get("json"))
-        try:
-            segs = json.loads(transcript_json) if transcript_json else []
-        except Exception:
-            segs = []
 
-        # 标记 done：阶段立刻推进，下载按钮立刻可用
+        # 标记 done：阶段立刻推进，下载按钮立刻可用（transcript 原子一并写入）
         _update_task(
             task_id,
             status="done",
@@ -578,17 +577,8 @@ def _run_pipeline(
             message=f"完成：{result.segments_count} 段",
             ended_at=datetime.now().isoformat(timespec="seconds"),
             meta_json=json.dumps(meta, ensure_ascii=False),
+            transcript=transcript_json,
         )
-
-        # 后台渐进推 transcript：每 300ms 推一段，前端看起来像"实时"
-        if segs:
-            threading.Thread(
-                target=_stream_transcript,
-                args=(task_id, segs),
-                daemon=True,
-            ).start()
-        else:
-            _update_task(task_id, transcript=transcript_json)
 
     except (ConfigLoadError, FileNotFoundError, RuntimeError) as e:
         logger.exception(f"[web] 任务 {task_id} 失败")
@@ -608,26 +598,6 @@ def _run_pipeline(
         )
     finally:
         stop.set()  # pipeline 结束（成功/失败都算）：停掉看门狗线程
-
-
-def _stream_transcript(task_id: str, segs: list) -> None:
-    """后台线程：渐进把 segments 写入 DB，前端轮询时增量渲染。"""
-    import time
-
-    # 根据段数动态间隔：段多间隔短，避免用户等太久
-    if len(segs) <= 20:
-        interval = 0.5
-    elif len(segs) <= 60:
-        interval = 0.3
-    else:
-        interval = 0.15
-
-    for i in range(1, len(segs) + 1):
-        partial = json.dumps(segs[:i], ensure_ascii=False)
-        _update_task(task_id, transcript=partial)
-        time.sleep(interval)
-    # 全部推完：写最终版
-    _update_task(task_id, transcript=json.dumps(segs, ensure_ascii=False))
 
 
 # ---------------------------------------------------------------------------
