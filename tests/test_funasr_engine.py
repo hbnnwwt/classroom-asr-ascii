@@ -40,11 +40,12 @@ def test_parse_sentence_info_basic(cfg):
     assert segs[1].end == 5.0
 
 
-def test_parse_timestamp_first_last_token(cfg):
-    """顶层 timestamp 对齐不齐（差 > 3）→ 退回单段，时间戳取首尾 token。
+def test_parse_timestamp_extra_slots_unconsumed(cfg):
+    """ts 槽位多于字符（13 vs 9）：按序消费前 9 个，尾部多余槽位不消费。
 
-    funasr 1.4.16 实测 timestamp 为毫秒（R12）。本例 13 token vs 9 个去标点
-    字符 → 走退回单段路径；_detect_unit_div 用 duration_s 交叉验证判定毫秒。
+    旧"不齐退回单段"门禁已删（切片架构下 ts/text 同源，失配只是口吃/BPE
+    合并）；funasr 1.4.16 实测 timestamp 为毫秒（R12），
+    _detect_unit_div 用 duration_s 交叉验证判定毫秒。
     """
     engine = FunASREngine(cfg)
     fake_results = [{
@@ -60,8 +61,8 @@ def test_parse_timestamp_first_last_token(cfg):
     assert len(segs) == 1
     # 第一个 token 150 ms → 0.15s
     assert abs(segs[0].start - 0.15) < 0.01
-    # 最后一个 token end 3330 ms → 3.33s
-    assert abs(segs[0].end - 3.33) < 0.01
+    # 第 9 个（最后消费的）token end 2470 ms → 2.47s；多余 4 槽不消费
+    assert abs(segs[0].end - 2.47) < 0.01
     assert "大家好" in segs[0].text
 
 
@@ -210,15 +211,17 @@ class TestEngineCache:
 class TestTranscribeGenerateKwargs:
     """R14：--language 必须真实落到 generate 参数，而不是只改输出元数据。
 
-    不加载真实模型：_loaded=True + 假 model 对象让 _load_model 直接返回；
-    get_wav_duration_s 在 transcribe 内部 from ..media import，patch 模块属性即生效。
+    不加载真实模型：_loaded=True + 假 model；VAD/punc 同样用假加载器
+    （transcribe 走 VAD 预切路径，需要真实 wav 供切片）。
     """
 
     def test_generate_receives_cfg_language(self, cfg, tmp_path):
-        from unittest.mock import patch
+        import wave
 
         wav = tmp_path / "a.wav"
-        wav.write_bytes(b"RIFF-fake")
+        with wave.open(str(wav), "wb") as w:
+            w.setnchannels(1); w.setsampwidth(2); w.setframerate(16000)
+            w.writeframes(b"\x00\x00" * 16000)    # 1 秒静音
 
         captured: dict = {}
 
@@ -227,17 +230,27 @@ class TestTranscribeGenerateKwargs:
                 captured.update(kwargs)
                 return [{"text": "大家好", "timestamp": [[0, 300], [300, 600], [600, 900]]}]
 
+        class FakeVad:
+            def generate(self, **kwargs):
+                return [{"value": [[0, 900]]}]    # 全片一个语音段 → 单组
+
+        class FakePunc:
+            def generate(self, **kwargs):
+                return [{"text": kwargs.get("input")}]
+
         cfg.language = "en"
         engine = FunASREngine(cfg)
         engine._model = FakeModel()
         engine._loaded = True                     # 跳过真实模型加载
+        engine._load_vad_model = lambda: FakeVad()
+        engine._load_punc_model = lambda: FakePunc()
 
-        with patch("asr.media.get_wav_duration_s", return_value=5.0):
-            engine.transcribe(wav)
+        engine.transcribe(wav)
 
         assert captured["language"] == "en"       # 旧代码硬编码 "zh"
         assert captured["use_itn"] is cfg.asr.use_itn
         assert captured["batch_size_s"] == cfg.asr.batch_size_s
+        assert captured["input"].endswith(".grp0.wav")   # VAD 预切：切片入模
 
 
 class TestEnsureAsciiPathJunction:
@@ -346,13 +359,19 @@ class TestCharLevelTimestamps:
         rates = [(s.end - s.start) / len(s.text) for s in segs]
         assert max(rates) - min(rates) > 1e-6       # s/字 不再恒定（插值特征）
 
-    def test_mismatch_falls_back_single_segment(self):
-        # timestamp 数与去标点字符数差 > 3 → 退回单段（老行为），warn 不崩
-        text = "大家好大家好大家好大家好"
-        ts = [[100, 200]]                            # 严重不齐
+    def test_mismatch_short_ts_tail_merges_no_gate(self):
+        """门禁删除回归：ts 少于字符不再退回单段——按序对齐，耗尽后的
+        残余字符并入末段（守恒不丢字）。真机证据：213 ts/223 字的切片
+        曾被钉成一条 35.7s 字幕。"""
+        text = "大家好大家好大家好。再见再见"      # 13 锚定字符，ts 只有 11
+        ts = [[i * 100, i * 100 + 80] for i in range(11)]
         segs = self._engine()._parse_results(
-            [{"key": "k", "text": text, "timestamp": ts}], duration_s=10.0)
-        assert len(segs) == 1 and segs[0].text == text
+            [{"key": "k", "text": text, "timestamp": ts}], duration_s=0.5)
+        assert len(segs) == 2
+        assert segs[0].text == "大家好大家好大家好。"   # 9 字全锚定
+        # 后两个"再见"ts 耗尽 → 并入第二段末尾
+        assert segs[1].text == "再见再见"
+        assert sum(len(s.text) for s in segs) == len(text)
 
     def test_no_timestamp_spans_duration(self):
         # fast 模式（SenseVoice）无 timestamp：占满 [0, duration]（P0-4 前半）
@@ -426,9 +445,9 @@ class TestCharLevelTimestamps:
 
     def test_mismatch_within_relative_tolerance_splits(self):
         """长音频回归（94 分钟无分段根因之二）：真实课堂语音的 ts 数与
-        字符数存在 ~2% 固有差（口吃重复/BPE 合并两字一 ts）。绝对阈值 3
-        会把 10 分钟以上内容整体打成单段。相对容差 3%（下限 3）内必须
-        正常切段。"""
+        字符数存在 ~2%+ 固有差（口吃重复/BPE 合并两字一 ts）。门禁已删，
+        任意失配都正常切段——失配的代价只是锚点漂移，不切的代价是整片
+        钉成一条超长字幕。"""
         # 1000 汉字、每 20 字一个句号 → n_text=1000（句号不占 ts）
         unit = "一二三四五六七八九十一二三四五六七八九十"
         text = "。".join([unit] * 50) + "。"
@@ -441,50 +460,175 @@ class TestCharLevelTimestamps:
         #  按收尾语义并入前一段——正是设计行为，字符守恒不丢字）
         assert sum(len(s.text) for s in segs) == len(text)
 
-    def test_transcribe_chunks_long_audio(self, monkeypatch, tmp_path):
-        """长音频回归（94 分钟无标点+单段根因之一）：时长 > CHUNK_S 时
-        引擎侧按 CHUNK_S 切片、逐片转写、时间戳加偏移拼接。
-        不加载真模型：monkeypatch _transcribe_one。"""
-        import wave
-        eng = self._engine()
-        # 造 2 秒 16k 单声道静音 wav
-        wav = tmp_path / "in.wav"
-        with wave.open(str(wav), "wb") as w:
-            w.setnchannels(1); w.setsampwidth(2); w.setframerate(16000)
-            w.writeframes(b"\x00\x00" * 16000 * 2)
-        monkeypatch.setattr(type(eng), "CHUNK_S", 1)
-
-        from asr.engines.funasr_engine import Segment
-        calls = []
-        def fake_one(w, dur, hotwords, cb):
-            calls.append((str(w), dur))
-            cb(1.0, "识别完成")
-            return [Segment(start=0.0, end=0.5, text="甲")]
-        monkeypatch.setattr(eng, "_transcribe_one", fake_one)
-
-        segs = eng.transcribe(wav)
-        assert len(calls) == 2                        # 2s / 1s = 2 片
-        assert [round(c[1], 1) for c in calls] == [1.0, 1.0]
+    def test_long_span_splits_at_gap(self):
+        """大间隙兜底切分：无标点稀疏语气词链（真机"嗯想不想嗯嗯"6 字拖
+        29.6s）→ 跨度超 8s 时在 >0.8s 的字间停顿处断开，守恒+单调。"""
+        from asr.engines.funasr_engine import _split_by_char_ts
+        text = "嗯想不想嗯嗯"
+        ts = [[0, 300], [3000, 3400], [3500, 3800], [4000, 4300],
+              [12000, 12300], [12500, 12800]]      # 毫秒
+        segs = _split_by_char_ts(text, ts, duration_s=13.0)
         assert len(segs) == 2
-        assert segs[0].start == 0.0 and segs[1].start == 1.0   # 偏移拼接
-        assert not list(tmp_path.glob("*.part*.wav"))           # 切片临时文件已清理
+        assert segs[0].text == "嗯想不想"            # 头部在 4.3s 前的停顿处断
+        assert segs[1].text == "嗯嗯"
+        assert abs(segs[0].start - 0.0) < 0.01 and abs(segs[0].end - 4.3) < 0.01
+        assert abs(segs[1].start - 12.0) < 0.01 and abs(segs[1].end - 12.8) < 0.01
+        assert "".join(s.text for s in segs) == text
 
-    def test_transcribe_short_audio_no_chunking(self, monkeypatch, tmp_path):
-        """>CHUNK_S 才切片：短音频必须直接走单片路径（不产生 .part 文件）。"""
+    def test_long_span_splits_at_soft_punct(self):
+        """超长段二次切分：长语流无强标点（真机 34s/150 字只有逗号）→
+        超过 8s 在最后一个软标点处断开，时间锚精确、字符守恒、单调不重叠。"""
+        from asr.engines.funasr_engine import _split_by_char_ts
+        # 4 组"十字+逗号"，末尾句号；ts 每字 0.8s → 全程 ~32s 无强标点
+        unit = "一二三四五六七八九十"
+        text = ("，".join([unit] * 4)) + "。"
+        ts = [[i * 800, i * 800 + 600] for i in range(40)]
+        segs = _split_by_char_ts(text, ts, duration_s=35.0)
+        assert len(segs) == 4                        # 每 ~8s 一段
+        assert all(s.end - s.start <= 8.8 for s in segs)   # 段长有界
+        assert "".join(s.text for s in segs) == text       # 字符守恒
+        assert all(segs[i].end <= segs[i + 1].start for i in range(len(segs) - 1))
+
+class TestVadSlicedTranscribe:
+    """VAD 预切架构（取代 300s 定长切片）：独立 VAD → 分组 → 切片 → 偏移拼接。
+
+    全部不加载真模型：VAD/punc/asr 均注入假对象；wav 用 stdlib wave 造静音。
+    """
+
+    def _engine(self):
+        from asr.config import load_config
+        from asr.engines.funasr_engine import FunASREngine
+        cfg = load_config(Path(__file__).parent.parent / "config.yaml", strict_models=False)
+        return FunASREngine(cfg)
+
+    @staticmethod
+    def _make_wav(path, seconds):
         import wave
-        eng = self._engine()
-        wav = tmp_path / "in.wav"
-        with wave.open(str(wav), "wb") as w:
+        with wave.open(str(path), "wb") as w:
             w.setnchannels(1); w.setsampwidth(2); w.setframerate(16000)
-            w.writeframes(b"\x00\x00" * 16000)        # 1 秒
+            w.writeframes(b"\x00\x00" * int(16000 * seconds))
 
-        from asr.engines.funasr_engine import Segment
+    def test_group_vad_segments_rules(self):
+        from asr.engines.funasr_engine import _group_vad_segments
+        # gap 并入：0.5→2.0 间隙 1.5s ≤ 2 → 同组
+        assert _group_vad_segments([[0, 500], [2000, 3000]], 2.0, 30.0) == [[0.0, 3.0]]
+        # gap 分裂：间隙 2.5s > 2 → 两组
+        assert _group_vad_segments([[0, 500], [3000, 3500]], 2.0, 30.0) == [[0.0, 0.5], [3.0, 3.5]]
+        # 墙钟封顶：第三段并入后墙钟 4.5s > 3.0 → 另起一组
+        got = _group_vad_segments([[0, 1000], [2000, 3000], [4000, 4500]], 2.0, 3.0)
+        assert got == [[0.0, 3.0], [4.0, 4.5]]
+        # 空输入
+        assert _group_vad_segments([], 2.0, 30.0) == []
+        assert _group_vad_segments(None, 2.0, 30.0) == []
+
+    def test_punctuate_shape_crash_halves_retry(self):
+        """流式 punc 形状崩溃（1 字文本/1 字迷你句）→ 对半递归重试；
+        1 字无标点可加，原样返回。真机回归：孤字语气词组（嗯/对/好）。"""
+        eng = self._engine()
+
+        class CrashOnOdd:
+            def generate(self, **kw):
+                t = kw["input"]
+                if len(t) % 2 == 1:
+                    raise TypeError("only 0-dimensional arrays")
+                return [{"text": t + "。"}]
+
+        eng._load_punc_model = lambda: CrashOnOdd()
+        # "abcde"(5,奇) 崩 → "ab"(顺)+"cde"(崩→"c"原样+"de"顺)
+        assert eng._punctuate("abcde") == "ab。cde。"
+        # 偶数长度直达
+        assert eng._punctuate("abcd") == "abcd。"
+
+    def test_punctuate_conservation_reject(self):
+        """punc 输出丢字符 → 守恒校验拒绝 → 退回无标点原文（丢标点不丢内容）。"""
+        eng = self._engine()
+
+        class DropsLast:
+            def generate(self, **kw):
+                t = kw["input"]
+                return [{"text": t[:-1] + "。"}]
+
+        eng._load_punc_model = lambda: DropsLast()
+        assert eng._punctuate("大家好今天上课") == "大家好今天上课"
+
+    def test_transcribe_vad_sliced_offsets_and_cleanup(self, tmp_path):
+        """两个语音组 → 两次切片转写 → 时间戳按片偏移拼接，临时切片清理。"""
+        wav = tmp_path / "in.wav"
+        self._make_wav(wav, 4.0)
+
         calls = []
-        def fake_one(w, dur, hotwords, cb):
-            calls.append(str(w))
-            return [Segment(start=0.0, end=0.5, text="乙")]
-        monkeypatch.setattr(eng, "_transcribe_one", fake_one)
+
+        class FakeAsr:
+            def generate(self, **kw):
+                calls.append(kw["input"])
+                return [{"text": "大家好。",
+                         "timestamp": [[100, 400], [400, 700], [700, 900]]}]
+
+        class FakeVad:
+            def generate(self, **kw):
+                # 0-0.5s 与 3.0-3.5s 两个语音段（间隙 2.5s > 2 → 两组）
+                return [{"value": [[0, 500], [3000, 3500]]}]
+
+        class FakePunc:
+            def generate(self, **kw):
+                return [{"text": kw["input"]}]
+
+        eng = self._engine()
+        eng._model = FakeAsr()
+        eng._loaded = True
+        eng._load_vad_model = lambda: FakeVad()
+        eng._load_punc_model = lambda: FakePunc()
 
         segs = eng.transcribe(wav)
-        assert len(calls) == 1 and calls[0] == str(wav)   # 原文件直达，无切片
-        assert segs[0].text == "乙"
+
+        assert len(calls) == 2                          # 两组各一次切片转写
+        assert all(c.endswith(".grp0.wav") or c.endswith(".grp1.wav") for c in calls)
+        assert not list(tmp_path.glob("*.grp*.wav"))    # 临时切片已清理
+        assert len(segs) == 2
+        # 组0：a=0.0，段局部 [0.1,0.9]；组1：a=3.0-0.3=2.7，段局部偏移后 [2.8,3.6]
+        assert abs(segs[0].start - 0.1) < 0.01 and abs(segs[0].end - 0.9) < 0.01
+        assert abs(segs[1].start - 2.8) < 0.01 and abs(segs[1].end - 3.6) < 0.01
+        assert segs[0].text == "大家好。"
+
+    def test_transcribe_empty_vad_returns_empty(self, tmp_path):
+        """纯静音：VAD 无语音段 → 空结果（不报错、不进降落伞）。"""
+        wav = tmp_path / "in.wav"
+        self._make_wav(wav, 1.0)
+
+        class FakeVad:
+            def generate(self, **kw):
+                return [{"value": []}]
+
+        eng = self._engine()
+        eng._load_vad_model = lambda: FakeVad()
+        assert eng.transcribe(wav) == []
+
+    def test_transcribe_vad_failure_parachute_whole_file(self, tmp_path):
+        """VAD 预切机械性失败 → 降落伞整文件单次转写（老合并路径保底）。"""
+        wav = tmp_path / "in.wav"
+        self._make_wav(wav, 1.0)
+
+        calls = []
+
+        class FakeAsr:
+            def generate(self, **kw):
+                calls.append(kw["input"])
+                return [{"text": "大家好。",
+                         "timestamp": [[100, 400], [400, 700], [700, 900]]}]
+
+        class FakePunc:
+            def generate(self, **kw):
+                return [{"text": kw["input"]}]
+
+        def boom():
+            raise RuntimeError("vad model boom")
+
+        eng = self._engine()
+        eng._model = FakeAsr()
+        eng._loaded = True
+        eng._load_vad_model = boom
+        eng._load_punc_model = lambda: FakePunc()
+
+        segs = eng.transcribe(wav)
+        assert len(calls) == 1 and calls[0] == str(wav)   # 原文件直达
+        assert len(segs) == 1 and segs[0].text == "大家好。"

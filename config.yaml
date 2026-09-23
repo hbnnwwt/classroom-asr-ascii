@@ -39,9 +39,8 @@ diarize:
 
 postprocess:
   itn: true                  # 二零二五 → 2025
-  merge_short_sentences: true
-  min_sentence_chars: 6
-  max_sentence_chars: 40
+  # 断句合并已删除（跨静音合并制造超长钉屏段 + 插值销毁真时间锚）；
+  # 断句在引擎层按逐字时间戳完成
   glossary: glossary/default.txt
 
 output:

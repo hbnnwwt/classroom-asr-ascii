@@ -2,8 +2,8 @@
 后处理（方案 5.5 节）：
 - ITN：引擎已规整主要情况（年份/数字），这里补正则兜底
 - 术语纠错：读 glossary/*.txt，最长匹配替换，记替换日志
-- 断句合并：min/max 字符数规则 + 标点二次切分 + 时间戳按字数插值
-- 行长度限制：SRT 单行 ≤ srt_max_chars_per_line
+- 断句合并已删除（会跨静音合并短句 + 插值销毁真时间锚，见 apply 注释）；
+  断句职责在引擎层（asr/engines/funasr_engine._split_by_char_ts）
 """
 from __future__ import annotations
 
@@ -129,137 +129,6 @@ def apply_glossary(
 
 
 # ---------------------------------------------------------------------------
-# 断句合并（方案 5.5 节）
-# ---------------------------------------------------------------------------
-# 强切分标点：句号、问号、感叹号、分号
-_HARD_PUNCT = "。？！；\n"
-# 弱切分标点：逗号、顿号 —— 允许短句合并时跨过
-_SOFT_PUNCT = "，、"
-
-
-def split_by_punct(text: str) -> List[str]:
-    """按强切分标点切段，标点保留在句尾（P0-3：标点是可读性的一部分）。"""
-    out: List[str] = []
-    buf: list[str] = []
-    for ch in text:
-        buf.append(ch)
-        if ch in _HARD_PUNCT:
-            piece = "".join(buf).strip()
-            # 纯标点残余（如句首孤立标点）不产出
-            if piece and any(c not in _HARD_PUNCT + _SOFT_PUNCT + " \n" for c in piece):
-                out.append(piece)
-            buf = []
-    if buf:
-        piece = "".join(buf).strip()
-        if piece:
-            out.append(piece)
-    return out
-
-
-def merge_short_sentences(
-    segments: List[Segment],
-    *,
-    min_chars: int,
-    max_chars: int,
-    duration_s: float | None = None,
-) -> List[Segment]:
-    """
-    把短句合并到 min_chars 以上，把超长句按标点二次切分。
-    时间戳按字数比例在原始段的时间区间内插值。
-    """
-    if not segments:
-        return segments
-
-    # 0) 入口清洗：把以 weak 标点开头的段拼到前一段，避免污染向下游传递
-    cleaned: List[Segment] = []
-    for seg in segments:
-        if seg.text and seg.text[0] in _SOFT_PUNCT and cleaned:
-            prev = cleaned[-1]
-            cleaned[-1] = replace(prev, text=prev.text + seg.text, end=seg.end)
-        else:
-            cleaned.append(seg)
-    segments = cleaned
-
-    # 1) 先按强标点切分
-    pieces: List[Tuple[str, float, float, Optional[str]]] = []  # (text, seg_start, seg_end, spk)
-    for seg in segments:
-        for ph in split_by_punct(seg.text):
-            pieces.append((ph, seg.start, seg.end, seg.spk))
-
-    # 2) 合并过短句（合并段 spk 取字数多数者）
-    merged: List[Tuple[str, float, float, Optional[str]]] = []
-    for text, s, e, spk in pieces:
-        if merged and len(merged[-1][0]) < min_chars:
-            old_text, old_s, old_e, old_spk = merged[-1]
-            new_spk = old_spk if len(old_text) >= len(text) else spk
-            merged[-1] = (old_text + text, old_s, e, new_spk)
-        else:
-            merged.append((text, s, e, spk))
-
-    # 3) 切分过长句（按弱标点）；子片继承原段 spk 不变
-    final: List[Tuple[str, float, float, Optional[str]]] = []
-    for text, s, e, spk in merged:
-        if len(text) <= max_chars:
-            final.append((text, s, e, spk))
-            continue
-        # 按弱标点切
-        parts = re.split(r"([，、])", text)
-        cur = ""
-
-        def _flush(buf: str) -> None:
-            """把累积 buf flush 到 final。若 buf 以 weak 标点开头且 final 末段属同 [s,e]，拼到末段。"""
-            if not buf:
-                return
-            if buf[0] in _SOFT_PUNCT and final and final[-1][1] == s and final[-1][2] == e:
-                last_text, last_s, last_e, last_spk = final[-1]
-                final[-1] = (last_text + buf, last_s, last_e, last_spk)
-            else:
-                final.append((buf, s, e, spk))
-
-        for p in parts:
-            if p in _SOFT_PUNCT:
-                cur += p
-                if len(cur) >= max_chars // 2:
-                    _flush(cur)
-                    cur = ""
-            else:
-                cur += p
-                if len(cur) > max_chars:
-                    _flush(cur)
-                    cur = ""
-        # 收尾：残余 cur 总拼到末段（同 [s,e]），避免独立弱标点段
-        _flush(cur)
-
-    # 4) 时间戳按字数比例在 (s, e) 内插值
-    out: List[Segment] = []
-    i = 0
-    while i < len(final):
-        # 找出属于同一原始段的片段
-        orig_s = final[i][1]
-        orig_e = final[i][2]
-        j = i
-        while j < len(final) and final[j][1] == orig_s and final[j][2] == orig_e:
-            j += 1
-        group = final[i:j]
-        spk = group[0][3]
-        total = sum(len(t) for t, _, _, _ in group)
-        if total == 0:
-            for t, _, _, _ in group:
-                out.append(Segment(start=orig_s, end=orig_e, text=t, spk=spk))
-        else:
-            cursor = orig_s
-            span = orig_e - orig_s
-            for t, _, _, _ in group:
-                ratio = len(t) / total
-                seg_start = cursor
-                seg_end = cursor + span * ratio
-                cursor = seg_end
-                out.append(Segment(start=seg_start, end=seg_end, text=t, spk=spk))
-        i = j
-    return out
-
-
-# ---------------------------------------------------------------------------
 # 时间戳合法性校验（方案 5.8 节）
 # ---------------------------------------------------------------------------
 def validate_timestamps(
@@ -316,13 +185,11 @@ def apply(segments: List[Segment], cfg: AppConfig, *, duration_s: float | None =
     pairs = load_glossary(cfg.postprocess.glossary) if cfg.postprocess.glossary else []
     segs, log = apply_glossary(segs, pairs)
 
-    # 3. 断句合并
-    if cfg.postprocess.merge_short_sentences:
-        segs = merge_short_sentences(
-            segs,
-            min_chars=cfg.postprocess.min_sentence_chars,
-            max_chars=cfg.postprocess.max_sentence_chars,
-        )
+    # 3. 断句合并已删除：该步骤为粗粒度时间戳时代设计——合并不看时间间隙，
+    #    真机实测把跨 15s 静音的三段短语气词（嗯/想不想/嗯嗯）合并成一条
+    #    29.6s 钉屏字幕，且其"超长句切分"用字数插值时间戳，会销毁引擎的
+    #    逐字真时间锚。切分职责已全部收归引擎层（_split_by_char_ts：
+    #    强标点 + 软标点 + 大间隙三类切点，时间锚全部真实）。
 
     # 4. 时间戳校验
     segs = validate_timestamps(segs, duration_s)

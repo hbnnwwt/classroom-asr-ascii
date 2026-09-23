@@ -63,9 +63,9 @@ class DiarizeConfig(BaseModel):
 
 class PostprocessConfig(BaseModel):
     itn: bool = True
-    merge_short_sentences: bool = True
-    min_sentence_chars: int = 6
-    max_sentence_chars: int = 40
+    # 断句合并（merge_short_sentences/min/max_sentence_chars）已删除：
+    # 跨静音合并制造 29.6s 钉屏段 + 字数插值销毁引擎逐字真时间锚。
+    # 旧配置文件残留这些键会被 pydantic 忽略，不影响加载。
     glossary: Path = Path("glossary/default.txt")
 
 
