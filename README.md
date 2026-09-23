@@ -10,6 +10,10 @@
 - **ffmpeg / ffprobe**：[Windows](https://www.gyan.dev/ffmpeg/builds/) 解压后把 `bin/` 加到 PATH
 - **Python 3.10**（机器若只有 3.12，funasr 1.2 + torch 2.14 也能跑，详见"实现偏差"）
 
+> **Windows 一键搭建**：完成上步后，双击 `setup.bat` 即自动完成下面第 2~3 步
+> （装 Python 依赖 + 下载 ≈2 GB 模型，需联网，可重复执行），
+> 然后双击 `run_web.bat` 启动。
+
 ### 2. 安装 Python 依赖
 ```bash
 cd classroom-asr

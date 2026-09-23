@@ -1,14 +1,27 @@
 __pycache__/
 *.pyc
-models/
-tmp_models/
-asr/web/uploads/
-asr/web/outputs/
-asr/web/web_state.db*
-out*/
-*.log
-tmp_repro_*.wav
-lecture.mp4
 .pytest_cache/
 .superpowers/
 .workbuddy/
+
+# 模型与运行数据（用 setup.bat 重新下载/生成）
+models/
+tmp_models/
+asr/web/uploads/
+asr/web/web_state.db*
+out*/
+*.log
+
+# 大媒体文件不入库（视频/音频/字幕）；测试小样本例外
+*.mp4
+*.mov
+*.mkv
+*.avi
+*.mp3
+*.wav
+*.m4a
+*.flac
+*.aac
+*.srt
+*.vtt
+!tests/fixtures/*.wav
