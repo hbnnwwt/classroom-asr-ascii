@@ -351,6 +351,61 @@ button.primary:hover:not(:disabled) { background: var(--accent-hover); }
 }
 .form-actions button[type="button"]:hover { background: var(--border); }
 
+/* ---- 多段视频合并面板 ---- */
+#merge-panel { display: flex; flex-direction: column; gap: 12px; }
+.merge-block {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); padding: 10px 12px;
+}
+.merge-block-title { font-size: 13px; color: var(--text-2); display: block; margin-bottom: 8px; }
+
+#parts-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.part-row {
+  display: flex; align-items: center; gap: 10px;
+  background: var(--surface-2); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); padding: 6px 10px; font-size: 13px;
+}
+.part-idx {
+  flex-shrink: 0; width: 22px; height: 22px; border-radius: 50%;
+  display: inline-flex; align-items: center; justify-content: center;
+  background: var(--accent-bg); color: var(--accent); font-size: 12px; font-weight: 600;
+}
+.part-name {
+  flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  color: var(--text);
+}
+.part-size { flex-shrink: 0; color: var(--text-3); font-size: 12px; }
+.part-codec { flex-shrink: 0; color: var(--text-2); font-size: 12px; }
+.part-codec:empty::after { content: "探测中…"; color: var(--text-3); }
+.part-ops { flex-shrink: 0; display: inline-flex; gap: 4px; }
+.part-ops button {
+  min-width: 26px; min-height: 26px; padding: 0 6px;
+  background: var(--bg); color: var(--text-2);
+  border: 1px solid var(--border-strong); border-radius: var(--radius-sm);
+  font-size: 13px; line-height: 1;
+}
+.part-ops button:hover:not(:disabled) { background: var(--border); color: var(--text); }
+.part-ops button.danger:hover { background: var(--err-bg); color: var(--err); border-color: var(--err); }
+
+.mode-radio { display: flex; gap: 20px; flex-wrap: wrap; }
+.mode-radio .radio,
+label.radio { flex-direction: row; align-items: center; gap: 6px; font-size: 14px; color: var(--text); cursor: pointer; }
+
+#probe-status { display: flex; flex-direction: column; gap: 8px; align-items: flex-start; }
+.probe-note { font-size: 13px; color: var(--text-2); }
+.probe-wait { display: inline-flex; align-items: center; gap: 8px; font-size: 13px; color: var(--text-2); }
+.probe-err { font-size: 13px; color: var(--err); }
+.codec-table { border-collapse: collapse; font-size: 12px; width: 100%; }
+.codec-table th, .codec-table td {
+  border: 1px solid var(--border); padding: 4px 8px; text-align: left;
+}
+.codec-table th { color: var(--text-2); background: var(--surface-2); font-weight: 500; }
+.transcode-pick {
+  flex-direction: row; align-items: center; gap: 8px;
+  font-size: 13px; color: var(--text); font-weight: 500;
+}
+.transcode-pick select { min-width: 260px; }
+
 #toolbar {
   display: flex; gap: 12px; align-items: center;
   margin-bottom: 16px;

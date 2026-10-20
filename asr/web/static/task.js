@@ -5,7 +5,7 @@ const $ = (id) => document.getElementById(id);
 const LIVE_ON = '<svg class="icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M6 4h4v16H6zM14 4h4v16h-4z"/></svg>暂停滚动';
 const LIVE_OFF = '<svg class="icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M6 4l14 8-14 8z"/></svg>恢复滚动';
 
-const STAGE_ORDER = ["probe", "extract", "denoise", "asr", "postprocess", "write", "done"];
+const STAGE_ORDER = ["merge", "probe", "extract", "denoise", "asr", "postprocess", "write", "done"];
 const MAX_VISIBLE_LINES = 80;    // DOM 中最多保留的段数（防长 transcript 把页面撑爆）
 
 let currentTaskId = null;
@@ -117,6 +117,12 @@ async function poll() {
 
 function updateUI(t) {
   taskStatus = t.status;
+  // 合并任务专属 UI：拼接阶段行 + MP4 下载按钮（普通任务隐藏）
+  const isMerged = Boolean(t.meta && t.meta.merge_mode);
+  const mergeLi = document.querySelector('#stages li[data-stage="merge"]');
+  if (mergeLi) mergeLi.style.display = isMerged ? "" : "none";
+  const mp4Btn = document.querySelector('#downloads .btn[data-fmt="mp4"]');
+  if (mp4Btn) mp4Btn.hidden = !isMerged;
   $("status").textContent = statusLabel(t.status);
   // 项目名（页面顶部）
   if (t.name && $("project-name").textContent !== t.name) {
