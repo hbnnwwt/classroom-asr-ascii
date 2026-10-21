@@ -2,17 +2,22 @@
 
 LLM 产物（.feedback.md / .polished.md）要在线阅读，渲染器只认
 asr/feedback.py 里约定的格式：标题 / 段落 / 加粗 / 行内代码 /
-无序有序列表 / 表格。宁缺毋滥——不引第三方依赖（项目全程离线），
-不做万能解析器；约定外的语法按原文显示。
+无序有序列表 / 表格。宁缺毋滥——不做万能解析器；约定外的语法按
+原文显示。渲染部分只用标准库。
+
+修改痕迹（render_diff）用 diff-match-patch 引擎（Google Docs 同源，
+纯 Python 无传递依赖）：字符级天然适配中文，自带 1s deadline——
+整篇重写的极端情况宁可标记粗一点，也不许卡死请求。
 
 安全铁律：LLM 输出是不可信数据。先全文 html.escape 再做 md 变换，
 任何标签注入只能变成纯文本。
 """
 from __future__ import annotations
 
-import difflib
 import html
 import re
+
+from diff_match_patch import diff_match_patch
 
 _H = re.compile(r"^(#{1,4})\s+(.*)$")
 _UL = re.compile(r"^\s*[-*]\s+(.*)$")
@@ -100,25 +105,19 @@ def render_markdown(text: str) -> str:
 # ---------------------------------------------------------------------------
 # 红字校对视图：原稿 vs 优化稿
 # ---------------------------------------------------------------------------
-_SENT_SPLIT = re.compile(r"(?<=[。！？!?；;])")
-
-
-def _sentences(text: str) -> list[str]:
-    """分句 token：句末标点后断开；换行独立成 token（段落边界）。"""
-    toks: list[str] = []
-    for line in text.split("\n"):
-        toks.extend(t for t in _SENT_SPLIT.split(line) if t)
-        toks.append("\n")
-    return toks[:-1]  # 末尾换行不是段落边界
+_DMP = diff_match_patch()
+_DMP.Diff_Timeout = 1.0   # 秒（相对值）：bisect 超时兜底，整篇重写耗时封顶
 
 
 def render_diff(original: str, polished: str) -> str:
     """红字校对视图：删除=红色划线（原文可见），新增=绿色。
 
-    两级 diff（全 stdlib）：句子对齐管全局（几百个 token，快），
-    替换块内做字级精修（git --word-diff 的味道）——标点修正只标
-    变化的字符，整句重写才整句换色。优化稿末尾"## 本课要点"是
-    纯新增节，不参与比对，按普通 md 渲染接在后面。
+    一遍字符级 diff + cleanupSemantic（把编辑边界归整到人类可读处），
+    不再需要"句子对齐 + 块内精修"两级方案。deadline=1s：极端整篇
+    重写时降级为较粗的标记，耗时封顶。换行在 equal 块里是段落边界；
+    划线/新增块里的换行不显示（划线段落的换行只是噪音）。优化稿
+    末尾"## 本课要点"是纯新增节，不参与比对，按普通 md 渲染接在
+    后面。
     """
     m = re.search(r"^##\s*本课要点\s*$", polished, re.M)
     tail_md = ""
@@ -126,8 +125,10 @@ def render_diff(original: str, polished: str) -> str:
         tail_md = polished[m.start():]
         polished = polished[:m.start()].rstrip("\n")
 
-    def _del(s): return f'<del class="diff-del">{html.escape(s)}</del>'
-    def _ins(s): return f'<ins class="diff-ins">{html.escape(s)}</ins>'
+    # 不传 deadline 位置参数——它按绝对时间戳解读，传 1.0 会立刻"过期"
+    # 退化成整删整增；超时兜底交给实例的 Diff_Timeout。
+    diffs = _DMP.diff_main(original, polished)
+    _DMP.diff_cleanupSemantic(diffs)
 
     parts: list[str] = []
     buf: list[str] = []
@@ -137,32 +138,17 @@ def render_diff(original: str, polished: str) -> str:
             parts.append("<p>" + "".join(buf) + "</p>")
             buf.clear()
 
-    a, b = _sentences(original), _sentences(polished)
-    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(
-            a=a, b=b, autojunk=False).get_opcodes():
-        if tag == "equal":
-            for t in a[i1:i2]:
-                _flush() if t == "\n" else buf.append(html.escape(t))
-        elif tag == "delete":
-            # 删掉的段落边界不显示（划线段落的换行只是噪音）
-            buf.extend(_del(t) for t in a[i1:i2] if t != "\n")
-        elif tag == "insert":
-            for t in b[j1:j2]:
-                _flush() if t == "\n" else buf.append(_ins(t))
-        else:  # replace：块内字级精修
-            ta = "".join(t for t in a[i1:i2] if t != "\n")
-            tb = "".join(t for t in b[j1:j2] if t != "\n")
-            for ct, ci1, ci2, cj1, cj2 in difflib.SequenceMatcher(
-                    a=ta, b=tb, autojunk=False).get_opcodes():
-                if ct == "equal":
-                    buf.append(html.escape(ta[ci1:ci2]))
-                elif ct == "delete":
-                    buf.append(_del(ta[ci1:ci2]))
-                elif ct == "insert":
-                    buf.append(_ins(tb[cj1:cj2]))
-                else:
-                    buf.append(_del(ta[ci1:ci2]))
-                    buf.append(_ins(tb[cj1:cj2]))
+    for op, text in diffs:
+        tag = None if op == 0 else ("del" if op < 0 else "ins")
+        for i, seg in enumerate(text.split("\n")):
+            if i:                       # seg 前有换行（段落边界）
+                if tag:
+                    continue            # 划线/新增块里的换行不显示
+                _flush()
+            if seg:
+                esc = html.escape(seg)
+                buf.append(esc if tag is None
+                           else f'<{tag} class="diff-{tag}">{esc}</{tag}>')
     _flush()
     if tail_md:
         parts.append(render_markdown(tail_md))

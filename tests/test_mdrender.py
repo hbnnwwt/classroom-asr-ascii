@@ -218,3 +218,18 @@ def test_diff_escapes_html():
     out = render_diff("<script>a</script>。", "正常。")
     assert "<script>" not in out
     assert "&lt;script&gt;" in out
+
+
+def test_diff_big_rewrite_bounded():
+    """4400 字级整段重写也要秒回：diff 引擎自带 1s deadline 兜底，
+    宁可标记粗一点也不许把同步请求卡死（difflib 两级版同款输入实测
+    8.9s 且无上限）。"""
+    import time
+    a = "今天我们讲第三章的内容，首先回顾上节课的要点。" * 200
+    b = "本节课进入第三章节，先复习上一讲的核心知识。" * 200
+    t0 = time.perf_counter()
+    out = render_diff(a, b)
+    dt = time.perf_counter() - t0
+    assert '<del class="diff-del">' in out and '<ins class="diff-ins">' in out
+    assert out.count("<del") == out.count("</del>")   # deadline 降级也不许吐残缺 HTML
+    assert dt < 6.0, f"整段重写耗时 {dt:.2f}s —— 性能回归"
