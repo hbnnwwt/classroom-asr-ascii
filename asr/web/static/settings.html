@@ -30,14 +30,30 @@
       </div>
     </header>
 
-    <section>
-      <h2>AI 反馈（LLM）</h2>
-      <p class="meta">
+    <section class="panel settings-panel">
+      <div class="section-head">
+        <h2>AI 反馈（LLM）</h2>
+        <span id="llm-state" class="status-badge status-pending" hidden>未配置</span>
+      </div>
+      <p class="hint">
         云 API（GLM / DeepSeek 等）与本地 Ollama 都走 OpenAI 兼容端点。
         base_url 与 model 都填好即启用；清空保存即关闭。
         示例：Ollama 用 <code>http://localhost:11434/v1</code>（api_key 留空）。
       </p>
       <form id="llm-form">
+        <label>
+          常用服务商（一键填充 base_url 与 model，api_key 仍需自填）
+          <select id="preset">
+            <option value="">手动输入</option>
+            <option value="ollama">Ollama 本地</option>
+            <option value="deepseek">DeepSeek</option>
+            <option value="siliconflow">硅基流动 SiliconFlow</option>
+            <option value="modelscope">ModelScope</option>
+            <option value="minimax">MiniMax</option>
+            <option value="zhipu">智谱 GLM</option>
+            <option value="openai">OpenAI</option>
+          </select>
+        </label>
         <label>
           base_url
           <input type="text" id="base-url" placeholder="https://open.bigmodel.cn/api/paas/v4" />
@@ -65,8 +81,8 @@
           <button type="button" id="save-btn" class="btn btn-primary">保存</button>
         </div>
       </form>
-      <p id="test-result" class="meta" hidden></p>
-      <p id="save-result" class="meta" hidden></p>
+      <p id="test-result" hidden></p>
+      <p id="save-result" hidden></p>
     </section>
   </main>
 

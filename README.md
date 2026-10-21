@@ -62,9 +62,10 @@ python -m asr.web --host 0.0.0.0 --port 8080   # 局域网开放
 
 两种配法，效果相同：
 
-- **页面配置（推荐）**：首页/详情页右上角"设置"进设置页，填好 base_url 与 model，
-  可先"测试连接"再保存——写回 `config.yaml` 的 `llm` 节，已有注释与配置原样保留。
-  未配置时点任务上的"AI 反馈"按钮也会直接跳到这里。
+- **页面配置（推荐）**：首页/详情页右上角"设置"进设置页，"常用服务商"下拉一键填充
+  base_url 与 model（Ollama 本地 / DeepSeek / 硅基流动 / ModelScope / MiniMax / 智谱 / OpenAI，
+  api_key 仍需自填），可先"测试连接"再保存——写回 `config.yaml` 的 `llm` 节，
+  已有注释与配置原样保留。未配置时点任务上的"AI 反馈"按钮也会直接跳到这里。
 - **手改文件**：`config.yaml` 加 `llm` 节即启用（OpenAI 兼容端点，一套代码通吃云 API
   与本地 Ollama）；全留空则功能整体隐藏，不影响任何现有行为：
 

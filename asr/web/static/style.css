@@ -141,13 +141,16 @@ h1 { margin-top: 0; }
 form { display: flex; flex-direction: column; gap: 12px; margin-top: 16px; }
 label { display: flex; flex-direction: column; gap: 4px; font-size: 14px; }
 label.checkbox { flex-direction: row; align-items: center; gap: 8px; }
-input[type="text"], input[type="search"], select {
+/* 表单控件全类型统一（password/number 曾漏在列表外走 UA 默认样式，设置页暴露） */
+input[type="text"], input[type="search"], input[type="password"],
+input[type="number"], select {
   padding: 9px 12px; border: 1px solid var(--border-strong);
   border-radius: var(--radius-sm); font-size: 14px;
   background: var(--surface);
   transition: border-color 0.15s, box-shadow 0.15s;
 }
-input[type="text"]:focus, input[type="search"]:focus, select:focus {
+input[type="text"]:focus, input[type="search"]:focus,
+input[type="password"]:focus, input[type="number"]:focus, select:focus {
   border-color: var(--accent); box-shadow: var(--focus-ring); outline: none;
 }
 
@@ -495,7 +498,7 @@ a.theme-toggle { display: inline-flex; align-items: center; justify-content: cen
 #empty-state p { margin: 12px 0 16px; }
 
 .meta { color: var(--text-2); font-size: 12px; margin-left: 12px; }
-.meta code {
+.meta code, .hint code {
   background: var(--bg); padding: 1px 6px; border-radius: 3px; font-size: 12px;
   font-family: ui-monospace, Consolas, monospace;
 }
@@ -545,4 +548,27 @@ a.theme-toggle { display: inline-flex; align-items: center; justify-content: cen
   flex-direction: column;
   gap: 8px;
   align-items: flex-start;
+}
+
+/* ---------------------------------------------------------------------------
+   设置页：与上传面板同一套卡片词汇（surface-2 + 边框 + 圆角），表单限宽
+   --------------------------------------------------------------------------- */
+.panel {
+  background: var(--surface-2); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 16px; margin-bottom: 16px;
+}
+.settings-panel { max-width: 640px; }
+.section-head {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 12px; margin-bottom: 4px;
+}
+.section-head h2 { margin: 0; font-size: 17px; }
+/* 结果反馈：与 .error 同构的 ok/err 色对（✓/✗ 前缀保色盲可辨） */
+.msg-ok {
+  color: var(--ok); background: var(--ok-bg);
+  padding: 8px 10px; border-radius: var(--radius-sm); margin: 12px 0 0;
+}
+.msg-err {
+  color: var(--err); background: var(--err-bg);
+  padding: 8px 10px; border-radius: var(--radius-sm); margin: 12px 0 0;
 }
