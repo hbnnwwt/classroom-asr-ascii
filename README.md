@@ -54,7 +54,21 @@ python -m asr.web --host 0.0.0.0 --port 8080   # 局域网开放
 打开浏览器访问 http://127.0.0.1:8000，上传文件即可。任务状态、进度、下载都在页面内。
 - 单文件转写 + 说话人分离可勾选
 - 任务进度轮询（1 秒一次），完成后六个按钮（SRT/VTT/MD/TXT/JSON/replace.log）直接下载
+- **AI 反馈（可选）**：上传时勾选"AI 反馈"自动生成，或任务完成后在详情页点"生成 AI 反馈 / 重试"；失败只记错误不拖垮转写
+- AI 产物与转写产物一样在下载区下载：AI 点评（`.feedback.md`）与优化逐字稿（`.polished.md`）
 - 任务历史存于 `asr/web/web_state.db`（SQLite），重启不丢
+
+#### AI 反馈配置（可选）
+
+`config.yaml` 加 `llm` 节即启用（OpenAI 兼容端点，一套代码通吃云 API 与本地 Ollama）；
+全留空则功能整体隐藏，不影响任何现有行为：
+
+```yaml
+llm:
+  base_url: http://localhost:11434/v1   # Ollama；云 API 换成对应 OpenAI 兼容端点
+  model: qwen2.5:7b
+  api_key: ""                            # 本地模型留空
+```
 
 ## 命令一览
 
@@ -83,7 +97,9 @@ out/
 ├── lecture.srt           # 字幕（UTF-8 BOM，Windows 友好）
 ├── lecture.vtt           # WebVTT
 ├── lecture.json          # 一等产物（下游摘要/检索）
-└── lecture.replace.log   # 术语替换日志
+├── lecture.replace.log   # 术语替换日志
+├── lecture.feedback.md   # AI 点评报告（可选：llm 配置后生成）
+└── lecture.polished.md   # AI 优化逐字稿（可选）
 ```
 
 ## 实现偏差
