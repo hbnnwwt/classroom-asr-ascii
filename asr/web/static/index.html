@@ -63,6 +63,11 @@
             <input type="checkbox" id="diarize" name="diarize" />
             启用说话人分离
           </label>
+          <!-- 默认整个藏起来：list.js 探测到 llm 配置才显示——没配置的用户不该看到死开关 -->
+          <label class="checkbox" id="ai-feedback-block" hidden>
+            <input type="checkbox" id="ai-feedback" name="ai_feedback" />
+            AI 反馈（点评 + 优化稿）
+          </label>
         </div>
         <div class="form-actions">
           <button type="submit" id="submit-btn" class="primary">开始转写</button>

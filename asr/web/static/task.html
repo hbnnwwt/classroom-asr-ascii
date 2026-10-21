@@ -48,6 +48,8 @@
             <li data-stage="asr"><span class="mark">·</span><span class="label">语音识别</span><span class="msg"></span></li>
             <li data-stage="postprocess"><span class="mark">·</span><span class="label">后处理</span><span class="msg"></span></li>
             <li data-stage="write"><span class="mark">·</span><span class="label">写输出文件</span><span class="msg"></span></li>
+            <!-- AI 行默认在 DOM 里，task.js 按 meta 显隐——没开过 AI 的任务看不到 -->
+            <li data-stage="ai"><span class="mark">·</span><span class="label">AI 反馈</span><span class="msg"></span></li>
             <li data-stage="done"><span class="mark">·</span><span class="label">完成</span><span class="msg"></span></li>
           </ol>
 
@@ -68,6 +70,9 @@
               <a class="btn" data-fmt="vtt">VTT</a>
               <a class="btn" data-fmt="md">MD</a>
               <a class="btn" data-fmt="json">JSON</a>
+              <!-- AI 产物：有 ai_files 才显示（renderAiUi 控制），href 由 done 分支统一刷 -->
+              <a class="btn" data-fmt="feedback" hidden title="AI 点评报告（教学反馈 + 稿件反馈）">AI 点评</a>
+              <a class="btn" data-fmt="polished" hidden title="优化版逐字稿（校订 + 要点）">优化稿</a>
               <a class="btn" data-fmt="mp4" hidden title="拼接合并后的完整视频（仅旧版合并任务）">MP4 视频</a>
               <a class="btn" data-fmt="replace.log" title="术语替换日志（调试用）">replace.log</a>
             </div>
@@ -76,6 +81,12 @@
               <h4>每段独立字幕（时间轴归零，配各段原视频）</h4>
               <ul id="part-downloads-list"></ul>
             </div>
+          </div>
+
+          <!-- AI 反馈动作：手动生成/重试（done 且 LLM 可用时出现） -->
+          <div id="ai-actions" hidden>
+            <div id="ai-error" class="error"></div>
+            <button id="ai-retry" type="button" class="btn">生成 AI 反馈</button>
           </div>
         </section>
       </div>

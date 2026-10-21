@@ -308,6 +308,9 @@ $("upload-form").addEventListener("submit", async (e) => {
   form.append("name", $("project-name-input").value.trim());
   form.append("quality", $("quality").value);
   form.append("diarize", $("diarize").checked ? "true" : "false");
+  // 开关藏起来时元素仍在 DOM 里、checked 恒为 false——统一发 "true"/"false"，
+  // 不在前端分支，后端拿不到就是 False
+  form.append("ai_feedback", $("ai-feedback").checked ? "true" : "false");
   for (const f of selectedFiles) form.append("files", f, f.name);
 
   $("submit-btn").disabled = true;
@@ -461,3 +464,11 @@ if (oldTaskParam) {
   loadProjects();
   startListPolling();
 }
+
+// ---------------------------------------------------------------------------
+// LLM 可用性：没配 llm 节就整个开关藏起来，不占位不报错
+// ---------------------------------------------------------------------------
+fetch("/api/llm/status")
+  .then((r) => r.json())
+  .then((s) => { if (s.enabled) $("ai-feedback-block").hidden = false; })
+  .catch(() => {});

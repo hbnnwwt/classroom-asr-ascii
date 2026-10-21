@@ -97,6 +97,12 @@
   border-radius: var(--radius-sm);
 }
 
+/* hidden 属性兜底：本文件多个选择器（.btn / label / #ai-actions 等）自带
+   display，作者样式会压过 UA 的 [hidden]{display:none}，不兜底则 hidden
+   形同虚设、元素照常显示（实测 computed display 仍是 inline-flex）。
+   AI 开关/按钮的显隐全靠这条起效。 */
+[hidden] { display: none !important; }
+
 body {
   font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
   margin: 0;
@@ -528,4 +534,13 @@ button.primary:hover:not(:disabled) { background: var(--accent-hover); }
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
   }
+}
+
+/* AI 反馈动作区（手动生成/重试） */
+#ai-actions {
+  margin-top: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  align-items: flex-start;
 }

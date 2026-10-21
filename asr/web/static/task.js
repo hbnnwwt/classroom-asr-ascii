@@ -5,7 +5,8 @@ const $ = (id) => document.getElementById(id);
 const LIVE_ON = '<svg class="icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M6 4h4v16H6zM14 4h4v16h-4z"/></svg>暂停滚动';
 const LIVE_OFF = '<svg class="icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M6 4l14 8-14 8z"/></svg>恢复滚动';
 
-const STAGE_ORDER = ["merge", "probe", "extract", "denoise", "asr", "postprocess", "write", "done"];
+// ai 是 done 之后追加的 stage：开了 AI 反馈的任务转写完成后还会走它
+const STAGE_ORDER = ["merge", "probe", "extract", "denoise", "asr", "postprocess", "write", "ai", "done"];
 const MAX_VISIBLE_LINES = 80;    // DOM 中最多保留的段数（防长 transcript 把页面撑爆）
 
 let currentTaskId = null;
@@ -21,6 +22,7 @@ let taskElapsedTimer = null; // 每秒刷整体已用时间
 let currentStage = null;      // 当前阶段名（用于 elapsed 显示）
 let stageStartTime = 0;       // 当前阶段开始时间（来自后端 stage_started_at，刷新不重置）
 let taskStatus = null;        // 当前任务状态（done 时一次性渲染 transcript）
+let llmAvailable = false;     // LLM 是否配置（决定手动生成/重试按钮渲染）
 
 /**
  * 页面加载时恢复任务：URL 路径 /task/{id} 优先（管理界面跳转过来），
@@ -72,6 +74,16 @@ async function restoreLastTask() {
   startPolling();
 }
 
+// LLM 可用性先探再恢复任务：fetch 异步，若晚于首轮 poll 到达，done 任务
+// 的按钮会按 llmAvailable=false 收起且轮询已停——补一轮 poll 用真值重绘。
+fetch("/api/llm/status")
+  .then((r) => r.json())
+  .then((s) => {
+    llmAvailable = Boolean(s.enabled);
+    if (llmAvailable && taskStatus === "done" && !pollTimer) poll();
+  })
+  .catch(() => {});
+
 restoreLastTask();
 
 function resetStages() {
@@ -107,7 +119,10 @@ async function poll() {
     if (!resp.ok) { showError(`查询失败: ${resp.status}`); stopPolling(); return; }
     const t = await resp.json();
     updateUI(t);
-    if (t.status === "done" || t.status === "failed") {
+    // AI 反馈可能还在 done 之后跑：开关开了且没有产物/错误 → 继续轮询
+    const aiPending = t.status === "done" && t.meta
+      && t.meta.ai_feedback && !t.meta.ai_files && !t.meta.ai_error;
+    if ((t.status === "done" && !aiPending) || t.status === "failed") {
       stopPolling();
     }
   } catch (err) {
@@ -122,6 +137,11 @@ function updateUI(t) {
   const isMulti = Boolean(t.meta && (t.meta.parts || t.meta.merge_mode));
   const mergeLi = document.querySelector('#stages li[data-stage="merge"]');
   if (mergeLi) mergeLi.style.display = isMulti ? "" : "none";
+  // AI stage 行显隐不放 done 分支：AI 进行中任务仍是 running，行得跟着每轮轮询走。
+  // 三个信号任一命中就显示——开过开关 / 失败过 / 出过产物。
+  const hasAi = Boolean(t.meta && (t.meta.ai_feedback || t.meta.ai_error || t.meta.ai_files));
+  const aiLi = document.querySelector('#stages li[data-stage="ai"]');
+  if (aiLi) aiLi.style.display = hasAi ? "" : "none";
   const mp4Btn = document.querySelector('#downloads .btn[data-fmt="mp4"]');
   if (mp4Btn) mp4Btn.hidden = !(t.meta && t.meta.merge_mode);
   $("status").textContent = statusLabel(t.status);
@@ -150,6 +170,7 @@ function updateUI(t) {
       a.download = "";
     });
     renderPartDownloads(t.meta);
+    renderAiUi(t);
   }
 }
 
@@ -183,6 +204,49 @@ function renderPartDownloads(meta) {
     ul.appendChild(li);
   });
 }
+
+/**
+ * AI 反馈按钮区（仅 done 分支调用）：两个下载按钮显隐 + 手动生成/重试。
+ * done + LLM 可用 +（无产物 或 有错误）→ 显示按钮；有产物无错 → 只留下载。
+ */
+function renderAiUi(t) {
+  const meta = t.meta || {};
+  const fbBtn = document.querySelector('#downloads .btn[data-fmt="feedback"]');
+  const poBtn = document.querySelector('#downloads .btn[data-fmt="polished"]');
+  const hasFiles = Boolean(meta.ai_files);
+  if (fbBtn) fbBtn.hidden = !hasFiles;
+  if (poBtn) poBtn.hidden = !hasFiles;
+
+  const box = $("ai-actions");
+  if (t.status !== "done" || !llmAvailable || hasFiles) { box.hidden = true; return; }
+  box.hidden = false;
+  const errBox = $("ai-error");
+  if (meta.ai_error) {
+    errBox.hidden = false;
+    errBox.textContent = `AI 反馈失败：${meta.ai_error}`;
+    $("ai-retry").textContent = "重试 AI 反馈";
+  } else {
+    errBox.hidden = true;
+    $("ai-retry").textContent = "生成 AI 反馈";
+  }
+}
+
+// 手动生成/重试：POST 触发后台 AI stage，恢复轮询看进度（失败只 alert，不打断页面）
+$("ai-retry").addEventListener("click", async () => {
+  $("ai-retry").disabled = true;
+  try {
+    const resp = await fetch(`/api/tasks/${currentTaskId}/feedback`, { method: "POST" });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      throw new Error(err.detail || `触发失败: ${resp.status}`);
+    }
+    startPolling();   // 恢复轮询，看 AI stage 进度
+  } catch (err) {
+    alert(err.message);
+  } finally {
+    $("ai-retry").disabled = false;
+  }
+});
 
 /**
  * 收到新的 transcript JSON：解析成 segments，把未渲染的段全部补上。
