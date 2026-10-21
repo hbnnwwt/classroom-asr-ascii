@@ -212,6 +212,64 @@ def test_static_file_not_found(client):
     assert r.status_code == 404
 
 
+# ---------------------------------------------------------------------------
+# AI 反馈产物下载：feedback/polished fmt + md 防抢占
+# ---------------------------------------------------------------------------
+def _mk_done_task_with_ai_files(isolated_db, task_id="dl1"):
+    """造一个 done 任务，outputs 里同时有转写 md 和两个 AI 产物。"""
+    import asr.web as wm
+    out_dir = wm.OUTPUT_ROOT / task_id
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / f"{task_id}_测试课.md").write_text("转写正文", encoding="utf-8")
+    (out_dir / f"{task_id}_测试课.feedback.md").write_text("# AI 课堂反馈", encoding="utf-8")
+    (out_dir / f"{task_id}_测试课.polished.md").write_text("# 优化稿", encoding="utf-8")
+    with closing(wm._db()) as conn:
+        conn.execute(
+            "INSERT INTO tasks (id, name, filename, input_path, output_dir,"
+            " status, progress, created_at, meta_json)"
+            " VALUES (?, '测试课', 'l.mp4', 'x', ?, 'done', 1.0, '2026-10-21', ?)",
+            (task_id, str(out_dir), json.dumps(
+                {"ai_files": {"feedback": f"{task_id}_测试课.feedback.md",
+                              "polished": f"{task_id}_测试课.polished.md"}},
+                ensure_ascii=False)),
+        )
+    return out_dir
+
+
+def test_download_md_not_hijacked_by_ai_files(client, isolated_db):
+    """md fmt 必须返回转写 md，不能被 .feedback.md/.polished.md 抢占。"""
+    _mk_done_task_with_ai_files(isolated_db)
+    r = client.get("/download/dl1/md")
+    assert r.status_code == 200
+    assert r.text == "转写正文"
+
+
+def test_download_feedback_and_polished_fmt(client, isolated_db):
+    _mk_done_task_with_ai_files(isolated_db)
+    r = client.get("/download/dl1/feedback")
+    assert r.status_code == 200
+    assert "# AI 课堂反馈" in r.text
+    assert "feedback.md" in r.headers.get("content-disposition", "")
+    r = client.get("/download/dl1/polished")
+    assert r.status_code == 200
+    assert "# 优化稿" in r.text
+
+
+def test_download_feedback_missing_404(client, isolated_db):
+    """任务没有 AI 产物 → feedback fmt 404（不 500）。"""
+    import asr.web as wm
+    out_dir = wm.OUTPUT_ROOT / "dl2"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    with closing(wm._db()) as conn:
+        conn.execute(
+            "INSERT INTO tasks (id, name, filename, input_path, output_dir,"
+            " status, progress, created_at)"
+            " VALUES ('dl2', 'n', 'a.mp4', 'x', ?, 'done', 1.0, '2026-10-21')",
+            (str(out_dir),),
+        )
+    assert client.get("/download/dl2/feedback").status_code == 404
+
+
 def _wait_done(client, task_id, timeout_s=5.0):
     """轮询直到状态非 pending/running。"""
     import time

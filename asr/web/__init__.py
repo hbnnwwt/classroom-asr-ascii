@@ -258,8 +258,9 @@ def status(task_id: str) -> JSONResponse:
 
 @app.get("/download/{task_id}/{fmt}")
 def download(task_id: str, fmt: str):
-    """下载指定格式输出（SRT/VTT/MD/TXT/JSON/REPLACE_LOG）。"""
-    ALLOWED = {"srt", "vtt", "md", "txt", "json", "replace.log", "mp4"}
+    """下载指定格式输出（SRT/VTT/MD/TXT/JSON/REPLACE_LOG/AI 反馈产物）。"""
+    ALLOWED = {"srt", "vtt", "md", "txt", "json", "replace.log", "mp4",
+               "feedback", "polished"}
     if fmt not in ALLOWED:
         raise HTTPException(400, f"不支持的格式: {fmt}")
 
@@ -271,17 +272,23 @@ def download(task_id: str, fmt: str):
         raise HTTPException(409, f"任务未完成: {row['status']}")
 
     out_dir = Path(row["output_dir"])
-    # 排除分段文件（{两位序号}_ 前缀，如 00_a.srt）——多段任务的整体 SRT
-    # 是 merged.srt，glob 顺序不保证它排在分段文件前面
-    files = [f for f in out_dir.glob(f"*.{fmt}")
-             if not re.match(r"^\d{2}_", f.name)]
+    if fmt in ("feedback", "polished"):
+        # AI 反馈产物：*.feedback.md / *.polished.md
+        files = list(out_dir.glob(f"*.{fmt}.md"))
+    else:
+        # 排除分段文件（{两位序号}_ 前缀）和 AI 产物——md 的 *.md glob 会
+        # 同时命中 *.feedback.md，而 files[0] 不保证顺序，不排除就是抢占
+        files = [
+            f for f in out_dir.glob(f"*.{fmt}")
+            if not re.match(r"^\d{2}_", f.name)
+            and not re.search(r"\.(feedback|polished)\.md$", f.name)
+        ]
     if not files:
         raise HTTPException(404, f"输出文件不存在: {fmt}")
     target = files[0]
-    return FileResponse(
-        str(target),
-        filename=f"{Path(row['filename']).stem}.{fmt}",
-    )
+    stem = row["name"] or Path(row["filename"]).stem
+    suffix = f".{fmt}.md" if fmt in ("feedback", "polished") else f".{fmt}"
+    return FileResponse(str(target), filename=f"{Path(stem).stem}{suffix}")
 
 
 @app.get("/download/{task_id}/part_srt/{index}")
