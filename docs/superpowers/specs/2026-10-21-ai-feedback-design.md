@@ -142,8 +142,12 @@ system 角色设定：资深教学评课专家兼文字编辑。输入 = 带说�
 - `{task_id}_{name}.feedback.md`
 - `{task_id}_{name}.polished.md`
 
-沿用现有命名前缀规则，现有下载列表 glob 自动带出，**零新下载端点**。task meta 登记
-`ai_files: {"feedback": "<文件名>", "polished": "<文件名>"}`。
+下载**复用现有 `/download/{id}/{fmt}` 路由**，扩展两个 fmt 值 `feedback` / `polished`
+（glob `*.{fmt}.md`）。注意：现有 `md` fmt 的 glob `*.md` 会同时匹配这两个文件，
+而 `files[0]` 不保证顺序——必须把 `*.feedback.md` / `*.polished.md` 从 `md` 的 glob
+结果里排除，否则会抢占现有 MD 下载（Never break userspace）。
+
+task meta 登记 `ai_files: {"feedback": "<文件名>", "polished": "<文件名>"}`。
 
 ## 7. Pipeline 集成与失败语义
 
@@ -180,7 +184,10 @@ system 角色设定：资深教学评课专家兼文字编辑。输入 = 带说�
 | `GET /api/llm/status` | **新增**：`{"enabled": bool, "model": str|null}`。enabled = `llm_enabled(cfg)` |
 | `POST /api/projects` | 表单可选字段 `ai_feedback`，缺省 false |
 | `POST /api/tasks/{id}/feedback` | **新增**：手动补跑，202/404/409 如上 |
-| 下载 | 无新端点，`.feedback.md` / `.polished.md` 走现有 glob |
+| 下载 | 无新路由；`/download/{id}/{fmt}` 扩展 fmt=`feedback`/`polished`，`md` glob 排除这两个后缀防抢占 |
+
+**前置修正**：`_run_pipeline` 的 done 更新目前整体覆盖 meta_json——改为读-改-写
+（保留 parts / merge_mode / ai_feedback 等既有键），否则 AI 开关和分段元数据会被冲掉。
 
 ## 9. 前端
 
@@ -192,9 +199,13 @@ system 角色设定：资深教学评课专家兼文字编辑。输入 = 带说�
 
 ### 任务页（task.html + task.js）
 
-- stage 列表加 "AI 反馈" 行：`meta.ai_feedback` 存在或 `meta.ai_error`/`ai_files`
-  非空时显示（与"拼接音轨"行同机制）。
-- 下载区：两个 `.md` 文件随现有列表自动出现，无新逻辑。
+- stage 列表加 "AI 反馈" 行（STAGE_ORDER 在 `write` 与 `done` 之间插入 `ai`）：
+  `meta.ai_feedback` 存在或 `meta.ai_error`/`ai_files` 非空时显示。
+- 下载区：两个固定按钮 "AI 点评"（data-fmt=feedback）/"优化稿"（data-fmt=polished），
+  `meta.ai_files` 存在且 done 时显示——不是动态 glob，下载按钮是静态 fmt 列表。
+- 轮询停止条件调整：`status==done` 且 `meta.ai_feedback` 为真但尚无 `ai_files`/
+  `ai_error`（AI 还在跑）→ **继续轮询**。AI 是 done 之后追加的 stage，不调整的话
+  前端会提前停止轮询，看不到 AI 进度和产物。
 - "AI 反馈"按钮（done 状态 + LLM 可用时显示，两种文案一个出口）：
   - 无 `ai_files` → "生成 AI 反馈"（覆盖上传没开开关的旧任务）
   - 有 `ai_error` → 错误条 + "重试 AI 反馈"
