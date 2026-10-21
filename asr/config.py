@@ -143,6 +143,11 @@ def load_config(
 
     def _read(p: Path) -> dict:
         if not p.exists():
+            # 同目录有模板（新克隆）→ 报错顺手指路；没有就不多嘴
+            if p.with_name("config.example.yaml").exists():
+                raise ConfigLoadError(
+                    f"配置文件不存在: {p}"
+                    f"（首次使用请先复制一份: config.example.yaml -> {p.name}）")
             raise ConfigLoadError(f"配置文件不存在: {p}")
         with p.open("r", encoding="utf-8") as f:
             return yaml.safe_load(f) or {}

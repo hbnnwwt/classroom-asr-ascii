@@ -3,6 +3,9 @@ REM 一键环境搭建：装依赖 + 下载模型（约 2.1 GB，只需联网跑一次）。
 REM 用法：双击 setup.bat，完成后双击 run_web.bat 启动服务。
 cd /d "%~dp0"
 
+REM First run: create local config.yaml (git-ignored, holds api_key) from template
+if not exist config.yaml copy /y config.example.yaml config.yaml >nul
+
 REM --- 1) 找 Python（优先 py 启动器，回退 PATH 里的 python）---
 set PY=
 py -3 --version >nul 2>&1 && set PY=py -3

@@ -6,6 +6,9 @@ __pycache__/
 
 # 模型与运行数据（用 setup.bat 重新下载/生成）
 models/
+
+# 用户活配置含 api_key 等秘密，模板在 config.example.yaml（首次 copy 一份）
+config.yaml
 tmp_models/
 asr/web/uploads/
 asr/web/web_state.db*

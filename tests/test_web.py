@@ -1575,8 +1575,12 @@ def test_upload_ai_feedback_flag_reaches_meta(client, isolated_db, monkeypatch):
 # 手动补跑 + LLM 状态端点
 # ---------------------------------------------------------------------------
 def test_llm_status_disabled_by_default(client, isolated_db):
-    """config.yaml 无 llm 节（默认仓库配置）→ enabled=false。"""
-    r = client.get("/api/llm/status")
+    """出厂模板 config.example.yaml 无 llm 节 → enabled=false。
+
+    不许用仓库根 config.yaml 当夹具——那是用户个人文件（含 key），
+    内容随本机配置变，测试会环境敏感。
+    """
+    r = client.get("/api/llm/status", params={"config": "config.example.yaml"})
     assert r.status_code == 200
     assert r.json() == {"enabled": False, "model": None}
 
@@ -1799,11 +1803,16 @@ def test_feedback_trigger_rejections(client, isolated_db):
     _mk_done_plain_task(isolated_db)  # fb1：done（末条断言的对象）
     _mk_done_plain_task(isolated_db, task_id="fb_running", status="running")
     _mk_done_plain_task(isolated_db, task_id="fb_pend", status="pending")
-    assert client.post("/api/tasks/nope/feedback").status_code == 404
-    assert client.post("/api/tasks/fb_running/feedback").status_code == 409
-    assert client.post("/api/tasks/fb_pend/feedback").status_code == 409
-    # done 任务但 LLM 未配置（仓库 config.yaml 无 llm 节）→ 409
-    assert client.post("/api/tasks/fb1/feedback").status_code == 409
+    # config 指出厂模板（无 llm 节）；仓库根 config.yaml 是用户个人文件，禁止当夹具
+    assert client.post("/api/tasks/nope/feedback",
+                       params={"config": "config.example.yaml"}).status_code == 404
+    assert client.post("/api/tasks/fb_running/feedback",
+                       params={"config": "config.example.yaml"}).status_code == 409
+    assert client.post("/api/tasks/fb_pend/feedback",
+                       params={"config": "config.example.yaml"}).status_code == 409
+    # done 任务但 LLM 未配置（出厂模板无 llm 节）→ 409
+    assert client.post("/api/tasks/fb1/feedback",
+                       params={"config": "config.example.yaml"}).status_code == 409
 
 
 def test_feedback_trigger_config_error_409(client, isolated_db, monkeypatch):

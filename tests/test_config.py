@@ -6,8 +6,8 @@ from asr.config import load_config, ConfigLoadError
 
 
 def test_load_default_config(strict_models=False):
-    """默认 config.yaml 应能加载通过（strict_models=False 时不验模型）。"""
-    cfg = load_config("config.yaml", strict_models=False)
+    """出厂模板 config.example.yaml 应能加载通过（strict_models=False 时不验模型）。"""
+    cfg = load_config("config.example.yaml", strict_models=False)
     assert cfg.engine == "funasr"
     assert cfg.language == "zh"
     assert cfg.device == "cpu"
@@ -25,6 +25,20 @@ def test_load_with_gpu_override(strict_models=False):
     """config.gpu.yaml 不存在时应报错。"""
     with pytest.raises(ConfigLoadError):
         load_config("config.yaml", overrides_path="config.gpu.yaml", strict_models=False)
+
+
+def test_missing_config_error_hints_example(tmp_path):
+    """config.yaml 不存在但同目录有模板 → 报错信息指路 copy（新克隆引导）。"""
+    (tmp_path / "config.example.yaml").write_text("device: cpu\n", encoding="utf-8")
+    with pytest.raises(ConfigLoadError, match="config.example.yaml"):
+        load_config(tmp_path / "config.yaml", strict_models=False)
+
+
+def test_missing_config_no_example_no_hint(tmp_path):
+    """同目录没有模板 → 报错就是纯"不存在"，不多嘴（回归保护）。"""
+    with pytest.raises(ConfigLoadError) as ei:
+        load_config(tmp_path / "config.yaml", strict_models=False)
+    assert "config.example.yaml" not in str(ei.value)
 
 
 def test_strict_models_passes_when_paths_exist():
@@ -123,8 +137,8 @@ def test_no_strict_all_missing_still_passes(tmp_path):
 def test_overrides_device_engine_language_applied():
     """P0-7：overrides 里 device/engine/language 必须落到 cfg。"""
     from asr.pipeline import _apply_overrides
-    cfg = load_config("config.yaml", strict_models=False)
-    assert (cfg.device, cfg.engine, cfg.language) == ("cpu", "funasr", "zh")  # config.yaml 基线
+    cfg = load_config("config.example.yaml", strict_models=False)
+    assert (cfg.device, cfg.engine, cfg.language) == ("cpu", "funasr", "zh")  # 出厂模板基线
     _apply_overrides(cfg, {"device": "cuda:0", "engine": "whisper", "language": "en"})
     assert cfg.device == "cuda:0"
     assert cfg.engine == "whisper"
@@ -134,7 +148,7 @@ def test_overrides_device_engine_language_applied():
 def test_overrides_none_and_unknown_keys_ignored():
     """P0-7 契约：None（CLI 未传）不覆盖 cfg；未知键静默忽略。"""
     from asr.pipeline import _apply_overrides
-    cfg = load_config("config.yaml", strict_models=False)
+    cfg = load_config("config.example.yaml", strict_models=False)
     _apply_overrides(cfg, {"device": None, "language": None, "nonsense": "x", "quality": "fast"})
     assert cfg.device == "cpu"
     assert cfg.language == "zh"

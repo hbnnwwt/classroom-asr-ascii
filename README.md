@@ -67,7 +67,10 @@ python -m asr.web --host 0.0.0.0 --port 8080   # 局域网开放
   api_key 仍需自填），可先"测试连接"再保存——写回 `config.yaml` 的 `llm` 节，
   已有注释与配置原样保留。未配置时点任务上的"AI 反馈"按钮也会直接跳到这里。
 - **手改文件**：`config.yaml` 加 `llm` 节即启用（OpenAI 兼容端点，一套代码通吃云 API
-  与本地 Ollama）；全留空则功能整体隐藏，不影响任何现有行为：
+  与本地 Ollama）；全留空则功能整体隐藏，不影响任何现有行为。
+  注意 `config.yaml` 已加入 `.gitignore`（含 api_key，不进仓库），仓库里只有模板
+  `config.example.yaml`——新克隆首次使用先 `copy config.example.yaml config.yaml`
+  （双击 `setup.bat` 会自动复制）：
 
 ```yaml
 llm:
