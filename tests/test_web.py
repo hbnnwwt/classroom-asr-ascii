@@ -416,6 +416,86 @@ def test_batch_export_includes_ai_stage_tasks(client, isolated_db):
 
 
 # ---------------------------------------------------------------------------
+# 下载名剥后缀：仅真实媒体/文档后缀剥一次，含点号任务名不截断
+# ---------------------------------------------------------------------------
+def test_download_name_with_dot_not_truncated(client, isolated_db):
+    """任务名 "3.2节 复习"：点号不是后缀分隔符，下载名必须保留全名。
+
+    旧实现 Path(stem).stem 双剥：".2节 复习" 被当后缀 → 下载名截成 "3.srt"。
+    """
+    from urllib.parse import quote
+    _mk_stage_task(isolated_db, "dot1", status="done", stage="done",
+                   name="3.2节 复习")
+    r = client.get("/download/dot1/srt")
+    assert r.status_code == 200
+    assert quote("3.2节 复习.srt") in r.headers.get("content-disposition", "")
+
+
+def test_download_name_from_filename_strips_once(client, isolated_db):
+    """无任务名回退文件名：真实媒体后缀剥一次（老行为不回归）。"""
+    from urllib.parse import quote
+    import asr.web as wm
+    out_dir = wm.OUTPUT_ROOT / "dot2"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "dot2_课.srt").write_text("x", encoding="utf-8")
+    with closing(wm._db()) as conn:
+        conn.execute(
+            "INSERT INTO tasks (id, filename, input_path, output_dir,"
+            " status, created_at) VALUES ('dot2', '3.2节 复习.mp4', 'x', ?,"
+            " 'done', '2026-10-21')",
+            (str(out_dir),),
+        )
+    r = client.get("/download/dot2/srt")
+    assert r.status_code == 200
+    assert quote("3.2节 复习.srt") in r.headers.get("content-disposition", "")
+
+
+def test_download_ai_fmt_name_keeps_dot(client, isolated_db):
+    """feedback/polished 的下载名 stem 不再被 Path.stem 剥第二次。"""
+    from urllib.parse import quote
+    import asr.web as wm
+    out_dir = wm.OUTPUT_ROOT / "dot3"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "dot3_课.md").write_text("正文", encoding="utf-8")
+    (out_dir / "dot3_3.2节 复习.feedback.md").write_text("# fb", encoding="utf-8")
+    with closing(wm._db()) as conn:
+        conn.execute(
+            "INSERT INTO tasks (id, name, filename, input_path, output_dir,"
+            " status, created_at) VALUES ('dot3', '3.2节 复习', 'l.mp4', 'x',"
+            " ?, 'done', '2026-10-21')",
+            (str(out_dir),),
+        )
+    r = client.get("/download/dot3/feedback")
+    assert r.status_code == 200
+    assert quote("3.2节 复习.feedback.md") in r.headers.get("content-disposition", "")
+    # 主 md 下载名同样不截断
+    r = client.get("/download/dot3/md")
+    assert quote("3.2节 复习.md") in r.headers.get("content-disposition", "")
+
+
+def test_part_srt_name_with_dot(client, isolated_db):
+    """分段下载名：段原名带点号也不截断；part_files 兜底名不双后缀。"""
+    from urllib.parse import quote
+    import asr.web as wm
+    out_dir = wm.OUTPUT_ROOT / "dot4"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "00_3.2节.srt").write_text("段", encoding="utf-8")
+    (out_dir / "merged.srt").write_text("整体", encoding="utf-8")
+    with closing(wm._db()) as conn:
+        conn.execute(
+            "INSERT INTO tasks (id, name, filename, input_path, output_dir,"
+            " status, created_at, meta_json) VALUES ('dot4', '课', 'a.mp4',"
+            " 'x', ?, 'done', '2026-10-21', ?)",
+            (str(out_dir), json.dumps(
+                {"parts": ["3.2节 复习.mp4"], "part_files": ["00_3.2节.srt"]},
+                ensure_ascii=False)),
+        )
+    r = client.get("/download/dot4/part_srt/0")
+    assert r.status_code == 200
+    assert quote("3.2节 复习.srt") in r.headers.get("content-disposition", "")
+
+
+# ---------------------------------------------------------------------------
 # 项目管理 API
 # ---------------------------------------------------------------------------
 def test_list_projects_empty(client):

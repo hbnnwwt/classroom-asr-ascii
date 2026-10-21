@@ -259,6 +259,21 @@ def status(task_id: str) -> JSONResponse:
     return JSONResponse(_row_to_dict(row))
 
 
+# 下载名剥后缀白名单：仅真实媒体/文档后缀才剥一次。任务名里的点号不是
+# 分隔符（"3.2节 复习"），Path.stem 会把 ".2节 复习" 当后缀剥掉——双剥后
+# 下载名截成 "3"。媒体后缀与 probe 支持面对齐；.srt 补 part_files 兜底路径。
+_KNOWN_STEM_EXTS = {
+    ".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm", ".ts", ".m4v",
+    ".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".opus", ".wma", ".srt",
+}
+
+
+def _strip_known_ext(name: str) -> str:
+    """仅当后缀在白名单内才剥一次；否则原样返回（含点号任务名不截断）。"""
+    p = Path(name)
+    return p.stem if p.suffix.lower() in _KNOWN_STEM_EXTS else name
+
+
 @app.get("/download/{task_id}/{fmt}")
 def download(task_id: str, fmt: str):
     """下载指定格式输出（SRT/VTT/MD/TXT/JSON/REPLACE_LOG/AI 反馈产物）。"""
@@ -292,9 +307,11 @@ def download(task_id: str, fmt: str):
     if not files:
         raise HTTPException(404, f"输出文件不存在: {fmt}")
     target = files[0]
-    stem = row["name"] or Path(row["filename"]).stem
+    # 剥后缀只认白名单：任务名/文件名里的点号（"3.2节 复习.mp4" 的 ".2节 复习"
+    # 不是后缀）不许被 Path.stem 连剥两次把名字截断
+    stem = _strip_known_ext(row["name"] or row["filename"])
     suffix = f".{fmt}.md" if fmt in ("feedback", "polished") else f".{fmt}"
-    return FileResponse(str(target), filename=f"{Path(stem).stem}{suffix}")
+    return FileResponse(str(target), filename=f"{stem}{suffix}")
 
 
 @app.get("/download/{task_id}/part_srt/{index}")
@@ -321,9 +338,10 @@ def download_part_srt(task_id: str, index: int):
     target = Path(row["output_dir"]) / part_files[index]
     if not target.exists():
         raise HTTPException(404, f"分段字幕文件缺失: {part_files[index]}")
-    # 下载名用该段原名（去后缀），用户拿到即可对上原视频
+    # 下载名用该段原名（去真实后缀），用户拿到即可对上原视频；
+    # 段名含点号（"3.2节 复习.mp4"）不许被截断，兜底名（.srt）不双后缀
     name = parts[index] if index < len(parts) else part_files[index]
-    return FileResponse(str(target), filename=f"{Path(name).stem}.srt")
+    return FileResponse(str(target), filename=f"{_strip_known_ext(name)}.srt")
 
 
 # ---------------------------------------------------------------------------
