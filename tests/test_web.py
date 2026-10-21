@@ -349,6 +349,73 @@ def test_download_rejects_bad_fmt(client):
 
 
 # ---------------------------------------------------------------------------
+# AI stage 期间解锁转写产物下载（转写产物在 AI stage 开始前已最终落盘）
+# ---------------------------------------------------------------------------
+def _mk_stage_task(isolated_db, task_id, *, status="running", stage="ai", name="课"):
+    """造一个指定 status/stage 的任务，输出目录里已有最终转写产物。"""
+    import asr.web as wm
+    out_dir = wm.OUTPUT_ROOT / task_id
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / f"{task_id}_课.srt").write_text(
+        "1\n00:00:00,000 --> 00:00:01,000\n正文\n", encoding="utf-8")
+    with closing(wm._db()) as conn:
+        conn.execute(
+            "INSERT INTO tasks (id, name, filename, input_path, output_dir,"
+            " status, progress, stage, created_at, meta_json)"
+            " VALUES (?, ?, 'l.mp4', 'x', ?, ?, 0.3, ?, '2026-10-21', ?)",
+            (task_id, name, str(out_dir), status, stage,
+             json.dumps({"ai_feedback": True}, ensure_ascii=False)),
+        )
+    return out_dir
+
+
+def test_download_during_ai_stage_returns_200(client, isolated_db):
+    """running + stage=ai：AI 反馈只是转写后的追加阶段，产物已最终落盘 → 可下载。"""
+    _mk_stage_task(isolated_db, "aidl1")
+    r = client.get("/download/aidl1/srt")
+    assert r.status_code == 200
+    assert "正文" in r.text
+
+
+def test_download_asr_stage_still_409(client, isolated_db):
+    """running + stage=asr：转写本体还没写盘 → 仍 409（防半成品语义保留）。"""
+    _mk_stage_task(isolated_db, "aidl2", stage="asr")
+    assert client.get("/download/aidl2/srt").status_code == 409
+
+
+def test_part_srt_download_during_ai_stage(client, isolated_db):
+    """分段字幕同口径：AI stage 期间可下载（拼接字幕早已写完）。"""
+    import asr.web as wm
+    out_dir = _mk_stage_task(isolated_db, "aidl3")
+    (out_dir / "00_a.srt").write_text("段一", encoding="utf-8")
+    with closing(wm._db()) as conn:
+        conn.execute(
+            "UPDATE tasks SET meta_json=? WHERE id='aidl3'",
+            (json.dumps({"parts": ["a.mp4"], "part_files": ["00_a.srt"],
+                         "ai_feedback": True}, ensure_ascii=False),),
+        )
+    r = client.get("/download/aidl3/part_srt/0")
+    assert r.status_code == 200
+    assert "段一" in r.text
+
+
+def test_batch_export_includes_ai_stage_tasks(client, isolated_db):
+    """批量导出：running+stage=ai 进 ZIP 且不进 _skipped；stage=asr 反之。"""
+    import zipfile as _z
+    import io as _io
+    _mk_stage_task(isolated_db, "aidl4", name="课A")
+    _mk_stage_task(isolated_db, "aidl5", stage="asr", name="课B")
+    r = client.post("/api/projects/batch-export", json={"ids": ["aidl4", "aidl5"]})
+    assert r.status_code == 200
+    with _z.ZipFile(_io.BytesIO(r.content)) as zf:
+        names = zf.namelist()
+        skipped = {it["id"] for it in json.loads(zf.read("_skipped.json"))}
+    assert any(n.startswith("课A/") for n in names), "AI stage 任务应进 ZIP"
+    assert not any(n.startswith("课B/") for n in names), "asr 阶段仍跳过"
+    assert "aidl4" not in skipped and "aidl5" in skipped
+
+
+# ---------------------------------------------------------------------------
 # 项目管理 API
 # ---------------------------------------------------------------------------
 def test_list_projects_empty(client):

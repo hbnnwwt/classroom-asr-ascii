@@ -271,7 +271,10 @@ def download(task_id: str, fmt: str):
         row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
     if row is None:
         raise HTTPException(404, "任务不存在")
-    if row["status"] != "done":
+    # AI stage 是转写完成后的追加阶段：进入它时转写产物（srt/txt/…）已最终
+    # 落盘，锁下载只会让用户白等一次 LLM。stage=ai 放行；asr 等其余阶段
+    # running 仍拒绝（转写本体可能是半成品，防半成品语义保留）。
+    if row["status"] != "done" and row["stage"] != "ai":
         raise HTTPException(409, f"任务未完成: {row['status']}")
 
     out_dir = Path(row["output_dir"])
@@ -301,7 +304,9 @@ def download_part_srt(task_id: str, index: int):
         row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
     if row is None:
         raise HTTPException(404, "任务不存在")
-    if row["status"] != "done":
+    # 同主下载路由：AI stage 期间分段字幕已最终落盘（拼接字幕在它之前写完），
+    # 放行；其余 running 阶段仍 409。
+    if row["status"] != "done" and row["stage"] != "ai":
         raise HTTPException(409, f"任务未完成: {row['status']}")
 
     try:
@@ -546,9 +551,10 @@ def batch_export(payload: dict):
         raise HTTPException(400, "单次最多导出 20 个项目（避免内存爆炸）")
 
     # 预先查 DB，按 name 组织文件路径（用 name 而不是 id 当 zip 内目录名更友好）
+    # stage 一并取出：running+stage=ai 的任务转写产物已终态，也要进 ZIP。
     with closing(_db()) as conn:
         rows = conn.execute(
-            "SELECT id, name, filename, output_dir, status FROM tasks WHERE id IN ({})".format(
+            "SELECT id, name, filename, output_dir, status, stage FROM tasks WHERE id IN ({})".format(
                 ",".join("?" * len(ids))
             ),
             ids,
@@ -563,7 +569,9 @@ def batch_export(payload: dict):
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
             seen_names: set[str] = set()
             for row in rows:
-                if row["status"] != "done":
+                # 与主下载路由同口径：AI stage 期间产物已终态可导出，
+                # 其余未完成任务跳过（防半成品进 ZIP）
+                if row["status"] != "done" and row["stage"] != "ai":
                     continue
                 # 每个项目一个子目录：<项目名>/<原文件名>.srt 等
                 folder = row["name"] or row["filename"] or row["id"]
@@ -582,10 +590,12 @@ def batch_export(payload: dict):
                     if f.is_file():
                         zf.write(f, arcname=f"{folder_unique}/{f.name}")
 
-            # 把失败/无输出的项目写到 manifest 里，让用户知道
+            # 把失败/无输出的项目写到 manifest 里，让用户知道。
+            # 已进 ZIP 的（含 AI stage 任务）不得再列成 skipped，否则 manifest 自相矛盾
             skipped = [
                 {"id": r["id"], "name": r["name"], "status": r["status"]}
-                for r in rows if r["status"] != "done"
+                for r in rows
+                if r["status"] != "done" and r["stage"] != "ai"
             ]
             if skipped:
                 import json as _j

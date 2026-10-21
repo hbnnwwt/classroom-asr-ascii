@@ -163,7 +163,9 @@ function updateUI(t) {
   if (t.transcript) handleTranscript(t.transcript);
 
   if (t.status === "failed") showError(t.error || "失败");
-  if (t.status === "done") {
+  // AI stage（running+stage=ai）期间转写产物已最终落盘，后端已放行下载：
+  // 下载区照常显示，别让用户白等一次 LLM。
+  if (t.status === "done" || (t.status === "running" && t.stage === "ai")) {
     $("downloads").hidden = false;
     document.querySelectorAll("#downloads .btn").forEach((a) => {
       a.href = `/download/${currentTaskId}/${a.dataset.fmt}`;
