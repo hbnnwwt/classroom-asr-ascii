@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>设置 - Classroom ASR</title>
+  <link rel="stylesheet" href="/static/style.css" />
+  <!-- 首帧前应用已存的主题选择，避免闪一下错误配色（theme.js 见 body 末尾） -->
+  <script>
+    try {
+      var t = localStorage.getItem("theme");
+      if (t === "dark" || t === "light") document.documentElement.setAttribute("data-theme", t);
+    } catch (e) { /* localStorage 不可用就跟随系统 */ }
+  </script>
+</head>
+<body>
+  <main>
+    <header class="page-header">
+      <div>
+        <a href="/" class="back-link">
+          <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M19 12H5"/><path d="m12 19-7-7 7-7"/></svg>
+          返回项目列表
+        </a>
+        <h1>设置</h1>
+      </div>
+      <div class="header-actions">
+        <button id="theme-toggle" type="button" class="theme-toggle" aria-label="切换主题">
+          <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8"/><path d="M12 17v4"/></svg>
+        </button>
+      </div>
+    </header>
+
+    <section>
+      <h2>AI 反馈（LLM）</h2>
+      <p class="meta">
+        云 API（GLM / DeepSeek 等）与本地 Ollama 都走 OpenAI 兼容端点。
+        base_url 与 model 都填好即启用；清空保存即关闭。
+        示例：Ollama 用 <code>http://localhost:11434/v1</code>（api_key 留空）。
+      </p>
+      <form id="llm-form">
+        <label>
+          base_url
+          <input type="text" id="base-url" placeholder="https://open.bigmodel.cn/api/paas/v4" />
+        </label>
+        <label>
+          api_key（本地模型留空）
+          <input type="password" id="api-key" placeholder="sk-..." autocomplete="off" />
+        </label>
+        <label>
+          model
+          <input type="text" id="model" placeholder="glm-4-flash / qwen2.5:7b" />
+        </label>
+        <div class="form-row">
+          <label>
+            timeout（秒）
+            <input type="number" id="timeout" min="1" value="300" />
+          </label>
+          <label>
+            max_tokens
+            <input type="number" id="max-tokens" min="1" value="16384" />
+          </label>
+        </div>
+        <div class="form-actions">
+          <button type="button" id="test-btn" class="btn">测试连接</button>
+          <button type="button" id="save-btn" class="btn btn-primary">保存</button>
+        </div>
+      </form>
+      <p id="test-result" class="meta" hidden></p>
+      <p id="save-result" class="meta" hidden></p>
+    </section>
+  </main>
+
+  <script src="/static/theme.js"></script>
+  <script src="/static/settings.js"></script>
+</body>
+</html>

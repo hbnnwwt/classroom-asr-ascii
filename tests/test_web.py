@@ -534,6 +534,29 @@ def test_list_projects_with_data(client):
     assert "transcript" not in data["items"][0]
 
 
+def test_list_projects_meta_ai_fields(client):
+    """列表接口透传 meta 里的 ai_files / ai_error —— 首页 AI 按钮的显隐依据。"""
+    rows = [
+        ("ai1", {"ai_files": {"feedback": "a.feedback.md", "polished": "a.polished.md"}},
+         "2026-10-21T10:00:00"),
+        ("ai2", {"ai_error": "LLM boom"}, "2026-10-21T10:00:01"),
+    ]
+    with _db() as c:
+        for tid, meta, ts in rows:
+            c.execute(
+                """INSERT INTO tasks (id, name, filename, input_path, output_dir,
+                                     status, created_at, meta_json)
+                   VALUES (?, ?, ?, ?, ?, 'done', ?, ?)""",
+                (tid, f"项目{tid}", "a.mp4", "/in", "/out", ts, json.dumps(meta)),
+            )
+
+    r = client.get("/api/projects")
+    assert r.status_code == 200
+    items = {it["id"]: it for it in r.json()["items"]}
+    assert items["ai1"]["meta"]["ai_files"]["polished"] == "a.polished.md"
+    assert items["ai2"]["meta"]["ai_error"] == "LLM boom"
+
+
 def test_list_projects_filter_by_status(client):
     """?status= 筛选。"""
     with _db() as c:
@@ -1567,6 +1590,148 @@ def test_llm_status_enabled(client, isolated_db, monkeypatch):
     monkeypatch.setattr(wm, "load_config", lambda *a, **kw: fake)
     r = client.get("/api/llm/status")
     assert r.json() == {"enabled": True, "model": "fake-m"}
+
+
+# ---------------------------------------------------------------------------
+# 设置页：llm 配置读写（真文件 roundtrip，文本手术见 test_config.py）+ 连接测试
+# ---------------------------------------------------------------------------
+def _write_settings_cfg(tmp_path, llm_block=""):
+    """可加载的最小 config（strict_models=False 不验模型路径），llm 块可选。"""
+    cfg = tmp_path / "settings_cfg.yaml"
+    cfg.write_text(
+        "# 顶部注释，不许动\n"
+        "device: cpu\n"
+        "models:\n"
+        "  funasr:\n"
+        "    asr: m/asr\n    vad: m/vad\n    punc: m/punc\n    spk: m/spk\n"
+        "  whisper:\n    size: small\n    compute_type: int8\n"
+        + llm_block,
+        encoding="utf-8",
+    )
+    return cfg
+
+
+_LLM_BODY = {"base_url": "http://127.0.0.1:8902/v1", "api_key": "k1",
+             "model": "fake-glm", "timeout": 60, "max_tokens": 4096}
+
+
+def test_llm_settings_get_roundtrip(client, isolated_db, tmp_path):
+    """GET 回填：读出 llm 节全部字段（缺省字段给默认值）。"""
+    cfg = _write_settings_cfg(tmp_path, (
+        "llm:\n  base_url: http://o/v1\n  api_key: k1\n"
+        "  model: m1\n  timeout: 60\n"
+    ))
+    r = client.get("/api/llm/settings", params={"config": str(cfg)})
+    assert r.status_code == 200
+    d = r.json()
+    assert d == {"base_url": "http://o/v1", "api_key": "k1", "model": "m1",
+                 "timeout": 60, "max_tokens": 16384}
+
+
+def test_llm_settings_get_absent_defaults(client, isolated_db, tmp_path):
+    """无 llm 节 → 全空/默认（设置页表单空态）。"""
+    cfg = _write_settings_cfg(tmp_path)
+    r = client.get("/api/llm/settings", params={"config": str(cfg)})
+    assert r.status_code == 200
+    assert r.json()["base_url"] == ""
+    assert r.json()["model"] == ""
+    assert r.json()["timeout"] == 300
+
+
+def test_llm_settings_save_surgery_and_status(client, isolated_db, tmp_path):
+    """POST 保存：注释模板被替换为活节、其他注释保住、status 端点立刻反映。"""
+    cfg = _write_settings_cfg(tmp_path, "# llm:\n#   base_url: old\n")
+    r = client.post("/api/llm/settings", params={"config": str(cfg)},
+                    json=_LLM_BODY)
+    assert r.status_code == 200
+    assert r.json() == {"status": "saved", "enabled": True}
+    text = cfg.read_text(encoding="utf-8")
+    assert "# 顶部注释，不许动" in text
+    assert "#   base_url: old" not in text
+    assert '\n  model: "fake-glm"\n' in text
+    r2 = client.get("/api/llm/status", params={"config": str(cfg)})
+    assert r2.json() == {"enabled": True, "model": "fake-glm"}
+
+
+def test_llm_settings_save_disable(client, isolated_db, tmp_path):
+    """清空 base_url/model 保存 = 功能关闭（表单即状态，无第二个开关）。"""
+    cfg = _write_settings_cfg(tmp_path, "llm:\n  base_url: http://o/v1\n  model: m1\n")
+    r = client.post("/api/llm/settings", params={"config": str(cfg)},
+                    json={"base_url": "", "api_key": "", "model": "",
+                          "timeout": 300, "max_tokens": 16384})
+    assert r.status_code == 200
+    assert r.json()["enabled"] is False
+    r2 = client.get("/api/llm/status", params={"config": str(cfg)})
+    assert r2.json()["enabled"] is False
+
+
+def test_llm_settings_save_validates(client, isolated_db, tmp_path):
+    """base_url 非 http(s) / 非正数 timeout → 422，且不落盘。"""
+    cfg = _write_settings_cfg(tmp_path)
+    for bad in ({**_LLM_BODY, "base_url": "ftp://x"},
+                {**_LLM_BODY, "timeout": 0},
+                {**_LLM_BODY, "max_tokens": -1}):
+        r = client.post("/api/llm/settings", params={"config": str(cfg)}, json=bad)
+        assert r.status_code == 422, bad
+    assert "llm:" not in cfg.read_text(encoding="utf-8")
+
+
+def test_llm_settings_save_missing_file_409(client, isolated_db, tmp_path):
+    """config 文件不存在 → 409（不许静默新建一个空配置）。"""
+    r = client.post("/api/llm/settings",
+                    params={"config": str(tmp_path / "nope.yaml")},
+                    json=_LLM_BODY)
+    assert r.status_code == 409
+
+
+def test_llm_test_ok(client, isolated_db, monkeypatch):
+    """测试连接：成功 → ok + 回复摘要；timeout 上限 30s 防按钮挂死。"""
+    import asr.web as wm
+    seen = {}
+
+    def fake_chat(messages, cfg, *, temperature=0.3, max_tokens=None):
+        seen["model"] = cfg.llm.model
+        seen["timeout"] = cfg.llm.timeout
+        seen["max_tokens"] = max_tokens
+        return "ok"
+
+    monkeypatch.setattr(wm, "chat", fake_chat)
+    r = client.post("/api/llm/test", json=_LLM_BODY)
+    assert r.status_code == 200
+    d = r.json()
+    assert d["ok"] is True
+    assert seen["model"] == "fake-glm"
+    assert seen["timeout"] == 30          # min(timeout, 30)
+    assert seen["max_tokens"] == 16
+
+
+def test_llm_test_error(client, isolated_db, monkeypatch):
+    """测试连接：LLMError → ok=false + 错误消息（测试结果是数据，不是 5xx）。"""
+    import asr.web as wm
+    from asr.llm import LLMError
+
+    def fake_chat(messages, cfg, *, temperature=0.3, max_tokens=None):
+        raise LLMError("LLM HTTP 401: bad key")
+
+    monkeypatch.setattr(wm, "chat", fake_chat)
+    r = client.post("/api/llm/test", json=_LLM_BODY)
+    assert r.status_code == 200
+    assert r.json() == {"ok": False, "error": "LLM HTTP 401: bad key"}
+
+
+def test_llm_test_empty_values_no_call(client, isolated_db, monkeypatch):
+    """base_url/model 为空 → ok=false 且不发起调用。"""
+    import asr.web as wm
+
+    def fake_chat(*a, **kw):  # pragma: no cover - 到这里就是错
+        raise AssertionError("空值不得调用 chat")
+
+    monkeypatch.setattr(wm, "chat", fake_chat)
+    r = client.post("/api/llm/test",
+                    json={"base_url": "", "api_key": "", "model": "m",
+                          "timeout": 30, "max_tokens": 100})
+    assert r.status_code == 200
+    assert r.json()["ok"] is False
 
 
 def _mk_done_plain_task(isolated_db, task_id="fb1", status="done"):

@@ -22,7 +22,7 @@ let taskElapsedTimer = null; // 每秒刷整体已用时间
 let currentStage = null;      // 当前阶段名（用于 elapsed 显示）
 let stageStartTime = 0;       // 当前阶段开始时间（来自后端 stage_started_at，刷新不重置）
 let taskStatus = null;        // 当前任务状态（done 时一次性渲染 transcript）
-let llmAvailable = false;     // LLM 是否配置（决定手动生成/重试按钮渲染）
+let llmAvailable = false;     // LLM 是否配置（未配置时点"生成 AI 反馈"跳设置页）
 
 /**
  * 页面加载时恢复任务：URL 路径 /task/{id} 优先（管理界面跳转过来），
@@ -74,14 +74,10 @@ async function restoreLastTask() {
   startPolling();
 }
 
-// LLM 可用性先探再恢复任务：fetch 异步，若晚于首轮 poll 到达，done 任务
-// 的按钮会按 llmAvailable=false 收起且轮询已停——补一轮 poll 用真值重绘。
+// LLM 可用性：只影响"生成 AI 反馈"点击行为（未配置跳设置页），不再门控按钮渲染。
 fetch("/api/llm/status")
   .then((r) => r.json())
-  .then((s) => {
-    llmAvailable = Boolean(s.enabled);
-    if (llmAvailable && taskStatus === "done" && !pollTimer) poll();
-  })
+  .then((s) => { llmAvailable = Boolean(s.enabled); })
   .catch(() => {});
 
 restoreLastTask();
@@ -212,7 +208,8 @@ function renderPartDownloads(meta) {
 
 /**
  * AI 反馈按钮区（仅 done 分支调用）：两个下载按钮显隐 + 手动生成/重试。
- * done + LLM 可用 +（无产物 或 有错误）→ 显示按钮；有产物无错 → 只留下载。
+ * done +（无产物 或 有错误）→ 显示按钮（未配置 LLM 也显示，点击跳设置页）；
+ * 有产物无错 → 只留下载。
  */
 function renderAiUi(t) {
   const meta = t.meta || {};
@@ -227,7 +224,7 @@ function renderAiUi(t) {
   if (poBtn) poBtn.hidden = !hasFiles;
 
   const box = $("ai-actions");
-  if (t.status !== "done" || !llmAvailable || hasFiles) { box.hidden = true; return; }
+  if (t.status !== "done" || hasFiles) { box.hidden = true; return; }
   box.hidden = false;
   const errBox = $("ai-error");
   if (meta.ai_error) {
@@ -242,6 +239,8 @@ function renderAiUi(t) {
 
 // 手动生成/重试：POST 触发后台 AI stage，恢复轮询看进度（失败只 alert，不打断页面）
 $("ai-retry").addEventListener("click", async () => {
+  // 未配置 LLM：不 POST（必吃 409），直接送去设置页
+  if (!llmAvailable) { window.location.href = "/settings"; return; }
   $("ai-retry").disabled = true;
   try {
     const resp = await fetch(`/api/tasks/${currentTaskId}/feedback`, { method: "POST" });

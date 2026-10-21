@@ -13,6 +13,7 @@ Web UI（FastAPI）：
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import sqlite3
@@ -21,13 +22,15 @@ import uuid
 from contextlib import asynccontextmanager, closing
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from loguru import logger
+from pydantic import BaseModel
 
 from ..analyze import compute_stats
-from ..config import ConfigLoadError, load_config
+from ..config import LLMConfig, ConfigLoadError, load_config, write_llm_section
 from ..feedback import build_feedback_messages, build_polish_messages
 from ..llm import LLMError, chat, llm_enabled
 from ..media import probe
@@ -191,6 +194,15 @@ def task_page(task_id: str) -> FileResponse:
     """项目详情页：单项目转写进度 + transcript。"""
     return FileResponse(
         str(STATIC_DIR / "task.html"),
+        headers={"Cache-Control": "no-cache, must-revalidate"},
+    )
+
+
+@app.get("/settings", response_class=HTMLResponse)
+def settings_page() -> FileResponse:
+    """设置页：LLM 配置表单（AI 反馈入口跳转目标）。"""
+    return FileResponse(
+        str(STATIC_DIR / "settings.html"),
         headers={"Cache-Control": "no-cache, must-revalidate"},
     )
 
@@ -655,6 +667,71 @@ def llm_status(config: str = "config.yaml"):
         return JSONResponse({"enabled": False, "model": None})
     return JSONResponse({"enabled": llm_enabled(cfg),
                          "model": cfg.llm.model or None})
+
+
+class _LLMBody(BaseModel):
+    """设置页表单体。全字段可空——表单即状态：清空 base_url/model 保存 = 关闭功能。"""
+    base_url: str = ""
+    api_key: str = ""
+    model: str = ""
+    timeout: int = 300
+    max_tokens: int = 16384
+
+
+@app.get("/api/llm/settings")
+def llm_settings_get(config: str = "config.yaml"):
+    """设置页回填：llm 节当前值。配置加载失败按空态返回（页面不许被打挂）。"""
+    try:
+        cfg = load_config(config, strict_models=False)
+    except ConfigLoadError:
+        cfg = None
+    llm = cfg.llm if cfg is not None else LLMConfig()
+    return JSONResponse({"base_url": llm.base_url, "api_key": llm.api_key,
+                         "model": llm.model, "timeout": llm.timeout,
+                         "max_tokens": llm.max_tokens})
+
+
+@app.post("/api/llm/settings")
+def llm_settings_save(body: _LLMBody, config: str = "config.yaml"):
+    """保存 llm 节：文本手术写回（保注释，见 write_llm_section），原子替换。"""
+    base_url = body.base_url.strip()
+    if base_url and not re.match(r"^https?://", base_url):
+        raise HTTPException(422, "base_url 必须以 http:// 或 https:// 开头")
+    if body.timeout <= 0 or body.max_tokens <= 0:
+        raise HTTPException(422, "timeout / max_tokens 必须为正整数")
+    path = Path(config)
+    if not path.is_file():
+        # 不静默新建：这个文件承载全部 ASR 配置，凭空造一个空的等于毁配置
+        raise HTTPException(409, f"配置文件不存在: {config}")
+
+    new_text = write_llm_section(
+        path.read_text(encoding="utf-8"),
+        {"base_url": base_url, "api_key": body.api_key.strip(),
+         "model": body.model.strip(), "timeout": body.timeout,
+         "max_tokens": body.max_tokens},
+    )
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(new_text, encoding="utf-8")
+    os.replace(tmp, path)   # 原子替换：写一半断电也不会毁掉整个 config.yaml
+    enabled = bool(base_url and body.model.strip())
+    return JSONResponse({"status": "saved", "enabled": enabled})
+
+
+@app.post("/api/llm/test")
+def llm_test(body: _LLMBody):
+    """测试连接：拿传入值试调一次（不落盘）。结果是数据不是错误，永远 200。"""
+    if not (body.base_url.strip() and body.model.strip()):
+        return JSONResponse({"ok": False, "error": "base_url 与 model 不能为空"})
+    # 测试调用上限 30s / 16 token：点一下按钮挂 300 秒是烂体验
+    cfg = SimpleNamespace(llm=LLMConfig(
+        base_url=body.base_url, api_key=body.api_key, model=body.model,
+        timeout=min(body.timeout, 30), max_tokens=body.max_tokens))
+    try:
+        reply = chat([{"role": "user", "content": "请只回复：ok"}], cfg,
+                     max_tokens=16)
+    except LLMError as e:
+        return JSONResponse({"ok": False, "error": str(e)})
+    return JSONResponse({"ok": True, "reply": (reply or "")[:50]})
 
 
 @app.post("/api/tasks/{task_id}/feedback")

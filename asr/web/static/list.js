@@ -11,6 +11,7 @@ const STATUS_LABEL = {
 let searchTimer = null;
 let listPollTimer = null;
 const selectedIds = new Set();  // 复选框选中状态
+let llmEnabled = false;         // /api/llm/status 探明后置 true（默认藏好，别给没配置的用户看死按钮）
 
 // ---------------------------------------------------------------------------
 // 项目列表
@@ -103,6 +104,20 @@ function renderProjects(items) {
       dl.className = "action-btn";
       dl.title = "下载 SRT 字幕";
       tdActions.appendChild(dl);
+
+      // AI 反馈入口：与详情页同一套显隐规则——没跑过或失败要重试才显示，
+      // 已有产物不占 UI（重跑走 API）。未配置 LLM 也显示：点击跳设置页。
+      const hasFiles = Boolean(p.meta && p.meta.ai_files);
+      const hasError = Boolean(p.meta && p.meta.ai_error);
+      if (!hasFiles || hasError) {
+        const ai = document.createElement("button");
+        ai.type = "button";
+        ai.textContent = "AI 反馈";
+        ai.className = "action-btn";
+        ai.title = hasError ? "上次 AI 反馈失败，点击重试" : "生成 AI 反馈（点评 + 优化稿）";
+        ai.onclick = () => runAiFeedback(p);
+        tdActions.appendChild(ai);
+      }
     } else if (p.status === "running" || p.status === "pending") {
       const view = document.createElement("a");
       view.href = `/task/${p.id}`;
@@ -122,6 +137,19 @@ function renderProjects(items) {
     tr.append(tdCheck, tdName, tdFile, tdStatus, tdProgress, tdSegs, tdTime, tdActions);
     tbody.appendChild(tr);
   }
+}
+
+async function runAiFeedback(p) {
+  // 未配置 → 跳设置页配置（配置好回来再点就是真触发）
+  if (!llmEnabled) { window.location.href = "/settings"; return; }
+  // 详情页按钮的同款出口：202 后行变"处理中"，2 秒轮询自动接管
+  const resp = await fetch(`/api/tasks/${p.id}/feedback`, { method: "POST" });
+  if (!resp.ok) {
+    const err = await resp.json().catch(() => ({}));
+    alert(err.detail || `请求失败: ${resp.status}`);
+    return;
+  }
+  await loadProjects();
 }
 
 async function deleteProject(p) {
@@ -470,5 +498,11 @@ if (oldTaskParam) {
 // ---------------------------------------------------------------------------
 fetch("/api/llm/status")
   .then((r) => r.json())
-  .then((s) => { if (s.enabled) $("ai-feedback-block").hidden = false; })
+  .then((s) => {
+    if (!s.enabled) return;
+    llmEnabled = true;
+    $("ai-feedback-block").hidden = false;
+    // 列表可能先于此返回（竞态）：补一次渲染让 AI 按钮出现
+    loadProjects();
+  })
   .catch(() => {});

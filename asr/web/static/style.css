@@ -313,6 +313,8 @@ button.primary:hover:not(:disabled) { background: var(--accent-hover); }
 }
 .theme-toggle:hover { background: var(--border); }
 .theme-toggle svg.icon { width: 18px; height: 18px; }
+/* header 设置入口是 <a>，借 theme-toggle 的图标按钮皮，补锚点缺失的盒模型 */
+a.theme-toggle { display: inline-flex; align-items: center; justify-content: center; text-decoration: none; }
 .back-link {
   color: var(--accent); text-decoration: none; font-size: 13px;
   display: inline-flex; align-items: center; gap: 5px;

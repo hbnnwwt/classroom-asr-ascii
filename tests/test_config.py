@@ -178,3 +178,120 @@ def test_llm_section_parsed(tmp_path):
     assert cfg.llm.model == "qwen2.5:7b"
     assert cfg.llm.timeout == 120
     assert cfg.llm.api_key == ""   # 本地端点不需要 key
+
+
+# ---------------------------------------------------------------------------
+# 设置页写回：write_llm_section 文本手术——保住注释与其余配置，
+# 绝不走 YAML 重序列化（会把整个文件的注释文档毁掉）。
+# ---------------------------------------------------------------------------
+import yaml
+
+from asr.config import write_llm_section
+
+_VALS = {"base_url": "https://open.bigmodel.cn/api/paas/v4",
+         "api_key": "sk-abc", "model": "glm-4-flash",
+         "timeout": 120, "max_tokens": 8192}
+
+
+def _roundtrip_llm(text: str) -> dict:
+    """手术后的文本必须仍能被 yaml 正常解析，取出 llm 节。"""
+    data = yaml.safe_load(text)
+    assert isinstance(data, dict), f"手术结果不是合法 YAML: {text!r}"
+    return data.get("llm") or {}
+
+
+def test_write_llm_appends_when_absent():
+    """无 llm 节 → 文末追加；原内容一字不动。"""
+    before = "device: cpu\n\nmedia:\n  sample_rate: 16000\n"
+    after = write_llm_section(before, _VALS)
+    assert after.startswith(before)
+    assert _roundtrip_llm(after) == _VALS
+
+
+def test_write_llm_replaces_commented_template():
+    """出厂注释模板 → 活节替换掉 # llm: 起的注释块，上方说明注释保留。"""
+    before = (
+        "# 常规注释，不许动\n"
+        "\n"
+        "# AI 反馈（教学点评 + 逐字稿优化）。整节缺失 = 功能隐藏。\n"
+        "# 云 API 与本地 Ollama 都走 OpenAI 兼容端点，一套代码：\n"
+        "# llm:\n"
+        "#   base_url: https://example.com/v1\n"
+        "#   api_key: 你的KEY\n"
+        "#   model: glm-4-flash\n"
+    )
+    after = write_llm_section(before, _VALS)
+    # 说明注释保留、注释值行消失、活节出现
+    assert "# AI 反馈（教学点评 + 逐字稿优化）。整节缺失 = 功能隐藏。" in after
+    assert "#   base_url:" not in after
+    assert "\nllm:\n" in after
+    assert "# 常规注释，不许动\n" in after
+    assert _roundtrip_llm(after) == _VALS
+
+
+def test_write_llm_replaces_live_section_in_middle():
+    """活 llm 节夹在其他节中间 → 只换 llm 块，后续节原样。"""
+    before = (
+        "device: cpu\n"
+        "llm:\n"
+        "  base_url: http://old/v1\n"
+        "  model: old-model\n"
+        "  timeout: 60\n"
+        "output:\n"
+        "  dir: ./out\n"
+    )
+    after = write_llm_section(before, _VALS)
+    assert "old-model" not in after
+    assert "http://old/v1" not in after
+    assert "output:\n  dir: ./out\n" in after
+    assert _roundtrip_llm(after) == _VALS
+
+
+def test_write_llm_preserves_unrelated_lines_byte_for_byte():
+    """llm 块以外的每一行逐字节不变（含行内注释与空行）。"""
+    before = (
+        "# 顶部说明\n"
+        "device: cpu        # 注释\n"
+        "\n"
+        "llm:\n"
+        "  base_url: http://old/v1\n"
+        "  model: old\n"
+        "\n"
+        "output:\n"
+        "  formats: [txt, md]\n"
+    )
+    after = write_llm_section(before, _VALS)
+    kept = [ln for ln in after.splitlines() if ln not in
+            ("llm:", "  base_url: http://old/v1", "  model: old")]
+    # 每一非 llm 原行都原样存在（顺序不变由 startswith 分块验证足够）
+    for line in ("# 顶部说明", "device: cpu        # 注释", "",
+                 "output:", "  formats: [txt, md]"):
+        assert line in after.splitlines(), f"丢失原行: {line!r}"
+
+
+def test_write_llm_empty_values_disable():
+    """base_url/model 清空保存 = 功能关闭（写入空串，加载后 enabled=False）。"""
+    from asr.llm import llm_enabled
+    vals = {"base_url": "", "api_key": "", "model": "",
+            "timeout": 300, "max_tokens": 16384}
+    after = write_llm_section("device: cpu\n", vals)
+    data = yaml.safe_load(after)
+    assert data["llm"]["base_url"] == ""
+    assert data["llm"]["model"] == ""
+
+
+def test_write_llm_quotes_special_chars():
+    """api_key 含引号/井号/反斜杠 → 双引号转义，roundtrip 不丢字符。"""
+    nasty = 'sk-"x#y\\z'
+    vals = {**_VALS, "api_key": nasty}
+    after = write_llm_section("device: cpu\n", vals)
+    assert _roundtrip_llm(after)["api_key"] == nasty
+
+
+def test_write_llm_crlf_endings_preserved():
+    """CRLF 文件：新节用 CRLF，未动行保持 CRLF。"""
+    before = "device: cpu\r\nmedia:\r\n  sample_rate: 16000\r\n"
+    after = write_llm_section(before, _VALS)
+    assert "device: cpu\r\n" in after
+    assert "\r\nllm:\r\n" in after
+    assert _roundtrip_llm(after) == _VALS

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Literal
 
@@ -200,3 +201,57 @@ def _check_model_paths(cfg: AppConfig) -> None:
             "模型路径缺失，请先运行 `python scripts/download_models.py` 下载：\n"
             + "\n".join(missing)
         )
+
+
+# ---------------------------------------------------------------------------
+# 设置页写回：llm 节文本手术
+# ---------------------------------------------------------------------------
+def _yaml_quote(s: str) -> str:
+    """双引号标量（转义 \\ 与 "）。井号/空格等特殊字符无需再操心。"""
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def write_llm_section(text: str, values: dict) -> str:
+    """把 llm 节写进 config.yaml 文本，返回新文本。
+
+    文本手术而非 YAML 重序列化：config.yaml 是用户手写维护的、带成片注释
+    文档的文件，round-trip 会把注释全部毁掉。三种形态：
+    活节原位替换 / 出厂注释模板激活 / 文末追加。其余内容一字不动。
+    """
+    nl = "\r\n" if "\r\n" in text else "\n"
+    section = nl.join([
+        "llm:",
+        f"  base_url: {_yaml_quote(values['base_url'])}",
+        f"  api_key: {_yaml_quote(values['api_key'])}",
+        f"  model: {_yaml_quote(values['model'])}",
+        f"  timeout: {int(values['timeout'])}",
+        f"  max_tokens: {int(values['max_tokens'])}",
+    ])
+    lines = text.split("\n")
+
+    start, mode = None, None
+    for i, ln in enumerate(lines):
+        if re.match(r"^llm:\s*$", ln):
+            start, mode = i, "live"
+            break
+        if re.match(r"^#\s*llm:\s*$", ln):
+            start, mode = i, "comment"
+            break
+
+    if start is None:  # 都没有 → 文末追加
+        if not text.endswith("\n"):
+            text += nl
+        return text + section + nl
+
+    # 块尾定位：活节吃到下一个顶格键（中间空行一并归块，宁可少一空行
+    # 也不留孤立的缩进残行）；注释节吃到连续注释行结束。
+    end = start + 1
+    if mode == "live":
+        while end < len(lines) and not re.match(r"^\S", lines[end]):
+            end += 1
+    else:
+        while end < len(lines) and lines[end].lstrip().startswith("#"):
+            end += 1
+
+    lines[start:end] = section.split("\n")
+    return "\n".join(lines)
