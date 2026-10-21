@@ -926,7 +926,8 @@ def test_create_project_multi_files(client, monkeypatch):
 
     recorded = {}
 
-    def _fake_multi(task_id, part_paths, out_dir, config_path, diarize, quality):
+    def _fake_multi(task_id, part_paths, out_dir, config_path, diarize, quality,
+                    ai_feedback):
         recorded["paths"] = list(part_paths)
         _update_task(task_id, status="done", progress=1.0)
 
@@ -952,7 +953,7 @@ def test_create_project_multi_files(client, monkeypatch):
 
 
 def test_create_project_single_file_plain(client, monkeypatch):
-    """1 个文件：老行为——UPLOAD_DIR/{task_id}_{名}，无 meta，直接 _run_pipeline。"""
+    """1 个文件：老布局——UPLOAD_DIR/{task_id}_{名}；meta 无 parts，经 wrapper 起转写。"""
     import asr.web as wm
     _install_fake_probe(monkeypatch, [_mk_info("a.mp4")])
 
@@ -1083,7 +1084,7 @@ def test_run_multi_task_merges_then_pipeline(isolated_db, monkeypatch):
     """先拼音频（stage=merge）再 pipeline 吃 merged.wav；meta 保留 parts。"""
     wm, out_dir, parts, merge_calls, pipeline_calls = _mk_multi_env(monkeypatch)
 
-    wm._run_multi_task("mt1", parts, out_dir, "config.yaml", False, "balanced")
+    wm._run_multi_task("mt1", parts, out_dir, "config.yaml", False, "balanced", False)
 
     assert merge_calls["n"] == 2
     assert hasattr(merge_calls["cfg"], "output"), "配置透传给 merge_audios"
@@ -1110,7 +1111,7 @@ def test_download_part_srt(client, monkeypatch):
     同时钉住主 SRT 下载不被分段文件（00_/01_ 前缀）劫持。
     """
     wm, out_dir, parts, _, _ = _mk_multi_env(monkeypatch)
-    wm._run_multi_task("mt1", parts, out_dir, "config.yaml", False, "balanced")
+    wm._run_multi_task("mt1", parts, out_dir, "config.yaml", False, "balanced", False)
 
     r = client.get("/download/mt1/part_srt/1")
     assert r.status_code == 200
@@ -1154,7 +1155,7 @@ def test_run_multi_task_failure_marks_failed(isolated_db, monkeypatch):
 
     monkeypatch.setattr(wm, "merge_audios", _boom)
 
-    wm._run_multi_task("mt1", parts, out_dir, "config.yaml", False, "balanced")
+    wm._run_multi_task("mt1", parts, out_dir, "config.yaml", False, "balanced", False)
 
     with _db() as c:
         row = c.execute("SELECT status, error FROM tasks WHERE id='mt1'").fetchone()
@@ -1176,7 +1177,7 @@ def test_run_multi_task_pipeline_failed_skips_part_srts(isolated_db, monkeypatch
 
     monkeypatch.setattr(wm, "_run_pipeline", _pipeline_fails_silently)
 
-    wm._run_multi_task("mt1", parts, out_dir, "config.yaml", False, "balanced")
+    wm._run_multi_task("mt1", parts, out_dir, "config.yaml", False, "balanced", False)
 
     with _db() as c:
         row = c.execute("SELECT status, meta_json FROM tasks WHERE id='mt1'").fetchone()
@@ -1261,3 +1262,135 @@ def test_pipeline_done_preserves_existing_meta(isolated_db, monkeypatch, tmp_pat
     assert meta["ai_feedback"] is True              # AI 开关依赖（Task 7）
     assert meta["merge_mode"] == "concat"           # 旧版任务依赖
     assert "duration_s" in meta                     # pipeline 自己的键照写
+
+
+# ---------------------------------------------------------------------------
+# AI stage：统计→点评→优化稿；失败不拖垮转写成果
+# ---------------------------------------------------------------------------
+def _mk_ai_task(isolated_db, monkeypatch, *, task_id="ai1", with_segs=True,
+                chat_side_effect=None):
+    """造一个已 done 的任务（transcript 列有 segments），mock 掉 LLM 层。"""
+    import asr.web as wm
+    out_dir = wm.OUTPUT_ROOT / task_id
+    out_dir.mkdir(parents=True, exist_ok=True)
+    segs = ([{"start": 0.0, "end": 3.0, "text": "那么我们开始上课。", "spk": "教师"}]
+            if with_segs else [])
+    with closing(wm._db()) as conn:
+        conn.execute(
+            "INSERT INTO tasks (id, name, filename, input_path, output_dir,"
+            " status, progress, stage, created_at, meta_json, transcript)"
+            " VALUES (?, '测试课', 'l.mp4', 'x', ?, 'done', 1.0, 'done',"
+            " '2026-10-21', ?, ?)",
+            (task_id, str(out_dir),
+             json.dumps({"ai_feedback": True}, ensure_ascii=False),
+             json.dumps(segs, ensure_ascii=False)),
+        )
+    calls = []
+
+    def fake_chat(messages, cfg, **kw):
+        calls.append(messages[0]["content"][:20])
+        if chat_side_effect:
+            raise chat_side_effect
+        return f"# 第{len(calls)}次结果"
+
+    monkeypatch.setattr(wm, "chat", fake_chat)
+    monkeypatch.setattr(wm, "llm_enabled", lambda cfg: True)
+    return wm, out_dir, calls
+
+
+def test_run_ai_stage_success(isolated_db, monkeypatch):
+    wm, out_dir, calls = _mk_ai_task(isolated_db, monkeypatch)
+    wm._run_ai_stage("ai1", "config.yaml")
+    assert len(calls) == 2                          # 点评 + 优化稿，两次独立调用
+    with closing(wm._db()) as conn:
+        row = conn.execute(
+            "SELECT status, stage, meta_json FROM tasks WHERE id='ai1'").fetchone()
+    assert row["status"] == "done" and row["stage"] == "done"
+    meta = json.loads(row["meta_json"])
+    fb, po = meta["ai_files"]["feedback"], meta["ai_files"]["polished"]
+    assert "ai_error" not in meta
+    assert (out_dir / fb).read_text(encoding="utf-8") == "# 第1次结果"
+    assert (out_dir / po).read_text(encoding="utf-8") == "# 第2次结果"
+    assert fb.endswith(".feedback.md") and po.endswith(".polished.md")
+
+
+def test_run_ai_stage_failure_keeps_done(isolated_db, monkeypatch):
+    """LLM 失败 → status 仍 done + meta.ai_error，不写产物，不拖垮转写。"""
+    from asr.llm import LLMError
+    wm, out_dir, calls = _mk_ai_task(
+        isolated_db, monkeypatch, chat_side_effect=LLMError("LLM HTTP 500: boom"))
+    wm._run_ai_stage("ai1", "config.yaml")
+    with closing(wm._db()) as conn:
+        row = conn.execute(
+            "SELECT status, meta_json FROM tasks WHERE id='ai1'").fetchone()
+    assert row["status"] == "done"
+    assert "boom" in json.loads(row["meta_json"])["ai_error"]
+    assert not list(out_dir.glob("*.feedback.md"))
+    assert not list(out_dir.glob("*.polished.md"))
+
+
+def test_run_ai_stage_no_transcript(isolated_db, monkeypatch):
+    """无转写结果 → ai_error，不调 LLM。"""
+    wm, out_dir, calls = _mk_ai_task(isolated_db, monkeypatch, with_segs=False)
+    wm._run_ai_stage("ai1", "config.yaml")
+    with closing(wm._db()) as conn:
+        row = conn.execute(
+            "SELECT status, meta_json FROM tasks WHERE id='ai1'").fetchone()
+    assert row["status"] == "done"
+    assert "无转写结果" in json.loads(row["meta_json"])["ai_error"]
+    assert calls == []
+
+
+def test_run_ai_stage_marks_flag_and_stats_fed(isolated_db, monkeypatch):
+    """prompt 里必须带统计事实（filler/语速）与说话人前缀正文。"""
+    import asr.web as wm
+    from asr.analyze import compute_stats
+    seen = {}
+
+    def fake_chat(messages, cfg, **kw):
+        if "评课专家" in messages[0]["content"]:
+            seen["feedback_user"] = messages[1]["content"]
+        return "# 结果"
+
+    out_dir = wm.OUTPUT_ROOT / "ai2"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    segs = [{"start": 0.0, "end": 60.0, "text": "那么那么那么我们上课。", "spk": "教师"}]
+    with closing(wm._db()) as conn:
+        conn.execute(
+            "INSERT INTO tasks (id, name, filename, input_path, output_dir,"
+            " status, created_at, transcript)"
+            " VALUES ('ai2', '课', 'l.mp4', 'x', ?, 'done', '2026-10-21', ?)",
+            (str(out_dir), json.dumps(segs, ensure_ascii=False)),
+        )
+    monkeypatch.setattr(wm, "chat", fake_chat)
+    monkeypatch.setattr(wm, "llm_enabled", lambda cfg: True)
+    wm._run_ai_stage("ai2", "config.yaml")
+    assert "那么" in seen["feedback_user"]            # 正文（带说话人前缀）
+    assert "filler_top" in seen["feedback_user"]      # 统计事实进了 prompt
+    with closing(wm._db()) as conn:
+        meta = json.loads(conn.execute(
+            "SELECT meta_json FROM tasks WHERE id='ai2'").fetchone()["meta_json"])
+    assert meta["ai_feedback"] is True                # 手动补跑也补旗标
+
+
+def test_upload_ai_feedback_flag_reaches_meta(client, isolated_db, monkeypatch):
+    """上传带 ai_feedback=true → meta 落库，单任务 wrapper 收到 True。"""
+    import asr.web as wm
+    got = {}
+
+    def fake_single(task_id, inp, out, cfg, dia, q, ai):
+        got["ai"] = ai
+
+    _install_fake_probe(monkeypatch, [_mk_info("a.mp3")])
+    monkeypatch.setattr(wm, "_run_single_task", fake_single)
+    monkeypatch.setattr(wm, "_run_multi_task", lambda *a, **kw: None)
+    r = client.post("/api/projects",
+                    files={"files": ("a.mp3", b"x", "audio/mpeg")},
+                    data={"name": "AI课", "ai_feedback": "true"})
+    assert r.status_code == 200
+    with closing(wm._db()) as conn:
+        row = conn.execute(
+            "SELECT meta_json FROM tasks WHERE id=?",
+            (r.json()["task_id"],)).fetchone()
+    assert json.loads(row["meta_json"])["ai_feedback"] is True
+    assert got["ai"] is True

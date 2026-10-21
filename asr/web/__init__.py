@@ -26,7 +26,10 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from loguru import logger
 
+from ..analyze import compute_stats
 from ..config import ConfigLoadError, load_config
+from ..feedback import build_feedback_messages, build_polish_messages
+from ..llm import LLMError, chat, llm_enabled
 from ..media import probe
 from ..merge import merge_audios, write_part_srts
 from ..pipeline import close_cached_engines
@@ -369,6 +372,7 @@ async def create_project(
     config: str = Form("config.yaml"),
     diarize: bool = Form(False),
     quality: str = Form("balanced"),
+    ai_feedback: bool = Form(False),
 ):
     """新建项目：files=[1 个] 普通转写；files=[多个] 逐段抽音轨拼接后一次转写。
 
@@ -420,7 +424,7 @@ async def create_project(
     final_name = name.strip() or Path(names[0]).stem
 
     if multi:
-        meta = {"parts": names}
+        meta = {"parts": names, "ai_feedback": ai_feedback}
         input_path = str(out_dir / "merged.wav")
         with closing(_db()) as conn:
             conn.execute(
@@ -432,20 +436,23 @@ async def create_project(
             )
         threading.Thread(
             target=_run_multi_task,
-            args=(task_id, saved, out_dir, config, diarize, quality),
+            args=(task_id, saved, out_dir, config, diarize, quality, ai_feedback),
             daemon=True,
         ).start()
     else:
+        # ai_feedback 开关随任务落 meta（False 也写）：done 的 meta 读-改-写
+        # 依赖它非空才能保序，前端/AI stage 也靠它判断是否补跑
         with closing(_db()) as conn:
             conn.execute(
                 """INSERT INTO tasks
-                   (id, name, filename, input_path, output_dir, status, created_at)
-                   VALUES (?, ?, ?, ?, ?, 'pending', ?)""",
-                (task_id, final_name, names[0], str(saved[0]), str(out_dir), ts),
+                   (id, name, filename, input_path, output_dir, status, created_at, meta_json)
+                   VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)""",
+                (task_id, final_name, names[0], str(saved[0]), str(out_dir), ts,
+                 json.dumps({"ai_feedback": ai_feedback}, ensure_ascii=False)),
             )
         threading.Thread(
-            target=_run_pipeline,
-            args=(task_id, saved[0], out_dir, config, diarize, quality),
+            target=_run_single_task,
+            args=(task_id, saved[0], out_dir, config, diarize, quality, ai_feedback),
             daemon=True,
         ).start()
 
@@ -631,6 +638,7 @@ def _run_multi_task(
     config_path: str,
     diarize: bool,
     quality: str,
+    ai_feedback: bool,
 ) -> None:
     """后台线程：逐段抽音轨拼接（stage=merge）→ 转写 → 每段独立 SRT。
 
@@ -675,6 +683,10 @@ def _run_multi_task(
             "part_files": [p.name for p in part_files],
         })
         _update_task(task_id, meta_json=json.dumps(meta, ensure_ascii=False))
+
+        # AI 反馈（可选）：拼接字幕写完后串行追加
+        if ai_feedback:
+            _run_ai_stage(task_id, config_path)
     except Exception as e:  # noqa: BLE001
         logger.exception(f"[web] 拼接任务 {task_id} 失败")
         _update_task(
@@ -812,6 +824,94 @@ def _run_pipeline(
         )
     finally:
         stop.set()  # pipeline 结束（成功/失败都算）：停掉看门狗线程
+
+
+# ---------------------------------------------------------------------------
+# AI 反馈 stage（点评 + 优化稿）。铁律：AI 失败不拖垮转写成果。
+# ---------------------------------------------------------------------------
+def _run_ai_stage(task_id: str, config_path: str) -> None:
+    """统计课堂数据 → LLM 点评 → LLM 优化稿。异常一律落 meta.ai_error，status 保持 done。"""
+    ts = datetime.now().isoformat(timespec="seconds")
+    try:
+        cfg = load_config(config_path, strict_models=False)
+        if not llm_enabled(cfg):
+            raise LLMError("LLM 未配置")
+
+        with closing(_db()) as conn:
+            row = conn.execute(
+                "SELECT output_dir, name, filename FROM tasks WHERE id=?",
+                (task_id,),
+            ).fetchone()
+        if row is None:
+            return
+        stem = row["name"] or Path(row["filename"]).stem
+
+        segs = _read_final_segments(task_id)
+        if not segs:
+            raise LLMError("无转写结果，无法生成 AI 反馈")
+
+        # 补旗标：手动补跑的老任务也要让前端显示 AI stage 行
+        meta = _read_meta(task_id)
+        meta["ai_feedback"] = True
+        _update_task(task_id, meta_json=json.dumps(meta, ensure_ascii=False),
+                     status="running", stage="ai", message="统计课堂数据",
+                     stage_started_at=ts)
+
+        # 正文从 segments 重建（单一事实源，不依赖 .txt 排版）
+        transcript = "\n".join(
+            f"{s.get('spk')}: {s['text']}" if s.get("spk") else s["text"]
+            for s in segs
+        )
+        out_dir = Path(row["output_dir"])
+        stats = compute_stats(segs)
+
+        _update_task(task_id, progress=0.1, stage="ai", message="生成点评报告")
+        report = chat(build_feedback_messages(transcript, stats), cfg)
+        fb_path = out_dir / f"{task_id}_{stem}.feedback.md"
+        fb_path.write_text(report, encoding="utf-8")
+
+        _update_task(task_id, progress=0.55, stage="ai", message="生成优化逐字稿")
+        polished = chat(build_polish_messages(transcript), cfg)
+        po_path = out_dir / f"{task_id}_{stem}.polished.md"
+        po_path.write_text(polished, encoding="utf-8")
+
+        meta = _read_meta(task_id)
+        meta["ai_files"] = {"feedback": fb_path.name, "polished": po_path.name}
+        meta.pop("ai_error", None)
+        _update_task(
+            task_id, status="done", stage="done", progress=1.0,
+            message="AI 反馈完成",
+            ended_at=datetime.now().isoformat(timespec="seconds"),
+            meta_json=json.dumps(meta, ensure_ascii=False),
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.exception(f"[web] 任务 {task_id} AI 反馈失败")
+        meta = _read_meta(task_id)
+        meta["ai_error"] = f"{type(e).__name__}: {e}"
+        _update_task(
+            task_id, status="done", stage="ai", message="AI 反馈失败",
+            ended_at=datetime.now().isoformat(timespec="seconds"),
+            meta_json=json.dumps(meta, ensure_ascii=False),
+        )
+
+
+def _run_single_task(
+    task_id: str,
+    input_path: Path,
+    output_dir: Path,
+    config_path: str,
+    diarize: bool,
+    quality: str,
+    ai_feedback: bool,
+) -> None:
+    """单任务 wrapper：pipeline → （done 且开开关）AI stage。"""
+    _run_pipeline(task_id, input_path, output_dir, config_path, diarize, quality)
+    with closing(_db()) as conn:
+        status = conn.execute(
+            "SELECT status FROM tasks WHERE id=?", (task_id,)
+        ).fetchone()["status"]
+    if status == "done" and ai_feedback:
+        _run_ai_stage(task_id, config_path)
 
 
 # ---------------------------------------------------------------------------
