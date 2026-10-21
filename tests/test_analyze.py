@@ -63,6 +63,19 @@ def test_question_sentence_split():
     assert s["questions"] == {"整体": 1}    # 只有"大家听懂了吗？"一条
 
 
+def test_question_pure_q_mark_and_no_punct():
+    """问句两条互补规则：带标点问句靠句尾"？"抓；ASR 丢标点的问句靠末字兜底。
+
+    "去还是不行？"句尾无吗/呢/吧——若切句吞掉"？"则两条规则都够不着，漏计。
+    """
+    segs = [
+        _seg(0, 10, "去还是不行？我们投票决定。"),
+        _seg(10, 20, "听懂了吗"),
+    ]
+    s = compute_stats(segs)
+    assert s["questions"] == {"整体": 2}   # 纯"？"问句 1 + 丢标点"吗"兜底 1
+
+
 def test_filler_word_table_no_single_char():
     """词表不含单字（"啊/嗯"子串误匹配率太高）。"""
     assert all(len(w) >= 2 for w in FILLER_WORDS)

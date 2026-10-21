@@ -14,9 +14,10 @@ FILLER_WORDS = (
     "好吧", "等于说", "就是说", "对不对", "我们来看",
 )
 
-# 切句含全角/半角"？"：切掉后问句靠末字"吗/呢/吧"兜底识别——
-# 若不切"？"，文中问句（…吗？没懂的…）会并入后句、句尾变非问字，漏计。
-_SENT_SPLIT = re.compile(r"[。！！??？]")
+# 切句保留句末标点（findall 连标点一起取回）：问句判定是两条互补规则——
+# 带标点问句靠"句尾为 ？"识别，ASR 丢标点的问句靠末字"吗/呢/吧"兜底。
+# 若切句吞掉分隔符（re.split），句尾永远不是"？"，纯"？"问句两条规则都够不着。
+_SENT_RE = re.compile(r"[^。！？!?]*[。！？!?]|[^。！？!?]+$")
 _Q_TAIL_CHARS = ("吗", "呢", "吧")
 
 
@@ -27,7 +28,7 @@ def _count_chars(texts: list[str]) -> int:
 def _question_count(texts: list[str]) -> int:
     n = 0
     for t in texts:
-        for sent in _SENT_SPLIT.split(t):
+        for sent in _SENT_RE.findall(t):
             s = sent.strip()
             if s and (s.endswith(("？", "?")) or s.endswith(_Q_TAIL_CHARS)):
                 n += 1
