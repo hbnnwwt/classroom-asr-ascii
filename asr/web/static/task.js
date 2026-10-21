@@ -117,12 +117,13 @@ async function poll() {
 
 function updateUI(t) {
   taskStatus = t.status;
-  // 合并任务专属 UI：拼接阶段行 + MP4 下载按钮（普通任务隐藏）
-  const isMerged = Boolean(t.meta && t.meta.merge_mode);
+  // 多段任务专属 UI：拼接阶段行（新任务 meta.parts，旧任务 meta.merge_mode）。
+  // MP4 下载按钮只属于旧版"真合并"任务——新方案不产视频，只产字幕。
+  const isMulti = Boolean(t.meta && (t.meta.parts || t.meta.merge_mode));
   const mergeLi = document.querySelector('#stages li[data-stage="merge"]');
-  if (mergeLi) mergeLi.style.display = isMerged ? "" : "none";
+  if (mergeLi) mergeLi.style.display = isMulti ? "" : "none";
   const mp4Btn = document.querySelector('#downloads .btn[data-fmt="mp4"]');
-  if (mp4Btn) mp4Btn.hidden = !isMerged;
+  if (mp4Btn) mp4Btn.hidden = !(t.meta && t.meta.merge_mode);
   $("status").textContent = statusLabel(t.status);
   // 项目名（页面顶部）
   if (t.name && $("project-name").textContent !== t.name) {
@@ -148,7 +149,39 @@ function updateUI(t) {
       a.href = `/download/${currentTaskId}/${a.dataset.fmt}`;
       a.download = "";
     });
+    renderPartDownloads(t.meta);
   }
+}
+
+/**
+ * 多段任务 done 后：渲染每段独立 SRT 下载链接（/download/{id}/part_srt/{i}）。
+ * part_files 由后端完成后写进 meta；每次整体重建，天然幂等。
+ */
+function renderPartDownloads(meta) {
+  const box = $("part-downloads");
+  const ul = $("part-downloads-list");
+  const files = (meta && meta.part_files) || [];
+  const parts = (meta && meta.parts) || [];
+  if (!files.length) { box.hidden = true; return; }
+
+  box.hidden = false;
+  ul.innerHTML = "";
+  files.forEach((fname, i) => {
+    const li = document.createElement("li");
+    const a = document.createElement("a");
+    a.href = `/download/${currentTaskId}/part_srt/${i}`;
+    const num = document.createElement("span");
+    num.className = "part-num";
+    num.textContent = String(i + 1);
+    const label = document.createElement("span");
+    label.textContent = parts[i] || fname;   // 段原名（与上传文件一致）
+    const size = document.createElement("span");
+    size.className = "part-fname";
+    size.textContent = fname;
+    a.append(num, label, size);
+    li.appendChild(a);
+    ul.appendChild(li);
+  });
 }
 
 /**

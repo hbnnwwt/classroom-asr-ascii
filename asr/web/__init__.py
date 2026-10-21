@@ -2,9 +2,9 @@
 Web UI（FastAPI）：
 - POST /upload        上传视频文件，返回 task_id
 - GET  /status/{id}   查询任务状态/进度（轮询）
-- GET  /download/{id}/{fmt} 下载指定格式输出（含合并视频 mp4）
-- POST /api/uploads   多段视频暂存上传 + 编码探测（合并前置）
-- POST /api/projects  创建项目；带 upload_id 走"多段合并"流程
+- GET  /download/{id}/{fmt} 下载指定格式输出（含旧任务合并视频 mp4）
+- POST /api/projects  创建项目：files=[1 个] 普通转写；files=[多个]
+                      逐段抽音轨拼接后一次转写（时间轴天然连续）
 - GET  /              单页前端
 
 数据持久化：SQLite（默认 ./web/web_state.db），重启后任务记录不丢，
@@ -13,23 +13,22 @@ Web UI（FastAPI）：
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import sqlite3
 import threading
-import time
 import uuid
 from contextlib import asynccontextmanager, closing
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from loguru import logger
 
 from ..config import ConfigLoadError, load_config
-from ..media import MediaInfo, probe
-from ..merge import anchor_supported, copy_compatible, merge_videos, parse_fps
+from ..media import probe
+from ..merge import merge_audios, write_part_srts
 from ..pipeline import close_cached_engines
 from ..pipeline import run as pipeline_run
 
@@ -43,9 +42,7 @@ DB_PATH = PACKAGE_DIR / "web_state.db"
 UPLOAD_DIR = PACKAGE_DIR / "uploads"
 OUTPUT_ROOT = PACKAGE_DIR / "outputs"
 
-# 多段合并：暂存目录名（UPLOAD_DIR/staging/{upload_id}）与上限
-STAGING_DIRNAME = "staging"
-STAGING_MAX_AGE_S = 24 * 3600   # 暂存会话超 24h 未用即清
+# 多段拼接：单次段数上限
 MAX_MERGE_PARTS = 20
 
 # ASR 看门狗：FunASR PUNC 阶段可能死锁（无任何 callback），超过这个时间无回调
@@ -180,13 +177,19 @@ app = FastAPI(title="Classroom ASR", version="1.0", lifespan=lifespan)
 @app.get("/", response_class=HTMLResponse)
 def index() -> FileResponse:
     """管理界面：项目列表。"""
-    return FileResponse(str(STATIC_DIR / "index.html"))
+    return FileResponse(
+        str(STATIC_DIR / "index.html"),
+        headers={"Cache-Control": "no-cache, must-revalidate"},
+    )
 
 
 @app.get("/task/{task_id}", response_class=HTMLResponse)
 def task_page(task_id: str) -> FileResponse:
     """项目详情页：单项目转写进度 + transcript。"""
-    return FileResponse(str(STATIC_DIR / "task.html"))
+    return FileResponse(
+        str(STATIC_DIR / "task.html"),
+        headers={"Cache-Control": "no-cache, must-revalidate"},
+    )
 
 
 @app.get("/static/{path:path}")
@@ -268,7 +271,10 @@ def download(task_id: str, fmt: str):
         raise HTTPException(409, f"任务未完成: {row['status']}")
 
     out_dir = Path(row["output_dir"])
-    files = list(out_dir.glob(f"*.{fmt}"))
+    # 排除分段文件（{两位序号}_ 前缀，如 00_a.srt）——多段任务的整体 SRT
+    # 是 merged.srt，glob 顺序不保证它排在分段文件前面
+    files = [f for f in out_dir.glob(f"*.{fmt}")
+             if not re.match(r"^\d{2}_", f.name)]
     if not files:
         raise HTTPException(404, f"输出文件不存在: {fmt}")
     target = files[0]
@@ -278,104 +284,31 @@ def download(task_id: str, fmt: str):
     )
 
 
-# ---------------------------------------------------------------------------
-# 多段视频合并：暂存上传 + 探测
-# 两段式由需求决定——用户要在界面上看到编码差异并选转码类型，
-# 所以文件先进暂存区探测，创建项目时再消费。
-# ---------------------------------------------------------------------------
-def _staging_root() -> Path:
-    """动态取暂存根目录（跟随测试 monkeypatch 的 UPLOAD_DIR）。"""
-    return UPLOAD_DIR / STAGING_DIRNAME
+@app.get("/download/{task_id}/part_srt/{index}")
+def download_part_srt(task_id: str, index: int):
+    """下载某一段的独立 SRT（多段拼接任务，时间归零配原视频用）。"""
+    with closing(_db()) as conn:
+        row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+    if row is None:
+        raise HTTPException(404, "任务不存在")
+    if row["status"] != "done":
+        raise HTTPException(409, f"任务未完成: {row['status']}")
 
-
-def _sweep_staging() -> None:
-    """清掉超 24h 的暂存会话（上传了但没创建任务的遗留文件）。"""
-    root = _staging_root()
-    if not root.exists():
-        return
-    cutoff = time.time() - STAGING_MAX_AGE_S
-    for d in root.iterdir():
-        try:
-            if d.is_dir() and d.stat().st_mtime < cutoff:
-                shutil.rmtree(d, ignore_errors=True)
-        except OSError:
-            pass
-
-
-def _part_summary(info: MediaInfo) -> dict:
-    """单段探测信息 → 前端展示结构（编码对比表用）。"""
-    v, a = info.video_streams[0], info.audio_streams[0]
-    return {
-        "name": info.path.name,
-        "size": info.path.stat().st_size if info.path.exists() else 0,
-        "duration_s": info.duration_s,
-        "video": {
-            "codec": v.get("codec_name"), "profile": v.get("profile"),
-            "width": v.get("width"), "height": v.get("height"),
-            "fps": parse_fps(v), "pix_fmt": v.get("pix_fmt"),
-        },
-        "audio": {
-            "codec": a.get("codec_name"),
-            "sample_rate": int(a.get("sample_rate") or 0),
-            "channels": int(a.get("channels") or 0),
-        },
-    }
-
-
-@app.post("/api/uploads")
-async def stage_uploads(files: list[UploadFile] = File(...)):
-    """多段视频暂存上传：保存 + ffprobe 逐段探测 + 兼容判定。
-
-    返回 upload_id（创建项目时引用）+ 每段编码信息 + compatible。
-    探测结论落盘 probe.json，创建时不重复探测、不信任前端。
-    """
-    if len(files) < 2:
-        raise HTTPException(400, "拼接合并至少需要 2 个文件")
-    if len(files) > MAX_MERGE_PARTS:
-        raise HTTPException(400, f"单次最多合并 {MAX_MERGE_PARTS} 段")
-
-    _sweep_staging()
-
-    upload_id = uuid.uuid4().hex[:12]
-    staging = _staging_root() / upload_id
-    staging.mkdir(parents=True, exist_ok=True)
     try:
-        infos: list[MediaInfo] = []
-        for f in files:
-            if not f.filename:
-                raise HTTPException(400, "文件名为空")
-            dest = staging / Path(f.filename).name
-            with open(dest, "wb") as out:
-                while chunk := await f.read(1024 * 1024):
-                    out.write(chunk)
-            try:
-                info = probe(dest)
-            except Exception as e:  # noqa: BLE001
-                raise HTTPException(400, f"无法探测 {f.filename}: {e}")
-            if not info.video_streams:
-                raise HTTPException(400, f"{f.filename} 没有视频流，无法拼接（本功能仅支持视频）")
-            if not info.audio_streams:
-                raise HTTPException(400, f"{f.filename} 没有音轨")
-            infos.append(info)
+        meta = json.loads(row["meta_json"] or "{}")
+    except ValueError:
+        meta = {}
+    part_files = meta.get("part_files") or []
+    parts = meta.get("parts") or []
+    if not 0 <= index < len(part_files):
+        raise HTTPException(404, "分段字幕不存在")
 
-        compatible = copy_compatible(infos)
-        anchor_ok = anchor_supported(infos[0])
-        # 段顺序 = 上传顺序（创建项目时若前端重排过，以 order 字段为准）
-        (staging / "probe.json").write_text(json.dumps({
-            "compatible": compatible,
-            "anchor_supported": anchor_ok,
-            "order": [i.path.name for i in infos],
-        }, ensure_ascii=False), encoding="utf-8")
-    except HTTPException:
-        shutil.rmtree(staging, ignore_errors=True)  # 半截会话不留垃圾
-        raise
-
-    return JSONResponse({
-        "upload_id": upload_id,
-        "compatible": compatible,
-        "anchor_supported": anchor_ok,
-        "parts": [_part_summary(i) for i in infos],
-    })
+    target = Path(row["output_dir"]) / part_files[index]
+    if not target.exists():
+        raise HTTPException(404, f"分段字幕文件缺失: {part_files[index]}")
+    # 下载名用该段原名（去后缀），用户拿到即可对上原视频
+    name = parts[index] if index < len(parts) else part_files[index]
+    return FileResponse(str(target), filename=f"{Path(name).stem}.srt")
 
 
 # ---------------------------------------------------------------------------
@@ -424,139 +357,93 @@ def get_project(task_id: str):
 
 @app.post("/api/projects")
 async def create_project(
-    file: Optional[UploadFile] = File(None),
+    files: list[UploadFile] = File(...),
     name: str = Form(""),
     config: str = Form("config.yaml"),
     diarize: bool = Form(False),
     quality: str = Form("balanced"),
-    upload_id: str = Form(""),
-    merge_mode: str = Form("transcribe"),
-    transcode: str = Form(""),
-    order: str = Form(""),
 ):
-    """新建项目：单文件直传（老路径，行为不变）或多段合并（upload_id）。"""
-    if upload_id:
-        return await _create_merged_project(
-            upload_id, merge_mode, transcode, order, name, config, diarize, quality,
-        )
-    if file is None or not file.filename:
-        raise HTTPException(400, "文件名为空")
+    """新建项目：files=[1 个] 普通转写；files=[多个] 逐段抽音轨拼接后一次转写。
 
-    task_id = uuid.uuid4().hex[:12]
-    ts = datetime.now().isoformat(timespec="seconds")
-    save_path = UPLOAD_DIR / f"{task_id}_{Path(file.filename).name}"
-
-    with open(save_path, "wb") as f:
-        while chunk := await file.read(1024 * 1024):
-            f.write(chunk)
-
-    out_dir = OUTPUT_ROOT / task_id
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    # name 默认用文件名去后缀
-    final_name = name.strip() or Path(file.filename).stem
-
-    with closing(_db()) as conn:
-        conn.execute(
-            """INSERT INTO tasks
-               (id, name, filename, input_path, output_dir, status, created_at)
-               VALUES (?, ?, ?, ?, ?, 'pending', ?)""",
-            (task_id, final_name, file.filename, str(save_path), str(out_dir), ts),
-        )
-
-    threading.Thread(
-        target=_run_pipeline,
-        args=(task_id, save_path, out_dir, config, diarize, quality),
-        daemon=True,
-    ).start()
-
-    return JSONResponse({"task_id": task_id, "name": final_name, "filename": file.filename})
-
-
-async def _create_merged_project(
-    upload_id: str,
-    merge_mode: str,
-    transcode: str,
-    order: str,
-    name: str,
-    config: str,
-    diarize: bool,
-    quality: str,
-) -> JSONResponse:
-    """消费暂存会话创建合并项目：校验 → 段文件移入正式目录 → 起后台任务。"""
-    staging = _staging_root() / upload_id
-    probe_path = staging / "probe.json"
-    if not probe_path.exists():
-        raise HTTPException(404, "上传会话不存在或已过期，请重新上传")
-    try:
-        probe_meta = json.loads(probe_path.read_text(encoding="utf-8"))
-    except ValueError:
-        raise HTTPException(404, "上传会话损坏，请重新上传")
-
-    if merge_mode not in ("transcribe", "merge_only"):
-        raise HTTPException(400, f"不支持的合并模式: {merge_mode}")
-    if transcode and transcode not in ("h264", "h265", "first"):
-        raise HTTPException(400, f"不支持的转码类型: {transcode}")
-    if not probe_meta.get("compatible") and not transcode:
-        raise HTTPException(400, "段落编码不一致，必须选择转码类型后再合并")
-    if transcode == "first" and not probe_meta.get("anchor_supported"):
-        raise HTTPException(400, "第一段编码不支持作为转码基准，请选择 H.264 / H.265")
-
-    # 段顺序：前端重排过则用 order（JSON 数组），否则用上传顺序
-    names = probe_meta.get("order") or []
-    if order:
-        try:
-            names = json.loads(order)
-        except ValueError:
-            raise HTTPException(400, "order 必须是文件名 JSON 数组")
-    if len(names) < 2:
-        raise HTTPException(400, "拼接合并至少需要 2 段视频")
-    # order 必须与暂存文件一一对应（防过期/篡改）
-    staged = sorted(p.name for p in staging.iterdir() if p.is_file() and p.name != "probe.json")
-    if sorted(names) != staged:
-        raise HTTPException(400, "段列表与上传会话不一致，请重新上传")
+    单/多差异只在落盘布局与 meta——转写路径同一条（拼接产物就是普通输入）。
+    """
+    if not files:
+        raise HTTPException(400, "未选择文件")
+    if len(files) > MAX_MERGE_PARTS:
+        raise HTTPException(400, f"单次最多拼接 {MAX_MERGE_PARTS} 段")
 
     task_id = uuid.uuid4().hex[:12]
     ts = datetime.now().isoformat(timespec="seconds")
     out_dir = OUTPUT_ROOT / task_id
     out_dir.mkdir(parents=True, exist_ok=True)
-
-    # 段文件移入正式目录（{task_id}_parts/{序号}_{原名}，序号保序、防重名）
+    multi = len(files) > 1
     parts_dir = UPLOAD_DIR / f"{task_id}_parts"
-    parts_dir.mkdir(parents=True, exist_ok=True)
-    part_paths: list[Path] = []
-    for i, n in enumerate(names):
-        dest = parts_dir / f"{i:02d}_{n}"
-        shutil.move(str(staging / n), str(dest))
-        part_paths.append(dest)
-    shutil.rmtree(staging, ignore_errors=True)
+    if multi:
+        parts_dir.mkdir(parents=True, exist_ok=True)
 
-    display_names = " + ".join(names)
+    # 保存 + 逐个探测（无音轨/损坏文件当场 400，不进任务队列）
+    saved: list[Path] = []
+    try:
+        for i, f in enumerate(files):
+            if not f.filename:
+                raise HTTPException(400, "文件名为空")
+            fname = Path(f.filename).name
+            # 多段：{序号}_{原名}（序号保序、防重名）；单段：老路径布局
+            dest = parts_dir / f"{i:02d}_{fname}" if multi else UPLOAD_DIR / f"{task_id}_{fname}"
+            with open(dest, "wb") as out:
+                while chunk := await f.read(1024 * 1024):
+                    out.write(chunk)
+            try:
+                info = probe(dest)
+            except Exception as e:  # noqa: BLE001
+                raise HTTPException(400, f"无法探测 {fname}: {e}")
+            if not info.audio_streams:
+                raise HTTPException(400, f"{fname} 没有音轨")
+            saved.append(dest)
+    except HTTPException:
+        # 半截会话不留垃圾
+        for p in saved:
+            p.unlink(missing_ok=True)
+        if multi:
+            shutil.rmtree(parts_dir, ignore_errors=True)
+        raise
+
+    names = [Path(f.filename).name for f in files]
+    display = " + ".join(names)
     final_name = name.strip() or Path(names[0]).stem
-    meta = {
-        "parts": names,
-        "merge_mode": merge_mode,
-        "transcode": transcode or None,
-        "compatible": probe_meta.get("compatible", False),
-    }
 
-    with closing(_db()) as conn:
-        conn.execute(
-            """INSERT INTO tasks
-               (id, name, filename, input_path, output_dir, status, created_at, meta_json)
-               VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)""",
-            (task_id, final_name, display_names, str(out_dir / "merged.mp4"),
-             str(out_dir), ts, json.dumps(meta, ensure_ascii=False)),
-        )
+    if multi:
+        meta = {"parts": names}
+        input_path = str(out_dir / "merged.wav")
+        with closing(_db()) as conn:
+            conn.execute(
+                """INSERT INTO tasks
+                   (id, name, filename, input_path, output_dir, status, created_at, meta_json)
+                   VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)""",
+                (task_id, final_name, display, input_path, str(out_dir), ts,
+                 json.dumps(meta, ensure_ascii=False)),
+            )
+        threading.Thread(
+            target=_run_multi_task,
+            args=(task_id, saved, out_dir, config, diarize, quality),
+            daemon=True,
+        ).start()
+    else:
+        with closing(_db()) as conn:
+            conn.execute(
+                """INSERT INTO tasks
+                   (id, name, filename, input_path, output_dir, status, created_at)
+                   VALUES (?, ?, ?, ?, ?, 'pending', ?)""",
+                (task_id, final_name, names[0], str(saved[0]), str(out_dir), ts),
+            )
+        threading.Thread(
+            target=_run_pipeline,
+            args=(task_id, saved[0], out_dir, config, diarize, quality),
+            daemon=True,
+        ).start()
 
-    threading.Thread(
-        target=_run_merged_task,
-        args=(task_id, part_paths, out_dir, merge_mode, transcode or None,
-              config, diarize, quality),
-        daemon=True,
-    ).start()
-
-    return JSONResponse({"task_id": task_id, "name": final_name, "filename": display_names})
+    filename = display if multi else names[0]
+    return JSONResponse({"task_id": task_id, "name": final_name, "filename": filename})
 
 
 @app.patch("/api/projects/{task_id}")
@@ -703,7 +590,7 @@ def batch_export(payload: dict):
 
 
 # ---------------------------------------------------------------------------
-# 后台合并任务：merge 阶段 → 转写 pipeline（或仅合并即 done）
+# 后台多段任务：拼音频（stage=merge）→ 转写 pipeline → 每段独立 SRT
 # ---------------------------------------------------------------------------
 def _read_meta(task_id: str) -> dict:
     """读当前 meta_json（损坏/缺失 → 空 dict）。"""
@@ -717,59 +604,78 @@ def _read_meta(task_id: str) -> dict:
         return {}
 
 
-def _run_merged_task(
+def _read_final_segments(task_id: str) -> list[dict]:
+    """读任务最终 transcript 列（done 时与状态原子写入的 JSON 数组）。"""
+    with closing(_db()) as conn:
+        row = conn.execute("SELECT transcript FROM tasks WHERE id=?", (task_id,)).fetchone()
+    if row is None:
+        return []
+    try:
+        segs = json.loads(row["transcript"] or "[]")
+    except ValueError:
+        return []
+    return segs if isinstance(segs, list) else []
+
+
+def _run_multi_task(
     task_id: str,
     part_paths: list[Path],
     output_dir: Path,
-    mode: str,
-    transcode: Optional[str],
     config_path: str,
     diarize: bool,
     quality: str,
 ) -> None:
-    """后台线程：拼接合并（stage=merge）→ 转写 pipeline；merge_only 到此为止。
+    """后台线程：逐段抽音轨拼接（stage=merge）→ 转写 → 每段独立 SRT。
 
-    进度口径：转写模式下 merge 占 0~5%（pipeline 自带 0.05 起，无缝衔接）；
-    仅合并模式下 merge 即全部进度。
+    进度口径：拼音频占 0~5%（pipeline 自带 0.05 起，无缝衔接）。
     """
-    transcode = transcode or None  # 空串/None 统一为"流拷贝"（merge_videos 的快路径）
     ts = datetime.now().isoformat(timespec="seconds")
-    _update_task(task_id, status="running", started_at=ts, message="开始合并")
+    _update_task(task_id, status="running", started_at=ts, message="拼接音轨")
 
-    # 进度消息用原始文件名（段文件已被加上序号前缀）
-    part_names = _read_meta(task_id).get("parts") or [p.name for p in part_paths]
-    scale = 1.0 if mode == "merge_only" else 0.05
+    meta = _read_meta(task_id)
+    # 进度消息/文件名用原始名（段文件已被加上序号前缀）
+    part_names = meta.get("parts") or [p.name for p in part_paths]
 
     def _cb(ratio: float, msg: str) -> None:
-        _update_task(task_id, progress=ratio * scale, stage="merge", message=msg)
+        _update_task(task_id, progress=ratio * 0.05, stage="merge", message=msg)
 
-    merged_path = Path(output_dir) / "merged.mp4"
+    merged_wav = Path(output_dir) / "merged.wav"
     try:
-        merge_videos(part_paths, merged_path, target=transcode, on_progress=_cb)
+        cfg = load_config(config_path, strict_models=False)
+        _, durations = merge_audios(part_paths, merged_wav, cfg, on_progress=_cb)
 
-        if mode == "merge_only":
-            meta = _read_meta(task_id)
-            meta["merged_size_bytes"] = merged_path.stat().st_size if merged_path.exists() else 0
-            _update_task(
-                task_id, status="done", progress=1.0, stage="done",
-                message=f"合并完成：{len(part_paths)} 段",
-                ended_at=datetime.now().isoformat(timespec="seconds"),
-                meta_json=json.dumps(meta, ensure_ascii=False),
-            )
-        else:
-            # pipeline 的 done 更新会整体覆盖 meta，跑完把合并元数据补回去
-            _run_pipeline(task_id, merged_path, Path(output_dir), config_path, diarize, quality)
-            meta = _read_meta(task_id)
-            meta.update({"parts": part_names, "merge_mode": mode, "transcode": transcode})
-            _update_task(task_id, meta_json=json.dumps(meta, ensure_ascii=False))
+        # pipeline 的 done 更新会整体覆盖 meta，跑完把分段元数据补回去
+        _run_pipeline(task_id, merged_wav, Path(output_dir), config_path, diarize, quality)
+
+        # pipeline 内部兜底失败时标 failed 但不抛——看状态说话：
+        # 失败就到此为止，别拿空 transcript 写出一堆空分段字幕
+        with closing(_db()) as conn:
+            status = conn.execute(
+                "SELECT status FROM tasks WHERE id=?", (task_id,)
+            ).fetchone()["status"]
+        if status != "done":
+            return
+
+        # 整体时间轴 → 每段一份独立 SRT（时间归零，配原视频用）
+        stems = [Path(n).stem for n in part_names]
+        part_files = write_part_srts(
+            _read_final_segments(task_id), durations, stems, Path(output_dir),
+            output_cfg=cfg.output,
+        )
+        meta = _read_meta(task_id)
+        meta.update({
+            "parts": part_names,
+            "part_files": [p.name for p in part_files],
+        })
+        _update_task(task_id, meta_json=json.dumps(meta, ensure_ascii=False))
     except Exception as e:  # noqa: BLE001
-        logger.exception(f"[web] 合并任务 {task_id} 失败")
+        logger.exception(f"[web] 拼接任务 {task_id} 失败")
         _update_task(
             task_id, status="failed", error=f"{type(e).__name__}: {e}",
             ended_at=datetime.now().isoformat(timespec="seconds"),
         )
     finally:
-        # 段文件已并入 merged.mp4（成败都已无用），清掉防 uploads 膨胀
+        # 段文件已并入 merged.wav（成败都已无用），清掉防 uploads 膨胀
         for p in part_paths:
             try:
                 Path(p).unlink(missing_ok=True)

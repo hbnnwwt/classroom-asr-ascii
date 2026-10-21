@@ -1,310 +1,203 @@
-"""merge.py 单测：编码签名判定 + 拼接/转码编排（monkeypatch 假 ffmpeg，不跑真实进程）。
+"""merge.py 单测：多段音轨拼接（wave 模块造真 WAV，纯 Python 零子进程）。
 
-merge 的核心不变式：concat 只在全部段落签名一致时执行；
-不一致时全部段落按同一目标参数转码后再 concat——绝无"部分转码部分拷贝"的混合。
+merge_audios 的核心不变式：逐段 extract_audio 产出统一格式
+（16k/单声道/pcm_s16le，格式一致由构造保证），拼接 = wave 数据块顺序追加。
+编码差异在音频层不存在——不是被解决，是不存在。
 """
-import subprocess
+import struct
+import wave
 from pathlib import Path
 
 import pytest
 
 from asr import merge
-from asr.media import MediaInfo
 
 
 # ---------------------------------------------------------------------------
-# 构造辅助：ffprobe 流字典的形状与真实输出一致（sample_rate 是字符串）
+# 构造辅助：真 WAV（16k/mono/16bit，与 extract_audio 产出同参数）
 # ---------------------------------------------------------------------------
-def _vstream(codec="h264", profile="High", w=1920, h=1080, pix="yuv420p", fps="30/1"):
-    return {
-        "codec_type": "video", "codec_name": codec, "profile": profile,
-        "width": w, "height": h, "pix_fmt": pix, "avg_frame_rate": fps,
-    }
+SR = 16000
 
 
-def _astream(codec="aac", sr="48000", ch=2):
-    return {"codec_type": "audio", "codec_name": codec, "sample_rate": sr, "channels": ch}
+def _write_wav(path: Path, seconds: float, sample: int = 1000) -> Path:
+    """写一个全部采样值相同的 WAV（内容可判别，验证拼接顺序）。"""
+    n = int(SR * seconds)
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(SR)
+        w.writeframes(struct.pack(f"<{n}h", *[sample] * n))
+    return path
 
 
-def _info(path, v=None, a=None, dur=60.0):
-    return MediaInfo(
-        path=Path(path), duration_s=dur,
-        audio_streams=[a if a is not None else _astream()],
-        video_streams=[v if v is not None else _vstream()],
-    )
+def _read_wav(path: Path):
+    with wave.open(str(path), "rb") as w:
+        return (
+            (w.getnchannels(), w.getsampwidth(), w.getframerate()),
+            w.getnframes(),
+            w.readframes(w.getnframes()),
+        )
 
 
-def _install_fake_ffmpeg(monkeypatch, calls, outputs=None):
-    """把 merge 模块的 ffmpeg 依赖换成假实现：记录命令 + 生成输出文件。"""
-    monkeypatch.setattr(merge, "which_or_die", lambda name: name)
+def _install_fake_extract(monkeypatch, calls, samples=None, seconds=None):
+    """把 merge 模块的 extract_audio 换成假实现：按序生成真 WAV。
 
-    def fake_run_cmd(cmd, **kw):
-        calls.append(cmd)
-        out = Path(cmd[-1])
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_bytes(b"FAKE")
-        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+    samples: 每段的采样值（默认递增 1000/2000/...），拼接顺序可验证。
+    seconds: 每段时长（默认 0.5s）。
+    """
+    seq = iter(samples or [1000 * (i + 1) for i in range(99)])
+    secs = iter(seconds or [0.5] * 99)
 
-    monkeypatch.setattr(merge, "run_cmd", fake_run_cmd)
+    def fake_extract(src, dst, cfg, audio_track=None):
+        calls.append(Path(src).name)
+        return _write_wav(Path(dst), seconds=next(secs), sample=next(seq))
 
-
-def _install_fake_probe(monkeypatch, infos):
-    """按路径返回预置 MediaInfo。"""
-    table = {str(Path(i.path)): i for i in infos}
-    monkeypatch.setattr(merge, "probe", lambda p: table[str(Path(p))])
+    monkeypatch.setattr(merge, "extract_audio", fake_extract)
 
 
-# ---------------------------------------------------------------------------
-# signature：编码签名
-# ---------------------------------------------------------------------------
-def test_signature_identical_for_same_params():
-    """相同参数 → 相同签名元组。"""
-    assert merge.signature(_info("a.mp4")) == merge.signature(_info("b.mp4"))
-
-
-def test_signature_differs_on_resolution():
-    a = _info("a.mp4")
-    b = _info("b.mp4", v=_vstream(w=1280, h=720))
-    assert merge.signature(a) != merge.signature(b)
-
-
-def test_signature_differs_on_fps():
-    a = _info("a.mp4", v=_vstream(fps="30/1"))
-    b = _info("b.mp4", v=_vstream(fps="25/1"))
-    assert merge.signature(a) != merge.signature(b)
-
-
-def test_signature_parses_fractional_fps():
-    """avg_frame_rate "30000/1001" → 29.97（与 30/1 不同签名）。"""
-    a = _info("a.mp4", v=_vstream(fps="30000/1001"))
-    b = _info("b.mp4", v=_vstream(fps="30/1"))
-    assert merge.signature(a) != merge.signature(b)
-    # 签名里 fps 取 3 位小数
-    assert any(abs(x - 29.97) < 0.001 for x in merge.signature(a) if isinstance(x, float))
-
-
-def test_signature_differs_on_audio_params():
-    a = _info("a.mp4", a=_astream(sr="44100"))
-    b = _info("b.mp4", a=_astream(sr="48000"))
-    assert merge.signature(a) != merge.signature(b)
+CFG = object()  # 假配置：真实现只透传给 extract_audio（已 mock）
 
 
 # ---------------------------------------------------------------------------
-# copy_compatible：流拷贝白名单 + 签名一致
+# 拼接正确性
 # ---------------------------------------------------------------------------
-def test_copy_compatible_all_whitelisted_and_identical():
-    infos = [_info("a.mp4"), _info("b.mp4"), _info("c.mp4")]
-    assert merge.copy_compatible(infos) is True
-
-
-def test_copy_compatible_rejects_pcm_audio():
-    """pcm 音频进 mp4 容器会产出坏文件 → 不允许流拷贝。"""
-    infos = [_info("a.mp4"), _info("b.mp4", a=_astream(codec="pcm_s16le"))]
-    assert merge.copy_compatible(infos) is False
-
-
-def test_copy_compatible_rejects_vp9_video():
-    infos = [_info("a.mp4"), _info("b.mp4", v=_vstream(codec="vp9"))]
-    assert merge.copy_compatible(infos) is False
-
-
-def test_copy_compatible_rejects_signature_mismatch():
-    """编码都在白名单内但分辨率不同 → 仍然不能流拷贝。"""
-    infos = [_info("a.mp4"), _info("b.mp4", v=_vstream(w=1280, h=720))]
-    assert merge.copy_compatible(infos) is False
-
-
-# ---------------------------------------------------------------------------
-# merge_videos：兼容路径（流拷贝）
-# ---------------------------------------------------------------------------
-def test_merge_compatible_uses_stream_copy(monkeypatch, tmp_path):
-    """签名一致 → concat demuxer + -c copy，一次 ffmpeg，零转码。"""
+def test_merge_audios_concatenates_in_order(monkeypatch, tmp_path):
+    """段落按给定顺序字节级拼接：第 1 段采样在前，第 2 段在后。"""
     calls = []
-    _install_fake_ffmpeg(monkeypatch, calls)
+    _install_fake_extract(monkeypatch, calls, samples=[1000, 2000],
+                          seconds=[0.4, 0.6])
     parts = [tmp_path / "a.mp4", tmp_path / "b.mp4"]
-    for p in parts:
-        p.write_bytes(b"X")
-    _install_fake_probe(monkeypatch, [_info(p) for p in parts])
-    out = tmp_path / "merged.mp4"
+    out = tmp_path / "merged.wav"
 
-    result = merge.merge_videos(parts, out)
+    wav_path, durations = merge.merge_audios(parts, out, CFG)
 
-    assert result == out
-    assert out.exists()
-    assert len(calls) == 1, "兼容路径只应有 1 次 ffmpeg 调用（concat）"
-    cmd = calls[0]
-    assert "-f" in cmd and "concat" in cmd
-    assert "-c" in cmd and "copy" in cmd[cmd.index("-c") + 1]
+    assert wav_path == out
+    assert durations == pytest.approx([0.4, 0.6]), "各段精确时长（wave 头）"
+    params, nframes, data = _read_wav(out)
+    assert params == (1, 2, SR), "拼接产物保持 16k/mono/16bit"
+    assert nframes == int(SR * 1.0), "总帧数 = 各段之和"
+    # 前 40% 是第一段（采样 1000），后 60% 是第二段（2000）
+    f40 = struct.unpack(f"<{int(SR * 0.4)}h", data[: int(SR * 0.4) * 2])
+    s60 = struct.unpack(f"<{int(SR * 0.6)}h", data[int(SR * 0.4) * 2:])
+    assert set(f40) == {1000} and set(s60) == {2000}, "顺序 = 段落顺序"
 
 
-def test_merge_incompatible_without_target_raises(monkeypatch, tmp_path):
-    """签名不一致且未选转码目标 → IncompatibleMediaError。"""
+def test_merge_audios_extracts_every_part(monkeypatch, tmp_path):
+    """每段各抽一次音轨，顺序与输入一致。"""
     calls = []
-    _install_fake_ffmpeg(monkeypatch, calls)
+    _install_fake_extract(monkeypatch, calls)
+    parts = [tmp_path / "a.mp4", tmp_path / "b.mp4", tmp_path / "c.mp3"]
+
+    merge.merge_audios(parts, tmp_path / "merged.wav", CFG)
+
+    assert calls == ["a.mp4", "b.mp4", "c.mp3"]
+
+
+def test_merge_audios_single_part(monkeypatch, tmp_path):
+    """单段也能拼（自然退化，无特殊分支）。"""
+    _install_fake_extract(monkeypatch, [], samples=[700])
+    out, durations = merge.merge_audios([tmp_path / "solo.mp4"], tmp_path / "m.wav", CFG)
+    _, _, data = _read_wav(out)
+    assert set(struct.unpack(f"<{len(data) // 2}h", data)) == {700}
+    assert durations == pytest.approx([0.5])
+
+
+def test_merge_audios_rejects_mismatched_params(monkeypatch, tmp_path):
+    """参数不一致（不该发生，防御性断言）→ 明确报错，不产出坏文件。"""
+    rates = iter([SR, 44100])  # 第一段 16k，第二段 44.1k（参数不一致）
+
+    def fake_extract(src, dst, cfg, audio_track=None):
+        p = Path(dst)
+        with wave.open(str(p), "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(next(rates))
+            w.writeframes(struct.pack("<100h", *([1] * 100)))
+        return p
+
+    monkeypatch.setattr(merge, "extract_audio", fake_extract)
     parts = [tmp_path / "a.mp4", tmp_path / "b.mp4"]
-    _install_fake_probe(monkeypatch, [
-        _info(parts[0]), _info(parts[1], v=_vstream(w=1280, h=720)),
-    ])
+    out = tmp_path / "merged.wav"
 
-    with pytest.raises(merge.IncompatibleMediaError):
-        merge.merge_videos(parts, tmp_path / "merged.mp4")
-    assert calls == [], "失败路径不得启动任何 ffmpeg"
+    with pytest.raises(ValueError, match="b|参数"):
+        merge.merge_audios(parts, out, CFG)
+    assert not out.exists(), "失败不得留下半截产物"
 
 
-# ---------------------------------------------------------------------------
-# merge_videos：转码路径（统一参数重编码全部段 → concat）
-# ---------------------------------------------------------------------------
-def test_merge_preset_h264_transcodes_all_then_concat(monkeypatch, tmp_path):
-    """target=h264：每段都用 libx264+aac 统一参数转码，再 concat -c copy。"""
-    calls = []
-    _install_fake_ffmpeg(monkeypatch, calls)
-    parts = [tmp_path / "a.mp4", tmp_path / "b.mp4"]
-    # 第二段分辨率不同（触发不兼容的典型场景）
-    _install_fake_probe(monkeypatch, [
-        _info(parts[0]), _info(parts[1], v=_vstream(w=1280, h=720)),
-    ])
-    out = tmp_path / "merged.mp4"
+def test_merge_audios_extract_failure_propagates(monkeypatch, tmp_path):
+    """抽音轨失败（如无音轨）→ 原样上抛。"""
+    def boom(src, dst, cfg, audio_track=None):
+        raise RuntimeError("视频无音轨")
 
-    merge.merge_videos(parts, out, target="h264")
-
-    assert len(calls) == 3, "2 段转码 + 1 次 concat"
-    transcodes = calls[:2]
-    for cmd in transcodes:
-        assert "libx264" in cmd
-        assert "aac" in cmd
-        # 锚点参数（第一段的 1920x1080@30）落到每一段
-        i = cmd.index("-vf")
-        assert cmd[i + 1] == "scale=1920:1080"
-        assert cmd[cmd.index("-r") + 1] == "30"
-    concat = calls[2]
-    assert "concat" in concat and "copy" in concat
+    monkeypatch.setattr(merge, "extract_audio", boom)
+    with pytest.raises(RuntimeError, match="无音轨"):
+        merge.merge_audios([tmp_path / "a.mp4", tmp_path / "b.mp4"],
+                           tmp_path / "m.wav", CFG)
 
 
-def test_merge_preset_h265_uses_libx265(monkeypatch, tmp_path):
-    calls = []
-    _install_fake_ffmpeg(monkeypatch, calls)
-    parts = [tmp_path / "a.mp4", tmp_path / "b.mp4"]
-    _install_fake_probe(monkeypatch, [
-        _info(parts[0]), _info(parts[1], v=_vstream(codec="hevc")),
-    ])
-
-    merge.merge_videos(parts, tmp_path / "merged.mp4", target="h265")
-
-    for cmd in calls[:2]:
-        assert "libx265" in cmd
-
-
-def test_merge_target_first_maps_anchor_codec(monkeypatch, tmp_path):
-    """target=first：编码器取第一段的编码家族（hevc → libx265），参数锚定第一段。"""
-    calls = []
-    _install_fake_ffmpeg(monkeypatch, calls)
-    parts = [tmp_path / "a.mp4", tmp_path / "b.mp4"]
-    _install_fake_probe(monkeypatch, [
-        _info(parts[0], v=_vstream(codec="hevc", w=1280, h=720, fps="25/1")),
-        _info(parts[1], v=_vstream(codec="h264")),
-    ])
-
-    merge.merge_videos(parts, tmp_path / "merged.mp4", target="first")
-
-    for cmd in calls[:2]:
-        assert "libx265" in cmd, "第一段是 hevc → 全部用 libx265"
-        assert cmd[cmd.index("-vf") + 1] == "scale=1280:720", "分辨率锚定第一段"
-        assert cmd[cmd.index("-r") + 1] == "25", "帧率锚定第一段"
-
-
-def test_merge_target_first_unsupported_anchor_codec_raises(monkeypatch, tmp_path):
-    """第一段编码无映射（如 mpeg4）→ first 目标不可用，明确报错。"""
-    calls = []
-    _install_fake_ffmpeg(monkeypatch, calls)
-    parts = [tmp_path / "a.mp4", tmp_path / "b.mp4"]
-    _install_fake_probe(monkeypatch, [
-        _info(parts[0], v=_vstream(codec="mpeg4")),
-        _info(parts[1], v=_vstream(codec="h264")),
-    ])
-
-    with pytest.raises(ValueError, match="第一段"):
-        merge.merge_videos(parts, tmp_path / "merged.mp4", target="first")
-
-
-def test_merge_rejects_part_without_video_stream(monkeypatch, tmp_path):
-    """音频文件混进视频拼接 → 明确报错（信息含文件名）。"""
-    _install_fake_ffmpeg(monkeypatch, [])
-    parts = [tmp_path / "a.mp4", tmp_path / "b.mp3"]
-    _install_fake_probe(monkeypatch, [
-        _info(parts[0]),
-        MediaInfo(path=parts[1], duration_s=10.0,
-                  audio_streams=[_astream()], video_streams=[]),
-    ])
-
-    with pytest.raises(ValueError, match="b.mp3"):
-        merge.merge_videos(parts, tmp_path / "merged.mp4")
-
-
-def test_merge_rejects_part_without_audio_stream(monkeypatch, tmp_path):
-    """无音轨的视频 → 报错（转写流程必须有音轨）。"""
-    _install_fake_ffmpeg(monkeypatch, [])
-    parts = [tmp_path / "a.mp4"]
-    _install_fake_probe(monkeypatch, [
-        MediaInfo(path=parts[0], duration_s=10.0,
-                  audio_streams=[], video_streams=[_vstream()]),
-    ])
-
-    with pytest.raises(ValueError, match="音轨"):
-        merge.merge_videos(parts, tmp_path / "merged.mp4")
-
-
-def test_merge_ffmpeg_failure_raises(monkeypatch, tmp_path):
-    """ffmpeg 返回非 0 → RuntimeError 带 stderr。"""
-    monkeypatch.setattr(merge, "which_or_die", lambda name: name)
-    monkeypatch.setattr(merge, "run_cmd", lambda cmd, **kw: subprocess.CompletedProcess(
-        args=cmd, returncode=1, stdout="", stderr="boom"))
-    parts = [tmp_path / "a.mp4", tmp_path / "b.mp4"]
-    _install_fake_probe(monkeypatch, [_info(p) for p in parts])
-
-    with pytest.raises(RuntimeError, match="boom"):
-        merge.merge_videos(parts, tmp_path / "merged.mp4")
-
-
-def test_concat_list_escapes_single_quotes(monkeypatch, tmp_path):
-    """文件名含单引号 → concat 列表正确转义（否则 ffmpeg 解析错乱）。"""
-    calls = []
-    captured = {}
-
-    def fake_run_cmd(cmd, **kw):
-        calls.append(cmd)
-        # 捕获 concat 列表文件内容
-        if "concat" in cmd:
-            list_file = Path(cmd[cmd.index("-i") + 1])
-            captured["list"] = list_file.read_text(encoding="utf-8")
-        out = Path(cmd[-1])
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_bytes(b"FAKE")
-        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
-
-    monkeypatch.setattr(merge, "which_or_die", lambda name: name)
-    monkeypatch.setattr(merge, "run_cmd", fake_run_cmd)
-    parts = [tmp_path / "it's a.mp4", tmp_path / "b.mp4"]
-    _install_fake_probe(monkeypatch, [_info(p) for p in parts])
-
-    merge.merge_videos(parts, tmp_path / "merged.mp4")
-
-    assert "file '" in captured["list"]
-    assert "\\'" in captured["list"], "单引号必须转义为 '\\''"
-
-
-def test_merge_reports_progress(monkeypatch, tmp_path):
-    """on_progress 收到 0..1 单调递增的进度，完成时到 1.0。"""
-    calls = []
-    _install_fake_ffmpeg(monkeypatch, calls)
-    parts = [tmp_path / "a.mp4", tmp_path / "b.mp4"]
-    _install_fake_probe(monkeypatch, [
-        _info(parts[0]), _info(parts[1], v=_vstream(w=1280, h=720)),
-    ])
+def test_merge_audios_reports_progress(monkeypatch, tmp_path):
+    """on_progress 收到 0..1 单调进度，完成时 1.0。"""
+    _install_fake_extract(monkeypatch, [])
     ratios = []
-
-    merge.merge_videos(parts, tmp_path / "merged.mp4", target="h264",
-                       on_progress=lambda r, msg: ratios.append(r))
-
+    merge.merge_audios(
+        [tmp_path / "a.mp4", tmp_path / "b.mp4"], tmp_path / "m.wav", CFG,
+        on_progress=lambda r, msg: ratios.append(r),
+    )
     assert ratios[0] == 0.0
     assert ratios == sorted(ratios), "进度单调递增"
     assert ratios[-1] == 1.0
+
+
+def test_merge_audios_cleans_tmpdir(monkeypatch, tmp_path, tmp_path_factory):
+    """中间 WAV 不留垃圾（tmpdir 用后即删）。"""
+    made = []
+
+    def fake_tmpdir(prefix="asr-"):
+        d = tmp_path_factory.mktemp(prefix)
+        made.append(d)
+        return d
+
+    monkeypatch.setattr(merge, "make_tmpdir", fake_tmpdir)
+    _install_fake_extract(monkeypatch, [])
+    merge.merge_audios([tmp_path / "a.mp4", tmp_path / "b.mp4"],
+                       tmp_path / "m.wav", CFG)
+    assert made and not any(p.exists() for p in made), "临时目录应被删除"
+
+
+# ---------------------------------------------------------------------------
+# write_part_srts：整体时间轴 → 每段一份独立 SRT（时间归零）
+# ---------------------------------------------------------------------------
+def _seg(start, end, text):
+    return {"start": start, "end": end, "text": text}
+
+
+def test_write_part_srts_splits_by_boundary(tmp_path):
+    """段起点落在哪段归哪段；时间归零配原视频；跨缝段不撕开。"""
+    segs = [
+        _seg(0.1, 0.4, "第一段话"),   # part0
+        _seg(0.9, 1.3, "跨缝话"),     # 起点在 part0 → 归 part0（不切文本）
+        _seg(1.2, 1.5, "第二段话"),   # part1
+    ]
+    files = merge.write_part_srts(
+        segs, durations=[1.0, 1.0], stems=["a", "b"], out_dir=tmp_path)
+
+    assert [p.name for p in files] == ["00_a.srt", "01_b.srt"]
+    a = (tmp_path / "00_a.srt").read_text(encoding="utf-8")
+    b = (tmp_path / "01_b.srt").read_text(encoding="utf-8")
+
+    assert "第一段话" in a and "跨缝话" in a
+    assert "00:00:00,100 --> 00:00:00,400" in a, "part0 时间归零"
+    assert "00:00:00,900 --> 00:00:01,300" in a, "跨缝段保留原相对时长"
+    assert "第二段话" in b and "跨缝话" not in b
+    assert "00:00:00,200 --> 00:00:00,500" in b, "part1 减去 1.0s 偏移"
+    assert b.splitlines()[0] == "1", "每份 SRT 序号独立从 1 起"
+
+
+def test_write_part_srts_empty_part_still_writes_file(tmp_path):
+    """某段无语音 → 仍写出空 SRT（文件与段一一对应，索引不错位）。"""
+    files = merge.write_part_srts(
+        [_seg(0.1, 0.4, "只有第一段有话")],
+        durations=[1.0, 1.0], stems=["a", "b"], out_dir=tmp_path)
+    assert len(files) == 2
+    b = (tmp_path / "01_b.srt").read_text(encoding="utf-8")
+    assert b.strip() == "", "空段 → 空 SRT"

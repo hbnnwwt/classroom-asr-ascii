@@ -170,8 +170,9 @@ $("cancel-upload-btn").addEventListener("click", () => {
 });
 
 // ---------------------------------------------------------------------------
-// 拖放上传：整个 dropzone 区域可拖可点。多选/拖入 ≥2 段视频时走
-// "暂存探测（/api/uploads）→ 选转码类型 → 创建合并项目"流程。
+// 拖放上传：整个 dropzone 区域可拖可点。选中 ≥2 个文件时展示段落列表，
+// 提交时按列表顺序全部 append 到 "files" 字段——后端逐段抽音轨拼接成
+// 一个 WAV 一次转写。前端不探测、不选编码：转写只吃音轨，没有分支。
 // ---------------------------------------------------------------------------
 const dz = $("dropzone");
 const fileInput = $("file-input");
@@ -183,68 +184,41 @@ function fmtSize(bytes) {
 }
 
 let selectedFiles = [];   // 有序：即拼接顺序
-let probeResult = null;   // /api/uploads 响应 {upload_id, compatible, parts}
-let stagingBusy = false;  // 暂存上传 + 探测进行中
 
 const VIDEO_RE = /\.(mp4|mov|mkv|avi|m4v|flv|ts|webm|mpg|mpeg)$/i;
-const isVideoFile = (f) => f.type.startsWith("video/") || VIDEO_RE.test(f.name);
 const isMediaFile = (f) => f.type.startsWith("video/") || f.type.startsWith("audio/")
   || VIDEO_RE.test(f.name) || /\.(mp3|wav|m4a|aac|flac)$/i.test(f.name);
-
-function escapeHtml(s) {
-  return String(s).replace(/[&<>"']/g, (c) => ({
-    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
-  }[c]));
-}
 
 function showFile() {
   const n = selectedFiles.length;
   dz.classList.toggle("has-file", n > 0);
   if (n === 0) {
     $("dz-main").textContent = "点击选择文件，或拖拽到此处";
-    $("dz-sub").textContent = "支持 mp4 / mov / mp3 / wav 等音视频；多段视频可拼接合并";
+    $("dz-sub").textContent = "支持 mp4 / mov / mp3 / wav 等音视频；多段自动拼接音轨连续转写";
   } else if (n === 1) {
     $("dz-main").textContent = selectedFiles[0].name;
     $("dz-sub").textContent = `${fmtSize(selectedFiles[0].size)} · 重新选择/拖拽可替换`;
   } else {
-    $("dz-main").textContent = `已选 ${n} 段视频`;
+    $("dz-main").textContent = `已选 ${n} 段`;
     $("dz-sub").textContent = "重新选择/拖拽可整体替换；下方列表可调整拼接顺序";
   }
 }
 
 function resetUploadForm() {
   selectedFiles = [];
-  probeResult = null;
-  stagingBusy = false;
   $("merge-panel").hidden = true;
-  $("probe-status").hidden = true;
-  $("probe-status").innerHTML = "";
   showFile();
-  updateSubmitLabel();
 }
 
 function setFiles(list) {
-  const files = Array.from(list);
-  if (files.length >= 2) {
-    const bad = files.filter((f) => !isVideoFile(f));
-    if (bad.length) {
-      alert(`拼接合并要求全部为视频文件，以下不是：\n${bad.map((f) => f.name).join("\n")}`);
-      return;
-    }
-  }
-  selectedFiles = files;
-  probeResult = null;
-  $("merge-panel").hidden = files.length < 2;
-  $("probe-status").hidden = true;
-  $("probe-status").innerHTML = "";
+  selectedFiles = Array.from(list);
+  $("merge-panel").hidden = selectedFiles.length < 2;
   renderPartsList();
   showFile();
-  updateSubmitLabel();
-  if (files.length >= 2) uploadStaging();
 }
 
 // ---------------------------------------------------------------------------
-// 段列表（顺序调整 / 移除 / 编码徽标）
+// 段列表（顺序调整 / 移除）
 // ---------------------------------------------------------------------------
 function renderPartsList() {
   const ul = $("parts-list");
@@ -267,11 +241,6 @@ function renderPartsList() {
     size.className = "part-size";
     size.textContent = fmtSize(f.size);
 
-    const codec = document.createElement("span");
-    codec.className = "part-codec";
-    const p = probeResult && probeResult.parts.find((x) => x.name === f.name);
-    if (p) codec.textContent = `${p.video.codec} ${p.video.width}×${p.video.height} · ${p.audio.codec}`;
-
     const ops = document.createElement("span");
     ops.className = "part-ops";
     const mkBtn = (label, title, cls, fn) => {
@@ -290,7 +259,7 @@ function renderPartsList() {
       mkBtn("✕", "移除", "danger", () => removePart(i)),
     );
 
-    li.append(idx, name, size, codec, ops);
+    li.append(idx, name, size, ops);
     ul.appendChild(li);
   });
 }
@@ -299,93 +268,11 @@ function movePart(i, delta) {
   const j = i + delta;
   if (j < 0 || j >= selectedFiles.length) return;
   [selectedFiles[i], selectedFiles[j]] = [selectedFiles[j], selectedFiles[i]];
-  // 集合没变，探测结论仍有效（compatible 与顺序无关）；
-  // 只需重渲染 + 刷新转码选项（"以第一段为基准"跟随新的第一段）
   renderPartsList();
-  renderProbeStatus();
 }
 
 function removePart(i) {
-  setFiles(selectedFiles.filter((_, k) => k !== i));  // 集合变了 → 重新暂存探测
-}
-
-// ---------------------------------------------------------------------------
-// 暂存上传 + 编码探测
-// ---------------------------------------------------------------------------
-async function uploadStaging() {
-  stagingBusy = true;
-  const status = $("probe-status");
-  status.hidden = false;
-  status.innerHTML = '<span class="probe-wait"><span class="spinner" aria-hidden="true"></span>上传并探测各段编码…</span>';
-  try {
-    const form = new FormData();
-    for (const f of selectedFiles) form.append("files", f, f.name);
-    const resp = await fetch("/api/uploads", { method: "POST", body: form });
-    if (!resp.ok) {
-      const err = await resp.json().catch(() => ({}));
-      throw new Error(err.detail || `上传失败: ${resp.status}`);
-    }
-    probeResult = await resp.json();
-    renderPartsList();      // 补上编码徽标
-    renderProbeStatus();
-  } catch (err) {
-    status.innerHTML = `<span class="probe-err">${escapeHtml(err.message)}</span>`;
-  } finally {
-    stagingBusy = false;
-  }
-}
-
-/** "以第一段为基准"是否可用：当前列表第一段的编码在 h264/hevc 家族内。 */
-function anchorSupportedNow() {
-  if (!probeResult || !selectedFiles.length) return false;
-  const first = probeResult.parts.find((p) => p.name === selectedFiles[0].name);
-  return Boolean(first && ["h264", "hevc"].includes(first.video.codec));
-}
-
-function renderProbeStatus() {
-  const status = $("probe-status");
-  if (!probeResult) return;
-  status.hidden = false;
-
-  if (probeResult.compatible) {
-    status.innerHTML =
-      '<span class="status-badge status-done">编码一致</span>' +
-      '<span class="probe-note">无损流拷贝拼接，秒级完成</span>';
-    return;
-  }
-
-  // 不一致：编码对比 + 转码类型选择
-  const rows = probeResult.parts.map((p) =>
-    `<tr><td>${escapeHtml(p.name)}</td>` +
-    `<td>${escapeHtml(p.video.codec)}${p.video.profile ? " · " + escapeHtml(p.video.profile) : ""}</td>` +
-    `<td>${p.video.width}×${p.video.height} @ ${p.video.fps}fps</td>` +
-    `<td>${escapeHtml(p.audio.codec)} ${(p.audio.sample_rate / 1000).toFixed(1)}kHz·${p.audio.channels}ch</td></tr>`,
-  ).join("");
-  status.innerHTML =
-    '<span class="status-badge status-failed">编码不一致</span>' +
-    '<span class="probe-note">需统一转码后拼接（耗时与视频总时长相关）</span>' +
-    `<table class="codec-table"><thead><tr><th>文件</th><th>视频编码</th><th>分辨率@帧率</th><th>音频</th></tr></thead><tbody>${rows}</tbody></table>`;
-
-  const pick = document.createElement("label");
-  pick.className = "transcode-pick";
-  const caption = document.createElement("span");
-  caption.textContent = "转码类型：";
-  const sel = document.createElement("select");
-  sel.id = "transcode-select";
-  const opts = [
-    ["", "请选择…"],
-    ["h264", "H.264（兼容性最好，推荐）"],
-    ["h265", "H.265（体积更小，速度较慢）"],
-  ];
-  if (anchorSupportedNow()) opts.push(["first", "以第一段编码为基准"]);
-  for (const [v, label] of opts) {
-    const o = document.createElement("option");
-    o.value = v;
-    o.textContent = label;
-    sel.appendChild(o);
-  }
-  pick.append(caption, sel);
-  status.appendChild(pick);
+  setFiles(selectedFiles.filter((_, k) => k !== i));
 }
 
 fileInput.addEventListener("change", () => setFiles(fileInput.files));
@@ -410,20 +297,9 @@ dz.addEventListener("drop", (e) => {
 });
 
 // ---------------------------------------------------------------------------
-// 提交：单文件走老路径（直传转写）；多段走合并（upload_id + 顺序 + 转码）
+// 提交：所有文件按列表顺序 append 到 "files" 字段——单文件、多段同一入口，
+// 后端见 1 个走普通转写、见 N 个拼音轨。没有第二个分支。
 // ---------------------------------------------------------------------------
-function currentMergeMode() {
-  const r = document.querySelector('input[name="merge-mode"]:checked');
-  return r ? r.value : "transcribe";
-}
-
-function updateSubmitLabel() {
-  const multi = selectedFiles.length >= 2;
-  $("submit-btn").textContent = multi && currentMergeMode() === "merge_only" ? "开始合并" : "开始转写";
-}
-document.querySelectorAll('input[name="merge-mode"]').forEach((r) =>
-  r.addEventListener("change", updateSubmitLabel));
-
 $("upload-form").addEventListener("submit", async (e) => {
   e.preventDefault();
   if (selectedFiles.length === 0) return;
@@ -432,23 +308,7 @@ $("upload-form").addEventListener("submit", async (e) => {
   form.append("name", $("project-name-input").value.trim());
   form.append("quality", $("quality").value);
   form.append("diarize", $("diarize").checked ? "true" : "false");
-
-  if (selectedFiles.length >= 2) {
-    if (stagingBusy) { alert("还在上传/探测编码，请稍候"); return; }
-    if (!probeResult) { alert("编码探测未完成或失败，请重新选择文件"); return; }
-    const sel = document.getElementById("transcode-select");
-    const transcode = sel ? sel.value : "";
-    if (!probeResult.compatible && !transcode) {
-      alert("各段编码不一致，请先选择转码类型");
-      return;
-    }
-    form.append("upload_id", probeResult.upload_id);
-    form.append("merge_mode", currentMergeMode());
-    form.append("transcode", transcode);
-    form.append("order", JSON.stringify(selectedFiles.map((f) => f.name)));
-  } else {
-    form.append("file", selectedFiles[0], selectedFiles[0].name);
-  }
+  for (const f of selectedFiles) form.append("files", f, f.name);
 
   $("submit-btn").disabled = true;
   $("submit-btn").innerHTML = '<span class="spinner" aria-hidden="true"></span>提交中…';
@@ -468,7 +328,7 @@ $("upload-form").addEventListener("submit", async (e) => {
     alert(err.message);
   } finally {
     $("submit-btn").disabled = false;
-    updateSubmitLabel();
+    $("submit-btn").textContent = "开始转写";
   }
 });
 

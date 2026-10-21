@@ -38,24 +38,16 @@
         <label class="dropzone" id="dropzone">
           <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m17 8-5-5-5 5"/><path d="M12 3v12"/></svg>
           <span class="dz-main" id="dz-main">点击选择文件，或拖拽到此处</span>
-          <span class="dz-sub" id="dz-sub">支持 mp4 / mov / mp3 / wav 等音视频；多段视频可拼接合并</span>
+          <span class="dz-sub" id="dz-sub">支持 mp4 / mov / mp3 / wav 等音视频；多段自动拼接音轨连续转写</span>
           <input type="file" id="file-input" name="file" accept="video/*,audio/*" required multiple />
         </label>
 
-        <!-- 多段合并（选中 ≥2 个视频时出现） -->
+        <!-- 多段拼接（选中 ≥2 个文件时出现，只管顺序，别的一概不管） -->
         <div id="merge-panel" hidden>
           <div class="merge-block">
-            <span class="merge-block-title">已选 <strong id="parts-count">0</strong> 段视频（按此顺序拼接）</span>
-            <ul id="parts-list" aria-label="视频段落列表"></ul>
+            <span class="merge-block-title">已选 <strong id="parts-count">0</strong> 段（按此顺序拼接音轨）</span>
+            <ul id="parts-list" aria-label="段落列表"></ul>
           </div>
-          <div class="merge-block">
-            <span class="merge-block-title">合并用途</span>
-            <div class="mode-radio" role="radiogroup" aria-label="合并用途">
-              <label class="radio"><input type="radio" name="merge-mode" value="transcribe" checked />合并后转写</label>
-              <label class="radio"><input type="radio" name="merge-mode" value="merge_only" />仅合并下载视频</label>
-            </div>
-          </div>
-          <div id="probe-status" class="merge-block" hidden></div>
         </div>
 
         <div class="form-row">

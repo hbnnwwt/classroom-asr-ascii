@@ -169,19 +169,21 @@ def _fake_pipeline_run(*args, **kwargs):
 
 
 def test_index_serves_html(client):
-    """GET / 返回管理界面 index.html。"""
+    """GET / 返回管理界面 index.html，带 no-cache（HTML 也不能被启发式缓存钉死）。"""
     r = client.get("/")
     assert r.status_code == 200
     assert "项目管理" in r.text
     assert "list.js" in r.text
+    assert "no-cache" in r.headers.get("Cache-Control", "")
 
 
 def test_task_page_serves_html(client):
-    """GET /task/{id} 返回详情页 task.html。"""
+    """GET /task/{id} 返回详情页 task.html，带 no-cache。"""
     r = client.get("/task/abc123")
     assert r.status_code == 200
     assert "项目详情" in r.text
     assert "task.js" in r.text
+    assert "no-cache" in r.headers.get("Cache-Control", "")
 
 
 def test_static_files(client):
@@ -398,12 +400,13 @@ def test_get_project_not_found(client):
 
 
 def test_create_project(client, monkeypatch):
-    """POST /api/projects 创建项目并启动后台任务。"""
+    """POST /api/projects 单文件创建项目并启动后台任务（老行为）。"""
     _install_sync_pipeline(monkeypatch)
+    _install_fake_probe(monkeypatch, [_mk_info("a.mp4")])
 
     r = client.post(
         "/api/projects",
-        files={"file": ("a.mp4", b"FAKE", "video/mp4")},
+        files=[("files", ("a.mp4", b"FAKE", "video/mp4"))],
         data={"name": "我的项目", "diarize": "true", "quality": "balanced"},
     )
     assert r.status_code == 200, r.text
@@ -421,10 +424,11 @@ def test_create_project(client, monkeypatch):
 def test_create_project_default_name(client, monkeypatch):
     """不传 name → 用文件名去后缀。"""
     _install_sync_pipeline(monkeypatch)
+    _install_fake_probe(monkeypatch, [_mk_info("lecture_03.mp4")])
 
     r = client.post(
         "/api/projects",
-        files={"file": ("lecture_03.mp4", b"X", "video/mp4")},
+        files=[("files", ("lecture_03.mp4", b"X", "video/mp4"))],
         data={"name": ""},
     )
     assert r.status_code == 200
@@ -827,208 +831,149 @@ def test_watchdog_updates_last_cb_time(isolated_db):
 # P0-6：看门狗终态守卫（done 任务不可被改写为 failed）
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
-# 多段视频合并：暂存上传 /api/uploads + 创建合并项目
+# 多段拼接：POST /api/projects files=[...] 直传 + _run_multi_task 编排
 # ---------------------------------------------------------------------------
 from asr.media import MediaInfo
 
 
-def _mk_info(path, codec="h264", w=1920, h=1080, fps="30/1", acodec="aac", sr="48000", ch=2):
-    """与 ffprobe 真实输出同形的 MediaInfo（按文件名匹配）。"""
+def _mk_info(path):
+    """创建路径校验用的 MediaInfo（只判有无音轨，与 ffprobe 输出同形）。"""
     p = Path(path)
     return MediaInfo(
         path=p, duration_s=60.0,
-        video_streams=[{"codec_type": "video", "codec_name": codec, "profile": "High",
-                        "width": w, "height": h, "pix_fmt": "yuv420p", "avg_frame_rate": fps}],
-        audio_streams=[{"codec_type": "audio", "codec_name": acodec,
-                        "sample_rate": sr, "channels": ch}],
+        video_streams=[{"codec_type": "video", "codec_name": "h264"}],
+        audio_streams=[{"codec_type": "audio", "codec_name": "aac"}],
     )
 
 
 def _install_fake_probe(monkeypatch, infos):
-    """按文件名把 wm.probe 换成假实现。"""
+    """按文件名把 wm.probe 换成假实现（自动剥掉落盘加的 task/序号前缀）。"""
+    import re as _re
     import asr.web as wm
     table = {Path(i.path).name: i for i in infos}
-    monkeypatch.setattr(wm, "probe", lambda p: table[Path(p).name])
+
+    def _lookup(p):
+        name = Path(p).name
+        if name in table:
+            return table[name]
+        return table[_re.sub(r"^([0-9a-f]{12}|\d{2})_", "", name)]
+
+    monkeypatch.setattr(wm, "probe", _lookup)
 
 
-def _stage_files(client, names):
-    """上传到暂存区，返回响应 JSON。"""
-    files = [("files", (n, b"FAKEVIDEO", "video/mp4")) for n in names]
-    r = client.post("/api/uploads", files=files)
-    assert r.status_code == 200, r.text
-    return r.json()
-
-
-def test_stage_uploads_probes_parts(client, monkeypatch):
-    """POST /api/uploads：保存到暂存区 + 返回探测信息与兼容判定。"""
+def test_create_project_multi_files(client, monkeypatch):
+    """2 个文件：存入 {task_id}_parts/{序号}_，meta 记 parts，起 _run_multi_task。"""
     import asr.web as wm
     _install_fake_probe(monkeypatch, [_mk_info("a.mp4"), _mk_info("b.mp4")])
-
-    data = _stage_files(client, ["a.mp4", "b.mp4"])
-
-    assert data["compatible"] is True
-    assert data["anchor_supported"] is True
-    assert len(data["parts"]) == 2
-    part = data["parts"][0]
-    assert part["name"] == "a.mp4"
-    assert part["video"]["codec"] == "h264"
-    assert part["video"]["width"] == 1920
-    assert part["audio"]["codec"] == "aac"
-    assert part["audio"]["sample_rate"] == 48000
-    # 文件落盘在暂存区
-    staging = wm.UPLOAD_DIR / "staging" / data["upload_id"]
-    assert (staging / "a.mp4").exists()
-    assert (staging / "b.mp4").exists()
-
-
-def test_stage_uploads_reports_incompatible(client, monkeypatch):
-    """分辨率不同 → compatible=False（前端据此弹转码选择）。"""
-    _install_fake_probe(monkeypatch, [
-        _mk_info("a.mp4"), _mk_info("b.mp4", w=1280, h=720),
-    ])
-    data = _stage_files(client, ["a.mp4", "b.mp4"])
-    assert data["compatible"] is False
-
-
-def test_stage_uploads_rejects_no_video_stream(client, monkeypatch):
-    import asr.web as wm
-    audio_only = MediaInfo(path=Path("x.mp3"), duration_s=10.0,
-                           video_streams=[], audio_streams=[{"codec_name": "mp3"}])
-    _install_fake_probe(monkeypatch, [_mk_info("a.mp4"), audio_only])
-    r = client.post("/api/uploads", files=[
-        ("files", ("a.mp4", b"X", "video/mp4")),
-        ("files", ("x.mp3", b"X", "audio/mpeg")),
-    ])
-    assert r.status_code == 400
-    assert "x.mp3" in r.json()["detail"]
-
-
-def test_create_project_from_staging(client, monkeypatch):
-    """带 upload_id 创建：任务入库 + 文件移出暂存区 + 后台合并启动。"""
-    import asr.web as wm
-    _install_fake_probe(monkeypatch, [_mk_info("a.mp4"), _mk_info("b.mp4")])
-    data = _stage_files(client, ["a.mp4", "b.mp4"])
-    upload_id = data["upload_id"]
 
     recorded = {}
 
-    def _fake_merged_task(task_id, part_paths, out_dir, mode, transcode,
-                          config_path, diarize, quality):
-        recorded.update(task_id=task_id, paths=list(part_paths),
-                        mode=mode, transcode=transcode)
+    def _fake_multi(task_id, part_paths, out_dir, config_path, diarize, quality):
+        recorded["paths"] = list(part_paths)
         _update_task(task_id, status="done", progress=1.0)
 
-    monkeypatch.setattr(wm, "_run_merged_task", _fake_merged_task)
+    monkeypatch.setattr(wm, "_run_multi_task", _fake_multi)
     import types
     monkeypatch.setattr(wm, "threading", types.SimpleNamespace(Thread=_InlineThread))
 
-    r = client.post("/api/projects", data={
-        "upload_id": upload_id,
-        "merge_mode": "transcribe",
-        "transcode": "",
-        "name": "第三次课",
-        "diarize": "false",
-        "quality": "balanced",
-    })
+    r = client.post("/api/projects",
+                    files=[("files", ("a.mp4", b"X", "video/mp4")),
+                           ("files", ("b.mp4", b"Y", "video/mp4"))],
+                    data={"name": "第三次课", "diarize": "false", "quality": "balanced"})
     assert r.status_code == 200, r.text
     task_id = r.json()["task_id"]
     assert r.json()["name"] == "第三次课"
+    assert r.json()["filename"] == "a.mp4 + b.mp4"
 
-    # 文件按序移入正式上传目录（带序号前缀保序）
+    # 段文件带序号前缀保序落盘
     assert [p.name for p in recorded["paths"]] == ["00_a.mp4", "01_b.mp4"]
-    assert recorded["mode"] == "transcribe"
-    # 暂存区已清空
-    staging = wm.UPLOAD_DIR / "staging" / upload_id
-    assert not staging.exists()
-
-    # DB 记录：文件名为各段拼接
+    # DB：meta 记录分段
     with _db() as c:
-        row = c.execute("SELECT filename, status FROM tasks WHERE id=?", (task_id,)).fetchone()
-    assert row["filename"] == "a.mp4 + b.mp4"
-    assert row["status"] == "done"
+        row = c.execute("SELECT meta_json FROM tasks WHERE id=?", (task_id,)).fetchone()
+    assert json.loads(row["meta_json"])["parts"] == ["a.mp4", "b.mp4"]
 
 
-def test_create_project_incompatible_requires_transcode(client, monkeypatch):
-    """不兼容 + 未选转码 → 400（服务端兜底校验，不信任前端）。"""
-    _install_fake_probe(monkeypatch, [
-        _mk_info("a.mp4"), _mk_info("b.mp4", w=1280, h=720),
-    ])
-    data = _stage_files(client, ["a.mp4", "b.mp4"])
-
-    r = client.post("/api/projects", data={
-        "upload_id": data["upload_id"],
-        "merge_mode": "transcribe",
-        "transcode": "",
-    })
-    assert r.status_code == 400
-    assert "转码" in r.json()["detail"]
-
-
-def test_create_project_staging_not_found(client):
-    """不存在的 upload_id → 404。"""
-    r = client.post("/api/projects", data={
-        "upload_id": "nope",
-        "merge_mode": "transcribe",
-        "transcode": "",
-    })
-    assert r.status_code == 404
-
-
-def test_create_project_merge_only_downloadable(client, monkeypatch):
-    """仅合并模式：任务 done 后可下载 merged.mp4。"""
+def test_create_project_single_file_plain(client, monkeypatch):
+    """1 个文件：老行为——UPLOAD_DIR/{task_id}_{名}，无 meta，直接 _run_pipeline。"""
     import asr.web as wm
-    _install_fake_probe(monkeypatch, [_mk_info("a.mp4"), _mk_info("b.mp4")])
-    data = _stage_files(client, ["a.mp4", "b.mp4"])
+    _install_fake_probe(monkeypatch, [_mk_info("a.mp4")])
 
-    def _fake_merged_task(task_id, part_paths, out_dir, mode, transcode,
-                          config_path, diarize, quality):
-        merged = Path(out_dir) / "merged.mp4"
-        merged.write_bytes(b"MERGED")
+    recorded = {}
+
+    def _fake_pipeline(task_id, input_path, output_dir, config_path, diarize, quality):
+        recorded["input"] = str(input_path)
         _update_task(task_id, status="done", progress=1.0)
 
-    monkeypatch.setattr(wm, "_run_merged_task", _fake_merged_task)
+    monkeypatch.setattr(wm, "_run_pipeline", _fake_pipeline)
     import types
     monkeypatch.setattr(wm, "threading", types.SimpleNamespace(Thread=_InlineThread))
 
-    r = client.post("/api/projects", data={
-        "upload_id": data["upload_id"],
-        "merge_mode": "merge_only",
-        "transcode": "",
-    })
-    assert r.status_code == 200
+    r = client.post("/api/projects", files=[("files", ("a.mp4", b"X", "video/mp4"))])
+    assert r.status_code == 200, r.text
     task_id = r.json()["task_id"]
 
-    r = client.get(f"/download/{task_id}/mp4")
+    assert recorded["input"] == str(wm.UPLOAD_DIR / f"{task_id}_a.mp4")
+    assert not (wm.UPLOAD_DIR / f"{task_id}_parts").exists(), "单文件不建 parts 目录"
+
+    with _db() as c:
+        row = c.execute("SELECT meta_json FROM tasks WHERE id=?", (task_id,)).fetchone()
+    assert not json.loads(row["meta_json"] or "{}").get("parts")
+
+
+def test_create_project_rejects_no_audio(client, monkeypatch):
+    """无音轨的文件 → 400 带文件名，且不留半截文件。"""
+    import asr.web as wm
+    silent = MediaInfo(path=Path("s.mp4"), duration_s=10.0,
+                       video_streams=[{"codec_name": "h264"}], audio_streams=[])
+    _install_fake_probe(monkeypatch, [_mk_info("a.mp4"), silent])
+
+    r = client.post("/api/projects",
+                    files=[("files", ("a.mp4", b"X", "video/mp4")),
+                           ("files", ("s.mp4", b"Y", "video/mp4"))])
+    assert r.status_code == 400
+    assert "s.mp4" in r.json()["detail"]
+    # 失败不留垃圾：无 parts 目录残留
+    assert not any(p.name.endswith("_parts") for p in wm.UPLOAD_DIR.iterdir())
+
+
+def test_create_project_rejects_too_many(client):
+    """超过 MAX_MERGE_PARTS → 400。"""
+    files = [("files", (f"p{i:02d}.mp4", b"X", "video/mp4")) for i in range(21)]
+    r = client.post("/api/projects", files=files)
+    assert r.status_code == 400
+
+
+def test_create_project_requires_files(client):
+    """不带文件 → 422（FastAPI 必填校验）。"""
+    r = client.post("/api/projects", data={"name": "x"})
+    assert r.status_code == 422
+
+
+def test_download_legacy_merged_mp4(client):
+    """旧版合并任务（meta.merge_mode）的 merged.mp4 仍可下载（存量不破坏）。"""
+    out_dir = OUTPUT_ROOT / "legacy1"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "merged.mp4").write_bytes(b"MERGED")
+    with _db() as c:
+        c.execute(
+            """INSERT INTO tasks (id, filename, input_path, output_dir,
+               status, progress, created_at, meta_json)
+               VALUES (?, ?, ?, ?, 'done', 1.0, ?, ?)""",
+            ("legacy1", "a.mp4 + b.mp4", str(out_dir / "merged.mp4"), str(out_dir),
+             "2026-10-19T00:00:00", json.dumps({"merge_mode": "merge_only"})),
+        )
+
+    r = client.get("/download/legacy1/mp4")
     assert r.status_code == 200
     assert r.content == b"MERGED"
 
 
-def test_sweep_staging_removes_old_dirs(client, monkeypatch):
-    """暂存目录超 24h 自动清理，新目录保留。"""
-    import os as _os
-    import time as _time
-    import asr.web as wm
-    staging_root = wm.UPLOAD_DIR / "staging"
-    old = staging_root / "old123"
-    fresh = staging_root / "fresh456"
-    for d in (old, fresh):
-        d.mkdir(parents=True, exist_ok=True)
-        (d / "x.mp4").write_bytes(b"X")
-    # 把 old 的 mtime 拨回 25 小时前
-    cutoff = _time.time() - 25 * 3600
-    _os.utime(old, (cutoff, cutoff))
-
-    wm._sweep_staging()
-
-    assert not old.exists()
-    assert fresh.exists()
-
-
 # ---------------------------------------------------------------------------
-# _run_merged_task：合并编排（merge_videos + pipeline 全 mock）
+# _run_multi_task：拼音频编排（merge_audios + pipeline 全 mock）
 # ---------------------------------------------------------------------------
-def _mk_merged_task_env(monkeypatch, tmp_path, mode, transcode="", compatible=True):
-    """插好桩的 _run_merged_task 测试环境：DB 行 + mock merge/pipeline。"""
+def _mk_multi_env(monkeypatch):
+    """插好桩的 _run_multi_task 测试环境：DB 行 + mock merge/pipeline。"""
+    import types
     import asr.web as wm
     out_dir = wm.OUTPUT_ROOT / "mt1"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1036,22 +981,32 @@ def _mk_merged_task_env(monkeypatch, tmp_path, mode, transcode="", compatible=Tr
 
     merge_calls = {}
 
-    def _fake_merge_videos(part_paths, out, target=None, on_progress=None):
-        merge_calls["target"] = target
-        merge_calls["n_parts"] = len(part_paths)
+    def _fake_merge(part_paths, out, cfg, on_progress=None):
+        merge_calls["n"] = len(part_paths)
+        merge_calls["cfg"] = cfg
         if on_progress:
-            on_progress(0.5, "转码第 1/2 段")
+            on_progress(0.5, "提取音轨 1/2")
         out = Path(out)
-        out.write_bytes(b"MERGED")
-        return out
+        out.write_bytes(b"WAVDATA")
+        return out, [1.0, 1.0]
 
-    monkeypatch.setattr(wm, "merge_videos", _fake_merge_videos)
+    monkeypatch.setattr(wm, "merge_audios", _fake_merge)
+
+    from asr.config import OutputConfig
+    fake_cfg = types.SimpleNamespace(output=OutputConfig())
+    monkeypatch.setattr(wm, "load_config", lambda *a, **kw: fake_cfg)
+
     pipeline_calls = {}
 
     def _fake_pipeline(task_id, input_path, output_dir, config_path, diarize, quality):
         pipeline_calls["input"] = str(input_path)
+        # 模拟真实 pipeline 的 done：meta 覆盖 + transcript 原子写入
         _update_task(task_id, status="done", progress=1.0,
-                     meta_json=json.dumps({"segments_count": 3}))
+                     meta_json=json.dumps({"segments_count": 3}),
+                     transcript=json.dumps([
+                         {"start": 0.1, "end": 0.4, "text": "第一段话"},
+                         {"start": 1.2, "end": 1.5, "text": "第二段话"},
+                     ], ensure_ascii=False))
 
     monkeypatch.setattr(wm, "_run_pipeline", _fake_pipeline)
 
@@ -1059,64 +1014,120 @@ def _mk_merged_task_env(monkeypatch, tmp_path, mode, transcode="", compatible=Tr
         c.execute(
             """INSERT INTO tasks (id, filename, input_path, output_dir, status, created_at, meta_json)
                VALUES (?, ?, ?, ?, 'pending', ?, ?)""",
-            ("mt1", "p1.mp4 + p2.mp4", str(out_dir / "merged.mp4"), str(out_dir),
+            ("mt1", "p1.mp4 + p2.mp4", str(out_dir / "merged.wav"), str(out_dir),
              "2026-10-20T00:00:00",
-             json.dumps({"parts": ["p1.mp4", "p2.mp4"], "merge_mode": mode,
-                         "transcode": transcode})),
+             json.dumps({"parts": ["p1.mp4", "p2.mp4"]})),
         )
     return wm, out_dir, parts, merge_calls, pipeline_calls
 
 
-def test_run_merged_task_transcribe_mode(isolated_db, monkeypatch):
-    """转写模式：先 merge（stage=merge）再跑 pipeline；meta 保留 parts 信息。"""
-    wm, out_dir, parts, merge_calls, pipeline_calls = _mk_merged_task_env(
-        monkeypatch, isolated_db, mode="transcribe")
+def test_run_multi_task_merges_then_pipeline(isolated_db, monkeypatch):
+    """先拼音频（stage=merge）再 pipeline 吃 merged.wav；meta 保留 parts。"""
+    wm, out_dir, parts, merge_calls, pipeline_calls = _mk_multi_env(monkeypatch)
 
-    wm._run_merged_task("mt1", parts, out_dir, "transcribe", "", "config.yaml", False, "balanced")
+    wm._run_multi_task("mt1", parts, out_dir, "config.yaml", False, "balanced")
 
-    assert merge_calls["n_parts"] == 2
-    assert merge_calls["target"] is None, "兼容 + 未选转码 → 流拷贝"
-    assert pipeline_calls["input"] == str(out_dir / "merged.mp4"), "pipeline 吃合并产物"
+    assert merge_calls["n"] == 2
+    assert hasattr(merge_calls["cfg"], "output"), "配置透传给 merge_audios"
+    assert pipeline_calls["input"] == str(out_dir / "merged.wav"), "pipeline 吃拼接产物"
 
     with _db() as c:
         row = c.execute("SELECT * FROM tasks WHERE id='mt1'").fetchone()
     d = _row_to_dict(row)
     assert d["status"] == "done"
     assert d["meta"]["parts"] == ["p1.mp4", "p2.mp4"], "done 后 parts 元数据不丢"
-    assert d["meta"]["segments_count"] == 3, "pipeline 的 meta 与 merge 的 meta 合并"
+    assert d["meta"]["segments_count"] == 3, "pipeline 的 meta 与分段 meta 合并"
+
+    # 每段一份独立 SRT：文件落盘 + meta 记录，内容按段边界切分且时间归零
+    assert d["meta"]["part_files"] == ["00_p1.srt", "01_p2.srt"]
+    a = (out_dir / "00_p1.srt").read_text(encoding="utf-8")
+    b = (out_dir / "01_p2.srt").read_text(encoding="utf-8")
+    assert "第一段话" in a and "第二段话" not in a
+    assert "第二段话" in b and "00:00:00,200 --> 00:00:00,500" in b, "时间归零"
 
 
-def test_run_merged_task_merge_only_mode(isolated_db, monkeypatch):
-    """仅合并模式：merge 完即 done，不跑 pipeline。"""
-    wm, out_dir, parts, merge_calls, pipeline_calls = _mk_merged_task_env(
-        monkeypatch, isolated_db, mode="merge_only")
+def test_download_part_srt(client, monkeypatch):
+    """/download/{id}/part_srt/{i}：下载某段独立 SRT；越界 404。
 
-    wm._run_merged_task("mt1", parts, out_dir, "merge_only", "h264", "config.yaml", False, "balanced")
+    同时钉住主 SRT 下载不被分段文件（00_/01_ 前缀）劫持。
+    """
+    wm, out_dir, parts, _, _ = _mk_multi_env(monkeypatch)
+    wm._run_multi_task("mt1", parts, out_dir, "config.yaml", False, "balanced")
 
-    assert merge_calls["target"] == "h264"
-    assert pipeline_calls == {}, "仅合并不得触发转写"
+    r = client.get("/download/mt1/part_srt/1")
+    assert r.status_code == 200
+    assert "第二段话" in r.text
+    assert "attachment" in r.headers.get("content-disposition", "")
+
+    assert client.get("/download/mt1/part_srt/5").status_code == 404
+    assert client.get("/download/mt1/part_srt/0").status_code == 200
+
+    # 主 SRT：输出目录里 00_p1.srt 排序在前，但整体字幕必须是 merged.srt
+    (out_dir / "merged.srt").write_text("整体字幕", encoding="utf-8")
+    r = client.get("/download/mt1/srt")
+    assert r.status_code == 200
+    assert r.text == "整体字幕", "分段文件不得劫持主 SRT 下载"
+
+
+def test_download_part_srt_rejects_undone(client):
+    """任务未完成 → 409（与主下载路由口径一致）。"""
+    out_dir = OUTPUT_ROOT / "undone1"
+    out_dir.mkdir(parents=True, exist_ok=True)
     with _db() as c:
-        row = c.execute("SELECT status, progress FROM tasks WHERE id='mt1'").fetchone()
-    assert row["status"] == "done"
-    assert row["progress"] == 1.0
+        c.execute(
+            """INSERT INTO tasks (id, filename, input_path, output_dir,
+               status, created_at, meta_json)
+               VALUES (?, ?, ?, ?, 'running', ?, ?)""",
+            ("undone1", "a.mp4 + b.mp4", "/in", str(out_dir),
+             "2026-10-20T00:00:00",
+             json.dumps({"parts": ["a.mp4", "b.mp4"],
+                         "part_files": ["00_a.srt", "01_b.srt"]})),
+        )
+    r = client.get("/download/undone1/part_srt/0")
+    assert r.status_code == 409
 
 
-def test_run_merged_task_failure_marks_failed(isolated_db, monkeypatch):
-    """合并失败 → 任务 failed + 错误信息（不得卡 running）。"""
-    wm, out_dir, parts, merge_calls, pipeline_calls = _mk_merged_task_env(
-        monkeypatch, isolated_db, mode="transcribe")
+def test_run_multi_task_failure_marks_failed(isolated_db, monkeypatch):
+    """拼音频失败 → 任务 failed + 错误信息（不得卡 running）。"""
+    wm, out_dir, parts, _, _ = _mk_multi_env(monkeypatch)
 
     def _boom(*a, **kw):
-        raise RuntimeError("ffmpeg 转码失败")
+        raise RuntimeError("视频无音轨")
 
-    monkeypatch.setattr(wm, "merge_videos", _boom)
+    monkeypatch.setattr(wm, "merge_audios", _boom)
 
-    wm._run_merged_task("mt1", parts, out_dir, "transcribe", "h264", "config.yaml", False, "balanced")
+    wm._run_multi_task("mt1", parts, out_dir, "config.yaml", False, "balanced")
 
     with _db() as c:
         row = c.execute("SELECT status, error FROM tasks WHERE id='mt1'").fetchone()
     assert row["status"] == "failed"
-    assert "ffmpeg" in row["error"]
+    assert "无音轨" in row["error"]
+
+
+def test_run_multi_task_pipeline_failed_skips_part_srts(isolated_db, monkeypatch):
+    """pipeline 内部标 failed（吞异常不抛）→ 不写空分段字幕，meta 不带 part_files。
+
+    真实事故：ASR 阶段 OSError 后 pipeline 兜底标 failed 并正常返回，
+    _run_multi_task 无从得知，继续用空 transcript 写出三个空 SRT。
+    """
+    wm, out_dir, parts, _, _ = _mk_multi_env(monkeypatch)
+
+    def _pipeline_fails_silently(task_id, *a, **kw):
+        _update_task(task_id, status="failed", stage="asr", progress=0.214,
+                     error="Unexpected: OSError: [Errno 22] Invalid argument")
+
+    monkeypatch.setattr(wm, "_run_pipeline", _pipeline_fails_silently)
+
+    wm._run_multi_task("mt1", parts, out_dir, "config.yaml", False, "balanced")
+
+    with _db() as c:
+        row = c.execute("SELECT status, meta_json FROM tasks WHERE id='mt1'").fetchone()
+    assert row["status"] == "failed", "失败状态不得被后续 meta 更新掩盖"
+    meta = json.loads(row["meta_json"] or "{}")
+    assert not meta.get("part_files"), "失败任务不应登记分段字幕"
+    written = [p.name for p in out_dir.glob("*.srt")]
+    assert not any(re.match(r"^\d{2}_", n) for n in written), \
+        f"失败后不应写出分段 SRT: {written}"
 
 
 class TestWatchdog:
