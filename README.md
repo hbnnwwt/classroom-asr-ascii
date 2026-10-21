@@ -2,8 +2,6 @@
 
 把课堂录课视频（mp4/mkv/...）一键转写成带时间戳的 SRT/MD/TXT/JSON，**全程离线**；可选接入 LLM（本地 Ollama 或云 API）生成 AI 点评与优化逐字稿。
 
-> 实现方案见 [方案.txt](../方案.txt)；开发过程中的实现偏差、阶段进度与已知边界见 [docs/DEVNOTES.md](docs/DEVNOTES.md)。
-
 ## 快速开始
 
 ### Windows 一键（推荐）
@@ -79,4 +77,4 @@ out/
 - **`--quality fast` 没有时间戳** —— SenseVoice 是端到端模型不输出时间戳，要时间戳用 balanced（默认）或 high。
 - **90 分钟视频 CPU 要多久** —— 8 核 CPU RTF ≈ 0.13，约 12 分钟；GPU < 1 分钟。
 - **全班齐读时说话人分离乱** —— cam++ 重叠语音不可靠，建议关 `--diarize`。
-- **SRT 一条字幕二三十秒** —— FunASR 粗时间戳的常态，已降级为软约束（详见 DEVNOTES）。
+- **SRT 一条字幕二三十秒** —— FunASR 粗时间戳的常态，已降级为软约束（详见 [docs/DEVNOTES.md](docs/DEVNOTES.md)）。
