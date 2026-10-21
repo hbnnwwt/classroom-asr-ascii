@@ -79,6 +79,15 @@ class OutputConfig(BaseModel):
     srt_encoding: str = "utf-8-sig"
 
 
+class LLMConfig(BaseModel):
+    """AI 反馈环节（可选）。全空 = 功能整体隐藏，不影响任何现有行为。"""
+    base_url: str = ""    # OpenAI 兼容端点；Ollama 用 http://localhost:11434/v1
+    api_key: str = ""     # 本地模型留空
+    model: str = ""
+    timeout: int = 300
+    max_tokens: int = 16384
+
+
 class AppConfig(BaseModel):
     """根配置"""
     device: str = "cpu"
@@ -92,6 +101,7 @@ class AppConfig(BaseModel):
     diarize: DiarizeConfig = Field(default_factory=DiarizeConfig)
     postprocess: PostprocessConfig = Field(default_factory=PostprocessConfig)
     output: OutputConfig = Field(default_factory=OutputConfig)
+    llm: LLMConfig = Field(default_factory=LLMConfig)
 
     # ------------------------------------------------------------------
     # 路径解析：以仓库根目录（config.yaml 所在目录）为基准

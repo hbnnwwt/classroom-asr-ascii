@@ -49,3 +49,12 @@ output:
   srt_max_chars_per_line: 20
   srt_max_duration_s: 8
   srt_encoding: utf-8-sig    # UTF-8 with BOM，Windows 播放器更友好
+
+# AI 反馈（教学点评 + 逐字稿优化）。整节缺失 = 功能隐藏。
+# 云 API 与本地 Ollama 都走 OpenAI 兼容端点，一套代码：
+# llm:
+#   base_url: https://open.bigmodel.cn/api/paas/v4   # Ollama: http://localhost:11434/v1
+#   api_key: 你的KEY                                   # 本地留空
+#   model: glm-4-flash
+#   timeout: 300
+#   max_tokens: 16384

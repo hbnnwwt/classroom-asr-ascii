@@ -138,3 +138,43 @@ def test_overrides_none_and_unknown_keys_ignored():
     _apply_overrides(cfg, {"device": None, "language": None, "nonsense": "x", "quality": "fast"})
     assert cfg.device == "cpu"
     assert cfg.language == "zh"
+
+
+# ---------------------------------------------------------------------------
+# AI 反馈：llm 配置节（缺省全空 = 功能关闭）
+# ---------------------------------------------------------------------------
+def _write_cfg_llm(tmp_path, extra=""):
+    # 与上面 P2-8 的 _write_cfg 同名会互相覆盖（签名不同），故独立命名。
+    cfg = tmp_path / "cfg.yaml"
+    cfg.write_text(
+        "models:\n"
+        "  funasr:\n"
+        "    asr:  m/asr\n    vad:  m/vad\n    punc:  m/punc\n    spk:  m/spk\n"
+        "  whisper:\n    size: small\n    compute_type: int8\n" + extra,
+        encoding="utf-8",
+    )
+    return cfg
+
+
+def test_llm_section_absent_defaults_off(tmp_path):
+    """无 llm 节 → 全默认值，功能关闭（llm_enabled 语义的基础）。"""
+    cfg = load_config(_write_cfg_llm(tmp_path), strict_models=False)
+    assert cfg.llm.base_url == ""
+    assert cfg.llm.model == ""
+    assert cfg.llm.api_key == ""
+    assert cfg.llm.timeout == 300
+    assert cfg.llm.max_tokens == 16384
+
+
+def test_llm_section_parsed(tmp_path):
+    """有 llm 节 → 值完整解析。"""
+    cfg = load_config(_write_cfg_llm(tmp_path, (
+        "llm:\n"
+        "  base_url: http://localhost:11434/v1\n"
+        "  model: qwen2.5:7b\n"
+        "  timeout: 120\n"
+    )), strict_models=False)
+    assert cfg.llm.base_url == "http://localhost:11434/v1"
+    assert cfg.llm.model == "qwen2.5:7b"
+    assert cfg.llm.timeout == 120
+    assert cfg.llm.api_key == ""   # 本地端点不需要 key
