@@ -117,7 +117,8 @@ async function poll() {
     updateUI(t);
     // AI 反馈可能还在 done 之后跑：开关开了且没有产物/错误 → 继续轮询
     const aiPending = t.status === "done" && t.meta
-      && t.meta.ai_feedback && !t.meta.ai_files && !t.meta.ai_error;
+      && t.meta.ai_feedback && !t.meta.ai_files && !t.meta.ai_error
+      && !t.meta.ai_errors;
     if ((t.status === "done" && !aiPending) || t.status === "failed") {
       stopPolling();
     }
@@ -138,7 +139,8 @@ function updateUI(t) {
   // 转写失败（status=failed）不留 AI 行：meta 里的 ai_feedback 开关只代表
   // "开过"，任务失败时该行会永远 pending，误导用户在等一个不会来的结果。
   const hasAi = t.status !== "failed" && Boolean(
-    t.meta && (t.meta.ai_feedback || t.meta.ai_error || t.meta.ai_files));
+    t.meta && (t.meta.ai_feedback || t.meta.ai_error
+               || t.meta.ai_errors || t.meta.ai_files));
   const aiLi = document.querySelector('#stages li[data-stage="ai"]');
   if (aiLi) aiLi.style.display = hasAi ? "" : "none";
   const mp4Btn = document.querySelector('#downloads .btn[data-fmt="mp4"]');
@@ -207,60 +209,81 @@ function renderPartDownloads(meta) {
 }
 
 /**
- * AI 反馈按钮区（仅 done 分支调用）：查看按钮显隐 + 生成/重新生成。
- * 有产物 → 查看按钮亮，动作按钮变"重新生成 AI 反馈"（confirm 防误触烧 token）；
- * 无产物或有错误 → 按原有逻辑显示错误条 + 生成/重试。
+ * AI 反馈按钮区（仅 done 分支调用）：三件产物各自独立显隐。
+ * 查看按钮：该件有登记才亮；错误条：全局（前置失败）+ 按件（单件失败
+ * 不连坐）谁失败报谁；动作按钮：点评+优化稿整组、深度优化单独，各配
+ * 生成/重新生成/重试三态（confirm 防误触烧 token）。
  */
-let aiHasFiles = false;   // 点击时判定 confirm 用（产物可能被上一轮 renderAiUi 刷新）
+const AI_NAMES = { feedback: "AI 点评", polished: "优化稿", deep: "深度优化" };
+const AI_TITLES = { feedback: "AI 点评报告", polished: "优化逐字稿", deep: "深度优化讲义" };
+let aiPairFiles = false;   // 点击时判定 confirm 用（产物可能被上一轮 renderAiUi 刷新）
+let aiDeepFiles = false;
 
 function renderAiUi(t) {
   const meta = t.meta || {};
-  const fbView = document.querySelector('#downloads .btn-view[data-view="feedback"]');
-  const poView = document.querySelector('#downloads .btn-view[data-view="polished"]');
-  // ai_error 判定前移到 hasFiles 短路之前：已有产物的任务 API 补跑再失败时
-  // meta 两键并存（旧 ai_files + 新 ai_error），必须显示错误条+重试，
-  // 不得拿陈旧下载掩住错误。
-  const hasError = Boolean(meta.ai_error);
-  const hasFiles = Boolean(meta.ai_files) && !hasError;
-  aiHasFiles = Boolean(meta.ai_files);
-  // 查看按钮与产物同条件显隐（有产物才可看）
-  if (fbView) fbView.hidden = !hasFiles;
-  if (poView) poView.hidden = !hasFiles;
+  const files = meta.ai_files || {};
+  const errs = meta.ai_errors || {};
+  document.querySelectorAll("#downloads .btn-view").forEach((b) => {
+    b.hidden = !files[b.dataset.view];
+  });
+  aiPairFiles = Boolean(files.feedback || files.polished);
+  aiDeepFiles = Boolean(files.deep);
 
   const box = $("ai-actions");
   if (t.status !== "done") { box.hidden = true; return; }
   box.hidden = false;
+
+  // 错误条：全局 ai_error（无转写/LLM 未配置等前置失败）+ 按件 ai_errors，
+  // 一条一行；已有产物 + 补跑再失败时两键并存，不得拿陈旧产物掩住错误
+  const lines = [];
+  if (meta.ai_error) lines.push(`AI 反馈失败：${meta.ai_error}`);
+  Object.entries(errs).forEach(([fmt, msg]) =>
+    lines.push(`${AI_NAMES[fmt] || fmt}失败：${msg}`));
   const errBox = $("ai-error");
-  if (hasError) {
-    errBox.hidden = false;
-    errBox.textContent = `AI 反馈失败：${meta.ai_error}`;
-    $("ai-retry").textContent = "重试 AI 反馈";
-  } else {
-    errBox.hidden = true;
-    $("ai-retry").textContent = hasFiles ? "重新生成 AI 反馈" : "生成 AI 反馈";
-  }
+  errBox.hidden = !lines.length;
+  errBox.textContent = lines.join("\n");
+
+  const pairErr = errs.feedback || errs.polished || meta.ai_error;
+  $("ai-retry").textContent = pairErr ? "重试 AI 反馈"
+    : (aiPairFiles ? "重新生成 AI 反馈" : "生成 AI 反馈");
+  $("ai-deep").textContent = errs.deep ? "重试深度优化"
+    : (aiDeepFiles ? "重新生成深度优化" : "生成深度优化");
 }
 
-// 手动生成/重新生成：POST 触发后台 AI stage，恢复轮询看进度（失败只 alert，不打断页面）
-$("ai-retry").addEventListener("click", async () => {
+// 手动生成/重新生成（任务页两键 + 阅读层单件键共用）：POST 触发后台
+// AI stage，收起动作区防二次点击吃 409，恢复轮询看进度（失败只 alert）
+async function triggerAiRun(path, btn, confirmMsg) {
   // 未配置 LLM：不 POST（必吃 409），直接送去设置页
   if (!llmAvailable) { window.location.href = "/settings"; return; }
-  // 已有产物：覆盖旧文件 + 再烧一次 token，确认了才动
-  if (aiHasFiles && !confirm("重新生成会覆盖现有 AI 点评和优化稿，并再次调用 LLM。继续？")) return;
-  $("ai-retry").disabled = true;
+  if (confirmMsg && !confirm(confirmMsg)) return;
+  btn.disabled = true;
   try {
-    const resp = await fetch(`/api/tasks/${currentTaskId}/feedback`, { method: "POST" });
+    const resp = await fetch(`/api/tasks/${currentTaskId}${path}`, { method: "POST" });
     if (!resp.ok) {
       const err = await resp.json().catch(() => ({}));
       throw new Error(err.detail || `触发失败: ${resp.status}`);
     }
+    closeAiViewer();
     $("ai-actions").hidden = true;   // 重跑期间收起按钮，防二次点击吃 409
     startPolling();   // 恢复轮询，看 AI stage 进度
   } catch (err) {
     alert(err.message);
   } finally {
-    $("ai-retry").disabled = false;
+    btn.disabled = false;
   }
+}
+
+$("ai-retry").addEventListener("click", () =>
+  triggerAiRun("/feedback", $("ai-retry"),
+    aiPairFiles ? "重新生成会覆盖现有 AI 点评和优化稿，并再次调用 LLM。继续？" : null));
+$("ai-deep").addEventListener("click", () =>
+  triggerAiRun("/ai/deep", $("ai-deep"),
+    aiDeepFiles ? "重新生成会覆盖现有深度优化讲义，并再次调用 LLM。继续？" : null));
+$("ai-modal-regen").addEventListener("click", () => {
+  const fmt = currentModalFmt;
+  if (!fmt) return;
+  triggerAiRun(`/ai/${fmt}`, $("ai-modal-regen"),
+    `重新生成会覆盖现有${AI_TITLES[fmt]}，并再次调用 LLM。继续？`);
 });
 
 /**
@@ -501,9 +524,11 @@ function showError(msg) {
 // ---------------------------------------------------------------------------
 // AI 产物阅读层：服务端把 md 渲染成 HTML（先转义后渲染，XSS 无门），
 // 这里只负责取回来填进弹层；下载与否看完再决定，链接挂现成 /download。
-// 优化稿有两个页签：正文 / 修改痕迹（红字 diff，懒加载 + 本次打开缓存）。
+// 优化稿/深度优化有两个页签：正文 / 修改痕迹（红字 diff，懒加载 + 本次打开
+// 缓存）；阅读层内可单独重新生成本件（POST /ai/{fmt}）。
 // ---------------------------------------------------------------------------
-let aiCache = {};   // {clean: {name,html,diff}, diff: {...}}，每次打开重置
+let aiCache = {};           // {clean: {name,html,diff}, diff: {...}}，每次打开重置
+let currentModalFmt = null; // 当前阅读的产物件（重新生成按钮的 POST 目标）
 
 function loadAiTab(fmt, tab) {
   const body = $("ai-modal-body");
@@ -525,19 +550,27 @@ function loadAiTab(fmt, tab) {
 function setAiTab(tab) {
   document.querySelectorAll("#ai-modal-tabs .tab").forEach((b) =>
     b.classList.toggle("active", b.dataset.tab === tab));
-  loadAiTab("polished", tab);
+  loadAiTab(currentModalFmt, tab);
 }
 
 function openAiViewer(fmt) {
+  currentModalFmt = fmt;
   aiCache = {};
-  $("ai-modal-tabs").hidden = fmt !== "polished";
-  $("ai-modal-title").textContent = fmt === "feedback" ? "AI 点评报告" : "优化逐字稿";
+  // 正文页签文案随件走：深度优化是讲义成稿，不叫"优化稿"
+  // （双向设置：先看 deep 再看 polished 时不得残留"讲义"）
+  document.querySelector('#ai-modal-tabs .tab[data-tab="clean"]').textContent =
+    fmt === "deep" ? "讲义" : "优化稿";
+  $("ai-modal-tabs").hidden = fmt === "feedback";
+  $("ai-modal-title").textContent = AI_TITLES[fmt];
   $("ai-modal-dl").href = `/download/${currentTaskId}/${fmt}`;
   $("ai-modal").hidden = false;
   loadAiTab(fmt, "clean");
 }
 
-function closeAiViewer() { $("ai-modal").hidden = true; }
+function closeAiViewer() {
+  $("ai-modal").hidden = true;
+  currentModalFmt = null;
+}
 
 document.querySelectorAll("#downloads .btn-view").forEach((b) =>
   b.addEventListener("click", () => openAiViewer(b.dataset.view)));

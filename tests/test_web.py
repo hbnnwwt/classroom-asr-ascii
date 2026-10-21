@@ -367,6 +367,30 @@ def test_ai_view_diff_flag_ignored_for_feedback(client, isolated_db):
     assert r.json()["diff"] is False
 
 
+def test_ai_view_and_download_deep(client, isolated_db):
+    """deep 是第三件 AI 产物：下载/在线阅读复用同一路径；diff 同 polished 规则。"""
+    import asr.web as wm
+    out_dir = _mk_done_task_with_ai_files(isolated_db)
+    (out_dir / "dl1_测试课.deep.md").write_text("我们上课。\n", encoding="utf-8")
+    with closing(wm._db()) as conn:
+        conn.execute(
+            "UPDATE tasks SET transcript=?, meta_json=? WHERE id='dl1'",
+            (json.dumps([{"start": 0.0, "end": 2.0, "text": "那个我们上课。"}],
+                        ensure_ascii=False),
+             json.dumps({"ai_files": {
+                 "feedback": "dl1_测试课.feedback.md",
+                 "polished": "dl1_测试课.polished.md",
+                 "deep": "dl1_测试课.deep.md"}}, ensure_ascii=False)))
+    r = client.get("/download/dl1/deep")
+    assert r.status_code == 200
+    assert "deep.md" in r.headers.get("content-disposition", "")
+    r = client.get("/api/tasks/dl1/ai/deep")
+    assert r.status_code == 200 and "我们上课。" in r.json()["html"]
+    body = client.get("/api/tasks/dl1/ai/deep?diff=1").json()
+    assert body["diff"] is True
+    assert '<del class="diff-del">那个</del>' in body["html"]
+
+
 def _wait_done(client, task_id, timeout_s=5.0):
     """轮询直到状态非 pending/running。"""
     import time
@@ -1582,7 +1606,7 @@ def test_run_ai_stage_success(isolated_db, monkeypatch):
 
 
 def test_run_ai_stage_failure_keeps_done(isolated_db, monkeypatch):
-    """LLM 失败 → status 仍 done + meta.ai_error，不写产物，不拖垮转写。"""
+    """LLM 全失败 → status 仍 done + 按件记 ai_errors，不写产物，不拖垮转写。"""
     from asr.llm import LLMError
     wm, out_dir, calls = _mk_ai_task(
         isolated_db, monkeypatch, chat_side_effect=LLMError("LLM HTTP 500: boom"))
@@ -1591,7 +1615,10 @@ def test_run_ai_stage_failure_keeps_done(isolated_db, monkeypatch):
         row = conn.execute(
             "SELECT status, meta_json FROM tasks WHERE id='ai1'").fetchone()
     assert row["status"] == "done"
-    assert "boom" in json.loads(row["meta_json"])["ai_error"]
+    meta = json.loads(row["meta_json"])
+    assert "boom" in meta["ai_errors"]["feedback"]
+    assert "boom" in meta["ai_errors"]["polished"]
+    assert "ai_files" not in meta, "全失败不得登记产物"
     assert not list(out_dir.glob("*.feedback.md"))
     assert not list(out_dir.glob("*.polished.md"))
 
@@ -1871,13 +1898,14 @@ def test_feedback_trigger_202_and_clears_error(client, isolated_db, monkeypatch)
                         ensure_ascii=False),))
     got = {}
     monkeypatch.setattr(wm, "_run_ai_stage",
-                        lambda tid, cfg: got.update(args=(tid, cfg)))
+                        lambda tid, cfg, fmts=None: got.update(args=(tid, cfg, fmts)))
     monkeypatch.setattr(wm, "llm_enabled", lambda cfg: True)
     # 内联线程：post 返回即线程已同步执行完，断言不依赖真线程调度（TOCTOU）
     monkeypatch.setattr(wm, "threading", types.SimpleNamespace(Thread=_InlineThread))
     r = client.post("/api/tasks/fb1/feedback")
     assert r.status_code == 202 and r.json() == {"status": "started"}
-    assert got["args"] == ("fb1", "config.yaml"), "AI stage 线程没跑起来"
+    assert got["args"] == ("fb1", "config.yaml", ("feedback", "polished")), \
+        "整组重跑必须是显式的点评+优化稿两件"
     with closing(wm._db()) as conn:
         row = conn.execute(
             "SELECT status, stage, progress, ended_at, meta_json FROM tasks"
@@ -1926,6 +1954,54 @@ def test_feedback_trigger_config_error_409(client, isolated_db, monkeypatch):
     assert "LLM 未配置" in r.json()["detail"]
 
 
+def test_ai_single_fmt_trigger(client, isolated_db, monkeypatch):
+    """单件重生端点：POST /ai/{fmt} 只重跑该件——登记/错误先出清（重建中
+    旧登记不作数），legacy ai_error 一并清，别的件的登记和 parts 不许动。"""
+    import types
+    import asr.web as wm
+    _mk_done_plain_task(isolated_db)
+    with closing(wm._db()) as conn:
+        conn.execute(
+            "UPDATE tasks SET meta_json=? WHERE id='fb1'",
+            (json.dumps({
+                "parts": ["a.mp4"],
+                "ai_files": {"feedback": "旧.feedback.md", "deep": "旧.deep.md"},
+                "ai_errors": {"deep": "旧失败"},
+                "ai_error": "旧全局错误"}, ensure_ascii=False),))
+    got = {}
+    monkeypatch.setattr(wm, "_run_ai_stage",
+                        lambda tid, cfg, fmts=None: got.update(args=(tid, cfg, fmts)))
+    monkeypatch.setattr(wm, "llm_enabled", lambda cfg: True)
+    monkeypatch.setattr(wm, "threading", types.SimpleNamespace(Thread=_InlineThread))
+    r = client.post("/api/tasks/fb1/ai/deep")
+    assert r.status_code == 202 and r.json() == {"status": "started"}
+    assert got["args"] == ("fb1", "config.yaml", ("deep",)), "必须只重跑 deep"
+    with closing(wm._db()) as conn:
+        row = conn.execute(
+            "SELECT status, stage, progress, ended_at, meta_json FROM tasks"
+            " WHERE id='fb1'").fetchone()
+    assert row["status"] == "running" and row["stage"] == "ai"
+    assert row["progress"] == 0 and row["ended_at"] is None
+    meta = json.loads(row["meta_json"])
+    assert meta["ai_files"] == {"feedback": "旧.feedback.md"}, "deep 旧登记必须出清"
+    assert "ai_errors" not in meta and "ai_error" not in meta
+    assert meta["parts"] == ["a.mp4"], "出清不得冲掉无关键"
+
+
+def test_ai_single_fmt_trigger_rejections(client, isolated_db):
+    """400 未知件 / 404 任务不存在 / 409 非 done / 409 LLM 未配置。"""
+    _mk_done_plain_task(isolated_db)  # fb1：done（LLM 未配置断言的对象）
+    _mk_done_plain_task(isolated_db, task_id="fb_running", status="running")
+    # 出厂模板无 llm 节；仓库根 config.yaml 是用户个人文件，禁止当夹具
+    assert client.post("/api/tasks/fb1/ai/nope",
+                       params={"config": "config.example.yaml"}).status_code == 400
+    assert client.post("/api/tasks/missing/ai/deep").status_code == 404
+    assert client.post("/api/tasks/fb_running/ai/deep",
+                       params={"config": "config.example.yaml"}).status_code == 409
+    assert client.post("/api/tasks/fb1/ai/deep",
+                       params={"config": "config.example.yaml"}).status_code == 409
+
+
 # ---------------------------------------------------------------------------
 # AI stage 失败终态收口 + AI 产物按 meta 登记名取
 # ---------------------------------------------------------------------------
@@ -1949,7 +2025,59 @@ def test_run_ai_stage_failure_sets_progress_done(isolated_db, monkeypatch):
             "SELECT status, progress, meta_json FROM tasks WHERE id='ai1'").fetchone()
     assert row["status"] == "done"
     assert row["progress"] == 1.0, "失败终态进度必须归 1.0（不配半程进度条）"
-    assert "polish boom" in json.loads(row["meta_json"])["ai_error"]
+    meta = json.loads(row["meta_json"])
+    assert "polish boom" in meta["ai_errors"]["polished"], "失败按件记 ai_errors"
+
+
+def test_run_ai_stage_deep_only(isolated_db, monkeypatch):
+    """fmts 参数化：只跑 deep → 单次 LLM 调用、只登记 deep，既有产物登记不动。"""
+    wm, out_dir, calls = _mk_ai_task(isolated_db, monkeypatch)
+    with closing(wm._db()) as conn:
+        conn.execute(
+            "UPDATE tasks SET meta_json=? WHERE id='ai1'",
+            (json.dumps({"ai_files": {"feedback": "旧.feedback.md",
+                                       "polished": "旧.polished.md"}},
+                        ensure_ascii=False),))
+    wm._run_ai_stage("ai1", "config.yaml", fmts=("deep",))
+    assert len(calls) == 1, "只跑 deep 不许碰点评/优化稿"
+    with closing(wm._db()) as conn:
+        row = conn.execute(
+            "SELECT status, meta_json FROM tasks WHERE id='ai1'").fetchone()
+    assert row["status"] == "done"
+    meta = json.loads(row["meta_json"])
+    assert set(meta["ai_files"]) == {"feedback", "polished", "deep"}
+    assert meta["ai_files"]["feedback"] == "旧.feedback.md", "未重跑的件不许动"
+    assert meta["ai_files"]["deep"].endswith(".deep.md")
+    assert "ai_error" not in meta and "ai_errors" not in meta
+
+
+def test_run_ai_stage_per_fmt_failure_no_collateral(isolated_db, monkeypatch):
+    """单件失败不连坐：feedback 失败只记 ai_errors.feedback；其余件照常产出；
+    失败件的重跑登记清掉（重建中旧登记不作数）。写侧不再写全局 ai_error。"""
+    from asr.llm import LLMError
+    wm, out_dir, calls = _mk_ai_task(isolated_db, monkeypatch)
+
+    def chat_feedback_booms(messages, cfg, **kw):
+        if "评课专家" in messages[0]["content"]:
+            raise LLMError("fb boom")
+        return "# ok"
+
+    monkeypatch.setattr(wm, "chat", chat_feedback_booms)
+    with closing(wm._db()) as conn:
+        conn.execute(
+            "UPDATE tasks SET meta_json=? WHERE id='ai1'",
+            (json.dumps({"ai_files": {"feedback": "旧.feedback.md"}},
+                        ensure_ascii=False),))
+    wm._run_ai_stage("ai1", "config.yaml", fmts=("feedback", "polished", "deep"))
+    with closing(wm._db()) as conn:
+        row = conn.execute(
+            "SELECT status, meta_json FROM tasks WHERE id='ai1'").fetchone()
+    assert row["status"] == "done", "单件失败不拖垮任务"
+    meta = json.loads(row["meta_json"])
+    assert set(meta["ai_files"]) == {"polished", "deep"}, "失败件的旧登记必须清掉"
+    assert "fb boom" in meta["ai_errors"]["feedback"]
+    assert "polished" not in meta["ai_errors"] and "deep" not in meta["ai_errors"]
+    assert "ai_error" not in meta, "写侧退役全局 ai_error，按件记 ai_errors"
 
 
 def test_download_feedback_prefers_registered_file(client, isolated_db):

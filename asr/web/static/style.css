@@ -224,7 +224,8 @@ button.primary:hover:not(:disabled) { background: var(--accent-hover); }
   color: #fff; font-size: 12px; transition: width 0.3s;
 }
 
-.error { color: var(--err); background: var(--err-bg); padding: 8px; border-radius: var(--radius-sm); margin-top: 8px; }
+/* white-space:pre-line 容纳按件报错的多行文本（一条一行） */
+.error { color: var(--err); background: var(--err-bg); padding: 8px; border-radius: var(--radius-sm); margin-top: 8px; white-space: pre-line; }
 
 /* 实时转写文本 */
 #transcript-panel {
@@ -549,6 +550,7 @@ a.theme-toggle { display: inline-flex; align-items: center; justify-content: cen
   gap: 8px;
   align-items: flex-start;
 }
+#ai-actions .btn-row { display: flex; gap: 8px; }
 
 /* ---------------------------------------------------------------------------
    设置页：与上传面板同一套卡片词汇（surface-2 + 边框 + 圆角），表单限宽

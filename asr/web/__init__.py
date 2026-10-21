@@ -31,7 +31,11 @@ from pydantic import BaseModel
 
 from ..analyze import compute_stats
 from ..config import LLMConfig, ConfigLoadError, load_config, write_llm_section
-from ..feedback import build_feedback_messages, build_polish_messages
+from ..feedback import (
+    build_deep_messages,
+    build_feedback_messages,
+    build_polish_messages,
+)
 from ..llm import LLMError, chat, llm_enabled
 from ..media import probe
 from ..mdrender import render_diff, render_markdown
@@ -302,11 +306,15 @@ def _ai_artifact(out_dir: Path, meta: dict, fmt: str) -> Path | None:
     return files[0] if files else None
 
 
+# AI 产物三件：点评报告 / 优化逐字稿 / 深度优化讲义（成稿化）
+_AI_FMTS = ("feedback", "polished", "deep")
+
+
 @app.get("/download/{task_id}/{fmt}")
 def download(task_id: str, fmt: str):
     """下载指定格式输出（SRT/VTT/MD/TXT/JSON/REPLACE_LOG/AI 反馈产物）。"""
     ALLOWED = {"srt", "vtt", "md", "txt", "json", "replace.log", "mp4",
-               "feedback", "polished"}
+               *_AI_FMTS}
     if fmt not in ALLOWED:
         raise HTTPException(400, f"不支持的格式: {fmt}")
 
@@ -321,7 +329,7 @@ def download(task_id: str, fmt: str):
         raise HTTPException(409, f"任务未完成: {row['status']}")
 
     out_dir = Path(row["output_dir"])
-    if fmt in ("feedback", "polished"):
+    if fmt in _AI_FMTS:
         try:
             meta = json.loads(row["meta_json"] or "{}")
         except ValueError:
@@ -333,7 +341,7 @@ def download(task_id: str, fmt: str):
         files = [
             f for f in out_dir.glob(f"*.{fmt}")
             if not re.match(r"^\d{2}_", f.name)
-            and not re.search(r"\.(feedback|polished)\.md$", f.name)
+            and not re.search(r"\.(?:feedback|polished|deep)\.md$", f.name)
         ]
         target = files[0] if files else None
     if target is None:
@@ -341,7 +349,7 @@ def download(task_id: str, fmt: str):
     # 剥后缀只认白名单：任务名/文件名里的点号（"3.2节 复习.mp4" 的 ".2节 复习"
     # 不是后缀）不许被 Path.stem 连剥两次把名字截断
     stem = _strip_known_ext(row["name"] or row["filename"])
-    suffix = f".{fmt}.md" if fmt in ("feedback", "polished") else f".{fmt}"
+    suffix = f".{fmt}.md" if fmt in _AI_FMTS else f".{fmt}"
     return FileResponse(str(target), filename=f"{stem}{suffix}")
 
 
@@ -352,10 +360,10 @@ def ai_view(task_id: str, fmt: str, diff: bool = False):
     与 /download 同一套 _ai_artifact 登记名解析；下载仍走 /download
     （前端查看层里直接挂它的链接），本端点只管看。
 
-    ?diff=1（仅 polished）：DB 里的原逐字稿 vs 优化稿做红字比对，
+    ?diff=1（polished/deep）：DB 里的原逐字稿 vs 产物做红字比对，
     删改痕迹原地可见；无 transcript 的老任务 diff=false 退普通渲染。
     """
-    if fmt not in ("feedback", "polished"):
+    if fmt not in _AI_FMTS:
         raise HTTPException(400, f"不支持的格式: {fmt}")
     with closing(_db()) as conn:
         row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
@@ -375,7 +383,7 @@ def ai_view(task_id: str, fmt: str, diff: bool = False):
     text = target.read_text(encoding="utf-8")
 
     diff_ok = False
-    if diff and fmt == "polished" and row["transcript"]:
+    if diff and fmt in ("polished", "deep") and row["transcript"]:
         try:
             segs = json.loads(row["transcript"])
         except ValueError:
@@ -787,9 +795,12 @@ def llm_test(body: _LLMBody):
     return JSONResponse({"ok": True, "reply": (reply or "")[:50]})
 
 
-@app.post("/api/tasks/{task_id}/feedback")
-def trigger_ai_feedback(task_id: str, config: str = "config.yaml"):
-    """对 done 任务手动补跑 AI 反馈（含上传时没开开关的旧任务）。"""
+def _start_ai_run(task_id: str, config: str, fmts: tuple) -> JSONResponse:
+    """AI 产物重跑的公共前置：校验 → 出清重跑件旧登记 → 起线程。
+
+    重跑件的旧登记/旧错误在起跑前出清：重建期间旧文件不作数，也不许
+    AI 视图读到半新不旧的登记名；全局 ai_error 一并清（前置失败的旧状态）。
+    """
     with closing(_db()) as conn:
         row = conn.execute(
             "SELECT status FROM tasks WHERE id=?", (task_id,)).fetchone()
@@ -812,13 +823,40 @@ def trigger_ai_feedback(task_id: str, config: str = "config.yaml"):
     # 旧结束时间（前端会渲染成 running+100%+冻结计时的假象）
     meta = _read_meta(task_id)
     meta.pop("ai_error", None)
+    files = meta.get("ai_files") or {}
+    errors = meta.get("ai_errors") or {}
+    for f in fmts:
+        files.pop(f, None)
+        errors.pop(f, None)
+    if files:
+        meta["ai_files"] = files
+    else:
+        meta.pop("ai_files", None)
+    if errors:
+        meta["ai_errors"] = errors
+    else:
+        meta.pop("ai_errors", None)
     _update_task(task_id, status="running", stage="ai", message="AI 反馈",
                  progress=0, ended_at=None,
                  stage_started_at=datetime.now().isoformat(timespec="seconds"),
                  meta_json=json.dumps(meta, ensure_ascii=False))
-    threading.Thread(target=_run_ai_stage, args=(task_id, config),
+    threading.Thread(target=_run_ai_stage, args=(task_id, config, fmts),
                      daemon=True).start()
     return JSONResponse({"status": "started"}, status_code=202)
+
+
+@app.post("/api/tasks/{task_id}/feedback")
+def trigger_ai_feedback(task_id: str, config: str = "config.yaml"):
+    """对 done 任务手动补跑 AI 反馈（点评+优化稿两件整组）。"""
+    return _start_ai_run(task_id, config, ("feedback", "polished"))
+
+
+@app.post("/api/tasks/{task_id}/ai/{fmt}")
+def trigger_ai_single(task_id: str, fmt: str, config: str = "config.yaml"):
+    """单件重生：三件 AI 产物各自独立重新生成（含上传时没生成的深度优化）。"""
+    if fmt not in _AI_FMTS:
+        raise HTTPException(400, f"不支持的格式: {fmt}")
+    return _start_ai_run(task_id, config, (fmt,))
 
 
 # ---------------------------------------------------------------------------
@@ -1047,8 +1085,14 @@ def _run_pipeline(
 # ---------------------------------------------------------------------------
 # AI 反馈 stage（点评 + 优化稿）。铁律：AI 失败不拖垮转写成果。
 # ---------------------------------------------------------------------------
-def _run_ai_stage(task_id: str, config_path: str) -> None:
-    """统计课堂数据 → LLM 点评 → LLM 优化稿。异常一律落 meta.ai_error，status 保持 done。"""
+def _run_ai_stage(task_id: str, config_path: str,
+                  fmts: tuple = ("feedback", "polished")) -> None:
+    """按 fmts 逐件生成 AI 产物（点评/优化稿/深度优化）。
+
+    单件失败不连坐：记 meta.ai_errors[fmt]、该件登记出清，其余件照常产出
+    ——不再像旧版那样 feedback 成功 + polished 失败 = 白烧一次 LLM 全作废。
+    前置失败（LLM 未配置/无转写结果）才落全局 meta.ai_error。
+    """
     ts = datetime.now().isoformat(timespec="seconds")
     try:
         cfg = load_config(config_path, strict_models=False)
@@ -1068,9 +1112,15 @@ def _run_ai_stage(task_id: str, config_path: str) -> None:
         if not segs:
             raise LLMError("无转写结果，无法生成 AI 反馈")
 
-        # 补旗标：手动补跑的老任务也要让前端显示 AI stage 行
+        # 补旗标：手动补跑的老任务也要让前端显示 AI stage 行；
+        # 重跑件的旧登记先出清（失败件不得残留"上次的产物"登记）
         meta = _read_meta(task_id)
         meta["ai_feedback"] = True
+        files = meta.get("ai_files") or {}
+        errors = meta.get("ai_errors") or {}
+        for f in fmts:
+            files.pop(f, None)
+            errors.pop(f, None)
         _update_task(task_id, meta_json=json.dumps(meta, ensure_ascii=False),
                      status="running", stage="ai", message="统计课堂数据",
                      stage_started_at=ts)
@@ -1081,33 +1131,55 @@ def _run_ai_stage(task_id: str, config_path: str) -> None:
             for s in segs
         )
         out_dir = Path(row["output_dir"])
-        stats = compute_stats(segs)
+        # 固定顺序的步骤表：点评依赖统计，只有重跑点评才算 stats
+        steps = []
+        if "feedback" in fmts:
+            stats = compute_stats(segs)
+            steps.append(("feedback", "生成点评报告",
+                          build_feedback_messages(transcript, stats)))
+        if "polished" in fmts:
+            steps.append(("polished", "生成优化逐字稿",
+                          build_polish_messages(transcript)))
+        if "deep" in fmts:
+            steps.append(("deep", "生成深度优化讲义",
+                          build_deep_messages(transcript)))
 
-        _update_task(task_id, progress=0.1, stage="ai", message="生成点评报告")
-        report = chat(build_feedback_messages(transcript, stats), cfg)
-        fb_path = out_dir / f"{task_id}_{stem}.feedback.md"
-        fb_path.write_text(report, encoding="utf-8")
-
-        _update_task(task_id, progress=0.55, stage="ai", message="生成优化逐字稿")
-        polished = chat(build_polish_messages(transcript), cfg)
-        po_path = out_dir / f"{task_id}_{stem}.polished.md"
-        po_path.write_text(polished, encoding="utf-8")
+        n = len(steps)
+        for i, (fmt, label, messages) in enumerate(steps):
+            _update_task(task_id, progress=(i + 0.5) / n, stage="ai",
+                         message=label)
+            try:
+                content = chat(messages, cfg)
+                path = out_dir / f"{task_id}_{stem}.{fmt}.md"
+                path.write_text(content, encoding="utf-8")
+                files[fmt] = path.name
+                errors.pop(fmt, None)
+            except Exception as e:  # noqa: BLE001 单件失败不连坐
+                logger.exception(f"[web] 任务 {task_id} {label}失败")
+                errors[fmt] = f"{type(e).__name__}: {e}"
 
         meta = _read_meta(task_id)
-        meta["ai_files"] = {"feedback": fb_path.name, "polished": po_path.name}
-        meta.pop("ai_error", None)
+        if files:
+            meta["ai_files"] = files
+        else:
+            meta.pop("ai_files", None)
+        if errors:
+            meta["ai_errors"] = errors
+        else:
+            meta.pop("ai_errors", None)
+        message = "AI 反馈完成" if not errors else \
+            f"AI 反馈完成（{len(errors)} 项失败）"
         _update_task(
             task_id, status="done", stage="done", progress=1.0,
-            message="AI 反馈完成",
+            message=message,
             ended_at=datetime.now().isoformat(timespec="seconds"),
             meta_json=json.dumps(meta, ensure_ascii=False),
         )
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001 前置失败（无转写/未配置）才走这里
         logger.exception(f"[web] 任务 {task_id} AI 反馈失败")
         meta = _read_meta(task_id)
         meta["ai_error"] = f"{type(e).__name__}: {e}"
-        # progress 归 1.0：失败常发生在优化稿一步（55%），done 终态不配
-        # 半程进度条
+        # progress 归 1.0：done 终态不配半程进度条
         _update_task(
             task_id, status="done", stage="ai", progress=1.0,
             message="AI 反馈失败",

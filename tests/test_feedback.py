@@ -1,7 +1,7 @@
 """prompt 构建测试：不调 LLM，只验结构与硬约束在文。"""
 import json
 
-from asr.feedback import build_feedback_messages, build_polish_messages
+from asr.feedback import build_deep_messages, build_feedback_messages, build_polish_messages
 
 STATS = {"duration_sec": 1800.0, "chars": 9000, "speed_cpm": 300.0,
          "filler_top": [("就是", 47)], "questions": {"教师": 12},
@@ -30,3 +30,14 @@ def test_polish_messages_constraints():
     assert msgs[1]["content"] == TEXT
     for kw in ("不改原意", "不增删信息", "本课要点", "口头禅"):
         assert kw in msgs[0]["content"], f"polish prompt 缺少红线: {kw}"
+
+
+def test_deep_messages_constraints():
+    """深度优化 = 成稿化讲义：结构化重构 + 不虚构红线，输入同 polish（原稿）。"""
+    msgs = build_deep_messages(TEXT)
+    assert [m["role"] for m in msgs] == ["system", "user"]
+    assert msgs[1]["content"] == TEXT
+    for kw in ("标题", "不虚构", "不增删"):   # 结构化 + 忠实红线
+        assert kw in msgs[0]["content"], f"deep prompt 缺少红线: {kw}"
+    # 与 polish 的红线区分开：deep 允许书面化重组，不保留口语
+    assert "书面" in msgs[0]["content"]

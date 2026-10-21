@@ -34,6 +34,13 @@ POLISH_SYSTEM = """你是一位细心的文字编辑。把下面的课堂逐字�
 3. 文末加 "## 本课要点" 一节：3~6 条要点，每条一行
 全文用中文，直接输出整理稿，不要任何前言或解释。"""
 
+DEEP_SYSTEM = """你是一位资深教材编辑。把下面的课堂逐字稿重写成一份结构化的课堂讲义成稿，输出 Markdown：
+1. 起一个体现本课主题的一级标题；按授课脉络分节，每节配二级小标题
+2. 段落充分重组：书面语化、补齐逻辑衔接、合并重复表述——以可直接存档发表的成稿为标准
+3. 保留说话人视角下的实例、推导、问答等实质内容，不省略知识点
+红线：不虚构课堂不存在的内容，不增删知识，不加原文没有的结论。
+全文用中文，直接输出成稿，不要任何前言或解释。"""
+
 
 def build_feedback_messages(transcript: str, stats: dict) -> list[dict]:
     user = ("课堂逐字稿：\n" + transcript
@@ -45,4 +52,9 @@ def build_feedback_messages(transcript: str, stats: dict) -> list[dict]:
 
 def build_polish_messages(transcript: str) -> list[dict]:
     return [{"role": "system", "content": POLISH_SYSTEM},
+            {"role": "user", "content": transcript}]
+
+
+def build_deep_messages(transcript: str) -> list[dict]:
+    return [{"role": "system", "content": DEEP_SYSTEM},
             {"role": "user", "content": transcript}]

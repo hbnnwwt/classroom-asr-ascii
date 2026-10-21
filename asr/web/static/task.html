@@ -82,6 +82,10 @@
                 <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></svg>
                 查看优化稿
               </button>
+              <button class="btn btn-view" type="button" data-view="deep" hidden title="页面内阅读深度优化讲义（成稿化）">
+                <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></svg>
+                查看深度优化
+              </button>
               <a class="btn" data-fmt="mp4" hidden title="拼接合并后的完整视频（仅旧版合并任务）">MP4 视频</a>
               <a class="btn" data-fmt="replace.log" title="术语替换日志（调试用）">replace.log</a>
             </div>
@@ -92,10 +96,14 @@
             </div>
           </div>
 
-          <!-- AI 反馈动作：手动生成/重试（done 且 LLM 可用时出现） -->
+          <!-- AI 反馈动作：手动生成/重试（done 且 LLM 可用时出现）。
+               点评+优化稿是上传开关的整组；深度优化按需单独生成 -->
           <div id="ai-actions" hidden>
             <div id="ai-error" class="error"></div>
-            <button id="ai-retry" type="button" class="btn">生成 AI 反馈</button>
+            <div class="btn-row">
+              <button id="ai-retry" type="button" class="btn">生成 AI 反馈</button>
+              <button id="ai-deep" type="button" class="btn">生成深度优化</button>
+            </div>
           </div>
         </section>
       </div>
@@ -125,13 +133,14 @@
           <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
         </button>
       </div>
-      <!-- 优化稿专属：正文 / 修改痕迹双页签（feedback 视图隐藏） -->
+      <!-- 优化稿/深度优化专属：正文 / 修改痕迹双页签（feedback 视图隐藏） -->
       <div class="modal-tabs" id="ai-modal-tabs" hidden>
         <button type="button" class="tab active" data-tab="clean">优化稿</button>
         <button type="button" class="tab" data-tab="diff">修改痕迹</button>
       </div>
       <div id="ai-modal-body" class="report"></div>
       <div class="modal-foot">
+        <button id="ai-modal-regen" type="button" class="btn" title="单独重新生成本件 AI 产物">重新生成此件</button>
         <a id="ai-modal-dl" class="btn btn-primary">下载 .md</a>
         <button id="ai-modal-close" type="button" class="btn">关闭</button>
       </div>
