@@ -1384,6 +1384,10 @@ def test_upload_ai_feedback_flag_reaches_meta(client, isolated_db, monkeypatch):
     _install_fake_probe(monkeypatch, [_mk_info("a.mp3")])
     monkeypatch.setattr(wm, "_run_single_task", fake_single)
     monkeypatch.setattr(wm, "_run_multi_task", lambda *a, **kw: None)
+    # 内联线程（同 _install_sync_pipeline 模式）：post 返回前 wrapper 已同步执行完，
+    # 否则 got["ai"] 依赖真线程与断言的调度竞态（TOCTOU 间歇假红）
+    import types
+    monkeypatch.setattr(wm, "threading", types.SimpleNamespace(Thread=_InlineThread))
     r = client.post("/api/projects",
                     files={"files": ("a.mp3", b"x", "audio/mpeg")},
                     data={"name": "AI课", "ai_feedback": "true"})
