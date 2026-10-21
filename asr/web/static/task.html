@@ -73,9 +73,15 @@
               <a class="btn" data-fmt="vtt">VTT</a>
               <a class="btn" data-fmt="md">MD</a>
               <a class="btn" data-fmt="json">JSON</a>
-              <!-- AI 产物：有 ai_files 才显示（renderAiUi 控制），href 由 done 分支统一刷 -->
-              <a class="btn" data-fmt="feedback" hidden title="AI 点评报告（教学反馈 + 稿件反馈）">AI 点评</a>
-              <a class="btn" data-fmt="polished" hidden title="优化版逐字稿（校订 + 要点）">优化稿</a>
+              <!-- AI 产物：有 ai_files 才显示（renderAiUi 控制）；下载收进阅读层 -->
+              <button class="btn btn-view" type="button" data-view="feedback" hidden title="页面内阅读 AI 点评报告">
+                <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></svg>
+                查看 AI 点评
+              </button>
+              <button class="btn btn-view" type="button" data-view="polished" hidden title="页面内阅读优化逐字稿">
+                <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></svg>
+                查看优化稿
+              </button>
               <a class="btn" data-fmt="mp4" hidden title="拼接合并后的完整视频（仅旧版合并任务）">MP4 视频</a>
               <a class="btn" data-fmt="replace.log" title="术语替换日志（调试用）">replace.log</a>
             </div>
@@ -109,6 +115,28 @@
       </div>
     </div>
   </main>
+
+  <!-- AI 产物阅读层：查看按钮打开，下载与否现场决定 -->
+  <div id="ai-modal" class="modal" hidden>
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="ai-modal-title">
+      <div class="modal-head">
+        <h3 id="ai-modal-title">AI 产物</h3>
+        <button id="ai-modal-x" type="button" class="modal-x" aria-label="关闭">
+          <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
+        </button>
+      </div>
+      <!-- 优化稿专属：正文 / 修改痕迹双页签（feedback 视图隐藏） -->
+      <div class="modal-tabs" id="ai-modal-tabs" hidden>
+        <button type="button" class="tab active" data-tab="clean">优化稿</button>
+        <button type="button" class="tab" data-tab="diff">修改痕迹</button>
+      </div>
+      <div id="ai-modal-body" class="report"></div>
+      <div class="modal-foot">
+        <a id="ai-modal-dl" class="btn btn-primary">下载 .md</a>
+        <button id="ai-modal-close" type="button" class="btn">关闭</button>
+      </div>
+    </div>
+  </div>
 
   <script src="/static/theme.js"></script>
   <script src="/static/task.js"></script>

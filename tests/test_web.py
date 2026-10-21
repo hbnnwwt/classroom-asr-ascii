@@ -271,6 +271,102 @@ def test_download_feedback_missing_404(client, isolated_db):
     assert client.get("/download/dl2/feedback").status_code == 404
 
 
+# ---------------------------------------------------------------------------
+# AI 产物在线阅读：GET /api/tasks/{id}/ai/{fmt} → {name, html}
+# ---------------------------------------------------------------------------
+def test_ai_view_feedback_rendered(client, isolated_db):
+    """查看端点：按登记名读 md → mdrender 渲染 → {name, html}。"""
+    out_dir = _mk_done_task_with_ai_files(isolated_db)
+    (out_dir / "dl1_测试课.feedback.md").write_text(
+        "# AI 课堂反馈\n\n| 指标 | 数值 |\n|---|---|\n| 语速 | 132 |",
+        encoding="utf-8")
+    r = client.get("/api/tasks/dl1/ai/feedback")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["name"] == "dl1_测试课.feedback.md"
+    assert "<h1>AI 课堂反馈</h1>" in body["html"]
+    assert "<td>132</td>" in body["html"]
+
+
+def test_ai_view_polished(client, isolated_db):
+    _mk_done_task_with_ai_files(isolated_db)
+    r = client.get("/api/tasks/dl1/ai/polished")
+    assert r.status_code == 200
+    assert "<h1>优化稿</h1>" in r.json()["html"]
+
+
+def test_ai_view_escapes_llm_output(client, isolated_db):
+    """LLM 注入的标签到浏览器只能是纯文本（转义前置）。"""
+    out_dir = _mk_done_task_with_ai_files(isolated_db)
+    (out_dir / "dl1_测试课.polished.md").write_text(
+        "<script>alert(1)</script>", encoding="utf-8")
+    r = client.get("/api/tasks/dl1/ai/polished")
+    assert r.status_code == 200
+    assert "<script>" not in r.json()["html"]
+    assert "&lt;script&gt;" in r.json()["html"]
+
+
+def test_ai_view_registered_name_wins_over_stale_glob(client, isolated_db):
+    """改名重跑后目录新旧并存 → 按登记名取，不许 glob 抢到旧文件。"""
+    out_dir = _mk_done_task_with_ai_files(isolated_db)   # 登记 dl1_测试课.*
+    (out_dir / "dl1_旧课名.feedback.md").write_text("# 旧文件", encoding="utf-8")
+    r = client.get("/api/tasks/dl1/ai/feedback")
+    assert "<h1>AI 课堂反馈</h1>" in r.json()["html"]
+
+
+def test_ai_view_no_artifact_404(client, isolated_db):
+    """done 任务但无 AI 产物 → 404（不 500）。"""
+    _mk_done_plain_task(isolated_db, task_id="fb_nofiles")
+    assert client.get("/api/tasks/fb_nofiles/ai/feedback").status_code == 404
+
+
+def test_ai_view_unknown_task_404(client, isolated_db):
+    assert client.get("/api/tasks/nope/ai/feedback").status_code == 404
+
+
+def test_ai_view_bad_fmt_400(client, isolated_db):
+    _mk_done_task_with_ai_files(isolated_db)
+    assert client.get("/api/tasks/dl1/ai/srt").status_code == 400
+
+
+def test_ai_view_polished_diff(client, isolated_db):
+    """?diff=1：原逐字稿（DB transcript）vs 优化稿 → 红字视图。"""
+    import asr.web as wm
+    out_dir = _mk_done_task_with_ai_files(isolated_db)
+    (out_dir / "dl1_测试课.polished.md").write_text(
+        "我们今天讲第三章。\n\n## 本课要点\n- 要点一\n", encoding="utf-8")
+    # 给任务补 transcript（_mk_done_task_with_ai_files 没插该列）
+    with closing(wm._db()) as conn:
+        conn.execute(
+            "UPDATE tasks SET transcript=? WHERE id='dl1'",
+            (json.dumps([{"start": 0.0, "end": 2.0, "text": "那个我们今天讲第三章。"}],
+                        ensure_ascii=False),))
+    r = client.get("/api/tasks/dl1/ai/polished?diff=1")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["diff"] is True
+    assert '<del class="diff-del">那个</del>' in body["html"]
+    assert "<h2>本课要点</h2>" in body["html"]
+
+
+def test_ai_view_diff_without_transcript(client, isolated_db):
+    """老任务无 transcript → 比对不了：diff=false + 普通渲染（不 500）。"""
+    _mk_done_task_with_ai_files(isolated_db)
+    r = client.get("/api/tasks/dl1/ai/polished?diff=1")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["diff"] is False
+    assert "<h1>优化稿</h1>" in body["html"]
+
+
+def test_ai_view_diff_flag_ignored_for_feedback(client, isolated_db):
+    """点评报告没有"原稿"概念：diff 参数忽略，正常渲染。"""
+    _mk_done_task_with_ai_files(isolated_db)
+    r = client.get("/api/tasks/dl1/ai/feedback?diff=1")
+    assert r.status_code == 200
+    assert r.json()["diff"] is False
+
+
 def _wait_done(client, task_id, timeout_s=5.0):
     """轮询直到状态非 pending/running。"""
     import time

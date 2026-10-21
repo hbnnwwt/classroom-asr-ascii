@@ -166,7 +166,7 @@ function updateUI(t) {
   // 下载区照常显示，别让用户白等一次 LLM。
   if (t.status === "done" || (t.status === "running" && t.stage === "ai")) {
     $("downloads").hidden = false;
-    document.querySelectorAll("#downloads .btn").forEach((a) => {
+    document.querySelectorAll("#downloads a.btn").forEach((a) => {
       a.href = `/download/${currentTaskId}/${a.dataset.fmt}`;
       a.download = "";
     });
@@ -207,40 +207,46 @@ function renderPartDownloads(meta) {
 }
 
 /**
- * AI 反馈按钮区（仅 done 分支调用）：两个下载按钮显隐 + 手动生成/重试。
- * done +（无产物 或 有错误）→ 显示按钮（未配置 LLM 也显示，点击跳设置页）；
- * 有产物无错 → 只留下载。
+ * AI 反馈按钮区（仅 done 分支调用）：查看按钮显隐 + 生成/重新生成。
+ * 有产物 → 查看按钮亮，动作按钮变"重新生成 AI 反馈"（confirm 防误触烧 token）；
+ * 无产物或有错误 → 按原有逻辑显示错误条 + 生成/重试。
  */
+let aiHasFiles = false;   // 点击时判定 confirm 用（产物可能被上一轮 renderAiUi 刷新）
+
 function renderAiUi(t) {
   const meta = t.meta || {};
-  const fbBtn = document.querySelector('#downloads .btn[data-fmt="feedback"]');
-  const poBtn = document.querySelector('#downloads .btn[data-fmt="polished"]');
+  const fbView = document.querySelector('#downloads .btn-view[data-view="feedback"]');
+  const poView = document.querySelector('#downloads .btn-view[data-view="polished"]');
   // ai_error 判定前移到 hasFiles 短路之前：已有产物的任务 API 补跑再失败时
   // meta 两键并存（旧 ai_files + 新 ai_error），必须显示错误条+重试，
   // 不得拿陈旧下载掩住错误。
   const hasError = Boolean(meta.ai_error);
   const hasFiles = Boolean(meta.ai_files) && !hasError;
-  if (fbBtn) fbBtn.hidden = !hasFiles;
-  if (poBtn) poBtn.hidden = !hasFiles;
+  aiHasFiles = Boolean(meta.ai_files);
+  // 查看按钮与产物同条件显隐（有产物才可看）
+  if (fbView) fbView.hidden = !hasFiles;
+  if (poView) poView.hidden = !hasFiles;
 
   const box = $("ai-actions");
-  if (t.status !== "done" || hasFiles) { box.hidden = true; return; }
+  if (t.status !== "done") { box.hidden = true; return; }
   box.hidden = false;
   const errBox = $("ai-error");
-  if (meta.ai_error) {
+  if (hasError) {
     errBox.hidden = false;
     errBox.textContent = `AI 反馈失败：${meta.ai_error}`;
     $("ai-retry").textContent = "重试 AI 反馈";
   } else {
     errBox.hidden = true;
-    $("ai-retry").textContent = "生成 AI 反馈";
+    $("ai-retry").textContent = hasFiles ? "重新生成 AI 反馈" : "生成 AI 反馈";
   }
 }
 
-// 手动生成/重试：POST 触发后台 AI stage，恢复轮询看进度（失败只 alert，不打断页面）
+// 手动生成/重新生成：POST 触发后台 AI stage，恢复轮询看进度（失败只 alert，不打断页面）
 $("ai-retry").addEventListener("click", async () => {
   // 未配置 LLM：不 POST（必吃 409），直接送去设置页
   if (!llmAvailable) { window.location.href = "/settings"; return; }
+  // 已有产物：覆盖旧文件 + 再烧一次 token，确认了才动
+  if (aiHasFiles && !confirm("重新生成会覆盖现有 AI 点评和优化稿，并再次调用 LLM。继续？")) return;
   $("ai-retry").disabled = true;
   try {
     const resp = await fetch(`/api/tasks/${currentTaskId}/feedback`, { method: "POST" });
@@ -492,3 +498,56 @@ function showError(msg) {
   $("error").textContent = msg;
   $("error").hidden = false;
 }
+// ---------------------------------------------------------------------------
+// AI 产物阅读层：服务端把 md 渲染成 HTML（先转义后渲染，XSS 无门），
+// 这里只负责取回来填进弹层；下载与否看完再决定，链接挂现成 /download。
+// 优化稿有两个页签：正文 / 修改痕迹（红字 diff，懒加载 + 本次打开缓存）。
+// ---------------------------------------------------------------------------
+let aiCache = {};   // {clean: {name,html,diff}, diff: {...}}，每次打开重置
+
+function loadAiTab(fmt, tab) {
+  const body = $("ai-modal-body");
+  const fill = (d) => {
+    if (d.name) $("ai-modal-title").textContent = d.name;
+    // diff 页签但后端给不了（原逐字稿缺失）→ 老实说，别渲染成正文
+    body.innerHTML = (tab === "diff" && !d.diff)
+      ? "<p>原逐字稿缺失，无法比对修改痕迹。</p>"
+      : d.html;   // 服务端 render_markdown / render_diff 产物（全文转义后渲染）
+  };
+  if (aiCache[tab]) { fill(aiCache[tab]); return; }
+  body.textContent = "加载中…";
+  fetch(`/api/tasks/${currentTaskId}/ai/${fmt}${tab === "diff" ? "?diff=1" : ""}`)
+    .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
+    .then((d) => { aiCache[tab] = d; fill(d); })
+    .catch((e) => { body.textContent = `✗ 加载失败：${e.message}`; });
+}
+
+function setAiTab(tab) {
+  document.querySelectorAll("#ai-modal-tabs .tab").forEach((b) =>
+    b.classList.toggle("active", b.dataset.tab === tab));
+  loadAiTab("polished", tab);
+}
+
+function openAiViewer(fmt) {
+  aiCache = {};
+  $("ai-modal-tabs").hidden = fmt !== "polished";
+  $("ai-modal-title").textContent = fmt === "feedback" ? "AI 点评报告" : "优化逐字稿";
+  $("ai-modal-dl").href = `/download/${currentTaskId}/${fmt}`;
+  $("ai-modal").hidden = false;
+  loadAiTab(fmt, "clean");
+}
+
+function closeAiViewer() { $("ai-modal").hidden = true; }
+
+document.querySelectorAll("#downloads .btn-view").forEach((b) =>
+  b.addEventListener("click", () => openAiViewer(b.dataset.view)));
+document.querySelectorAll("#ai-modal-tabs .tab").forEach((b) =>
+  b.addEventListener("click", () => setAiTab(b.dataset.tab)));
+$("ai-modal-x").addEventListener("click", closeAiViewer);
+$("ai-modal-close").addEventListener("click", closeAiViewer);
+$("ai-modal").addEventListener("click", (e) => {
+  if (e.target === $("ai-modal")) closeAiViewer();   // 点遮罩关闭
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && !$("ai-modal").hidden) closeAiViewer();
+});

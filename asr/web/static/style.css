@@ -572,3 +572,87 @@ a.theme-toggle { display: inline-flex; align-items: center; justify-content: cen
   color: var(--err); background: var(--err-bg);
   padding: 8px 10px; border-radius: var(--radius-sm); margin: 12px 0 0;
 }
+
+/* ===========================================================================
+   AI 产物阅读层（任务详情页）：遮罩 + 卡片 + 报告排版
+   =========================================================================== */
+.modal {
+  position: fixed; inset: 0; z-index: 100;
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(0, 0, 0, 0.45);
+  padding: 24px;
+}
+.modal-card {
+  display: flex; flex-direction: column;
+  width: min(800px, 100%); max-height: min(85vh, 900px);
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius); box-shadow: 0 8px 30px rgba(0, 0, 0, 0.18);
+}
+.modal-head {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 12px 16px; border-bottom: 1px solid var(--border);
+}
+.modal-head h3 { margin: 0; font-size: 15px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.modal-x {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 30px; height: 30px; padding: 0;
+  background: none; border: none; border-radius: var(--radius-sm);
+  color: var(--text-2); cursor: pointer;
+}
+.modal-x:hover { background: var(--surface-2); color: var(--text); }
+.modal-foot {
+  display: flex; justify-content: flex-end; gap: 10px;
+  padding: 12px 16px; border-top: 1px solid var(--border);
+}
+
+/* 报告正文：render_markdown 产物（h1-h4 / p / ul / ol / table / code） */
+.report { padding: 8px 24px 20px; overflow-y: auto; font-size: 14.5px; line-height: 1.75; }
+.report h1 { font-size: 20px; margin: 18px 0 10px; }
+.report h2 { font-size: 17px; margin: 18px 0 8px; padding-bottom: 4px; border-bottom: 1px solid var(--border); }
+.report h3 { font-size: 15px; margin: 14px 0 6px; }
+.report h4 { font-size: 14.5px; margin: 12px 0 6px; }
+.report h1:first-child, .report h2:first-child { margin-top: 10px; }
+.report p { margin: 8px 0; }
+.report ul, .report ol { margin: 8px 0; padding-left: 22px; }
+.report li { margin: 4px 0; }
+.report code {
+  font-size: 13px; padding: 1px 5px;
+  background: var(--surface-2); border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+.report table { border-collapse: collapse; margin: 12px 0; width: 100%; font-size: 14px; }
+.report th, .report td { border: 1px solid var(--border-strong); padding: 6px 10px; text-align: left; }
+.report th { background: var(--surface-2); font-weight: 600; }
+.report tbody tr:nth-child(even) { background: var(--surface-2); }
+
+/* 优化稿页签：正文 / 修改痕迹（仅 polished 视图显示） */
+.modal-tabs {
+  display: flex; gap: 4px;
+  padding: 8px 16px 0;
+  border-bottom: 1px solid var(--border);
+}
+.modal-tabs .tab {
+  padding: 6px 14px 8px;
+  background: none; border: none;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;   /* 压住 tabs 的 border-bottom，选中态与正文连通 */
+  font-size: 14px; color: var(--text-2);
+  cursor: pointer;
+}
+.modal-tabs .tab:hover { color: var(--text); }
+.modal-tabs .tab.active {
+  color: var(--text); font-weight: 600;
+  border-bottom-color: var(--accent);
+}
+
+/* 修改痕迹（render_diff 产物）：删=红划线原文，增=绿底新文 */
+.report del.diff-del {
+  text-decoration: line-through;
+  color: var(--err); background: var(--err-bg);
+  border-radius: 2px; padding: 0 1px;
+}
+.report ins.diff-ins {
+  text-decoration: none;
+  color: var(--ok); background: var(--ok-bg);
+  border-radius: 2px; padding: 0 1px;
+}

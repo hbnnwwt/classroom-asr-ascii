@@ -34,6 +34,7 @@ from ..config import LLMConfig, ConfigLoadError, load_config, write_llm_section
 from ..feedback import build_feedback_messages, build_polish_messages
 from ..llm import LLMError, chat, llm_enabled
 from ..media import probe
+from ..mdrender import render_diff, render_markdown
 from ..merge import merge_audios, write_part_srts
 from ..pipeline import close_cached_engines
 from ..pipeline import run as pipeline_run
@@ -286,6 +287,21 @@ def _strip_known_ext(name: str) -> str:
     return p.stem if p.suffix.lower() in _KNOWN_STEM_EXTS else name
 
 
+def _ai_artifact(out_dir: Path, meta: dict, fmt: str) -> Path | None:
+    """AI 产物定位：meta.ai_files 登记名优先，无登记 glob 兜底。
+
+    登记优先是硬要求——改名重跑后目录里新旧两份并存，glob 顺序不定
+    会取到旧文件；无登记（半程失败的老任务）glob 兜底，兼容"已产出
+    一份"的可下载性。
+    """
+    registered = (meta.get("ai_files") or {}).get(fmt)
+    candidate = out_dir / registered if registered else None
+    if candidate and candidate.exists():
+        return candidate
+    files = sorted(out_dir.glob(f"*.{fmt}.md"))
+    return files[0] if files else None
+
+
 @app.get("/download/{task_id}/{fmt}")
 def download(task_id: str, fmt: str):
     """下载指定格式输出（SRT/VTT/MD/TXT/JSON/REPLACE_LOG/AI 反馈产物）。"""
@@ -306,17 +322,11 @@ def download(task_id: str, fmt: str):
 
     out_dir = Path(row["output_dir"])
     if fmt in ("feedback", "polished"):
-        # AI 产物：meta.ai_files 有登记按名取——改名重跑后目录里新旧两份并存，
-        # glob 顺序不定会下到旧文件；无登记（半程失败的老任务）再 glob 兜底，
-        # 兼容"已产出一份"的可下载性
         try:
             meta = json.loads(row["meta_json"] or "{}")
         except ValueError:
             meta = {}
-        registered = (meta.get("ai_files") or {}).get(fmt)
-        candidate = out_dir / registered if registered else None
-        files = ([candidate] if candidate and candidate.exists()
-                 else list(out_dir.glob(f"*.{fmt}.md")))
+        target = _ai_artifact(out_dir, meta, fmt)
     else:
         # 排除分段文件（{两位序号}_ 前缀）和 AI 产物——md 的 *.md glob 会
         # 同时命中 *.feedback.md，而 files[0] 不保证顺序，不排除就是抢占
@@ -325,14 +335,57 @@ def download(task_id: str, fmt: str):
             if not re.match(r"^\d{2}_", f.name)
             and not re.search(r"\.(feedback|polished)\.md$", f.name)
         ]
-    if not files:
+        target = files[0] if files else None
+    if target is None:
         raise HTTPException(404, f"输出文件不存在: {fmt}")
-    target = files[0]
     # 剥后缀只认白名单：任务名/文件名里的点号（"3.2节 复习.mp4" 的 ".2节 复习"
     # 不是后缀）不许被 Path.stem 连剥两次把名字截断
     stem = _strip_known_ext(row["name"] or row["filename"])
     suffix = f".{fmt}.md" if fmt in ("feedback", "polished") else f".{fmt}"
     return FileResponse(str(target), filename=f"{stem}{suffix}")
+
+
+@app.get("/api/tasks/{task_id}/ai/{fmt}")
+def ai_view(task_id: str, fmt: str, diff: bool = False):
+    """AI 产物在线阅读：读 md → render_markdown → {name, html, diff}。
+
+    与 /download 同一套 _ai_artifact 登记名解析；下载仍走 /download
+    （前端查看层里直接挂它的链接），本端点只管看。
+
+    ?diff=1（仅 polished）：DB 里的原逐字稿 vs 优化稿做红字比对，
+    删改痕迹原地可见；无 transcript 的老任务 diff=false 退普通渲染。
+    """
+    if fmt not in ("feedback", "polished"):
+        raise HTTPException(400, f"不支持的格式: {fmt}")
+    with closing(_db()) as conn:
+        row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+    if row is None:
+        raise HTTPException(404, "任务不存在")
+    # 与 /download 同口径：stage=ai 期间放行（转写产物已落盘，AI 产物
+    # 部分生成时用户可先看已落盘的那份）
+    if row["status"] != "done" and row["stage"] != "ai":
+        raise HTTPException(409, f"任务未完成: {row['status']}")
+    try:
+        meta = json.loads(row["meta_json"] or "{}")
+    except ValueError:
+        meta = {}
+    target = _ai_artifact(Path(row["output_dir"]), meta, fmt)
+    if target is None:
+        raise HTTPException(404, f"输出文件不存在: {fmt}")
+    text = target.read_text(encoding="utf-8")
+
+    diff_ok = False
+    if diff and fmt == "polished" and row["transcript"]:
+        try:
+            segs = json.loads(row["transcript"])
+        except ValueError:
+            segs = []
+        if segs:
+            original = "\n".join(s.get("text", "") for s in segs)
+            return {"name": target.name, "diff": True,
+                    "html": render_diff(original, text)}
+    return {"name": target.name, "diff": diff_ok,
+            "html": render_markdown(text)}
 
 
 @app.get("/download/{task_id}/part_srt/{index}")
