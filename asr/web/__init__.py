@@ -773,6 +773,8 @@ def _run_pipeline(
             "segments_count": result.segments_count,
             "formats": list(result.written.keys()),
         }
+        # 读-改-写：done 前写入的键（parts/merge_mode/ai_feedback…）不许被冲掉
+        meta = {**_read_meta(task_id), **meta}
 
         # 抽 transcript（从 .json 读 segments 数组）。必须与 done 同一笔 UPDATE：
         # 前端见 done 即停止轮询，done 之后再后补的段永远到不了页面。

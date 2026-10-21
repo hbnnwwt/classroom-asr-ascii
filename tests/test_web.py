@@ -1218,3 +1218,46 @@ class TestWatchdog:
         assert flipped is True
         with closing(_db()) as conn:
             assert conn.execute("SELECT status FROM tasks WHERE id='t2'").fetchone()[0] == "failed"
+
+
+# ---------------------------------------------------------------------------
+# pipeline done 的 meta 读-改-写：done 不许冲掉既有 meta 键
+# ---------------------------------------------------------------------------
+def test_pipeline_done_preserves_existing_meta(isolated_db, monkeypatch, tmp_path):
+    """done 前写进 meta 的键（parts/ai_feedback/merge_mode）在 done 后仍在。"""
+    import asr.web as wm
+    out_dir = wm.OUTPUT_ROOT / "pm1"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    with closing(wm._db()) as conn:
+        conn.execute(
+            "INSERT INTO tasks (id, name, filename, input_path, output_dir,"
+            " status, created_at, meta_json)"
+            " VALUES ('pm1', '课', 'a.mp4', 'x', ?, 'pending', '2026-10-21', ?)",
+            (str(out_dir), json.dumps(
+                {"parts": ["a.mp4", "b.mp4"], "ai_feedback": True,
+                 "merge_mode": "concat"}, ensure_ascii=False)),
+        )
+    jp = tmp_path / "out.json"
+    jp.write_text(json.dumps({"segments": [
+        {"start": 0.0, "end": 1.0, "text": "嗯", "spk": "教师"}]},
+        ensure_ascii=False), encoding="utf-8")
+
+    class FakeResult:
+        duration_s = 10.0
+        elapsed_s = 1.0
+        rtf = 0.1
+        segments_count = 1
+        written = {"json": str(jp)}
+
+    monkeypatch.setattr(wm, "pipeline_run", lambda *a, **kw: FakeResult())
+    wm._run_pipeline("pm1", tmp_path / "in.wav", out_dir, "config.yaml",
+                     False, "balanced")
+
+    with closing(wm._db()) as conn:
+        row = conn.execute("SELECT status, meta_json FROM tasks WHERE id='pm1'").fetchone()
+    assert row["status"] == "done"
+    meta = json.loads(row["meta_json"])
+    assert meta["parts"] == ["a.mp4", "b.mp4"]      # 现网多段任务依赖
+    assert meta["ai_feedback"] is True              # AI 开关依赖（Task 7）
+    assert meta["merge_mode"] == "concat"           # 旧版任务依赖
+    assert "duration_s" in meta                     # pipeline 自己的键照写
