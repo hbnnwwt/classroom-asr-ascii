@@ -604,6 +604,49 @@ def batch_export(payload: dict):
 
 
 # ---------------------------------------------------------------------------
+# AI 反馈：LLM 可用性查询 + done 任务手动补跑
+# ---------------------------------------------------------------------------
+@app.get("/api/llm/status")
+def llm_status(config: str = "config.yaml"):
+    """LLM 可用性：前端据此显示/隐藏 AI 反馈入口。
+
+    配置加载失败也按"未启用"返回——状态查询不许被配置错误打挂。
+    """
+    try:
+        cfg = load_config(config, strict_models=False)
+    except ConfigLoadError:
+        return JSONResponse({"enabled": False, "model": None})
+    return JSONResponse({"enabled": llm_enabled(cfg),
+                         "model": cfg.llm.model or None})
+
+
+@app.post("/api/tasks/{task_id}/feedback")
+def trigger_ai_feedback(task_id: str, config: str = "config.yaml"):
+    """对 done 任务手动补跑 AI 反馈（含上传时没开开关的旧任务）。"""
+    with closing(_db()) as conn:
+        row = conn.execute(
+            "SELECT status FROM tasks WHERE id=?", (task_id,)).fetchone()
+    if row is None:
+        raise HTTPException(404, "任务不存在")
+    if row["status"] == "running":
+        raise HTTPException(409, "任务处理中，稍后再试")
+    if row["status"] != "done":
+        raise HTTPException(409, f"任务未完成: {row['status']}")
+    if not llm_enabled(load_config(config, strict_models=False)):
+        raise HTTPException(409, "LLM 未配置（config.yaml 缺 llm 节）")
+
+    # 清旧错误 + 标 running，起线程；_run_ai_stage 自己管成功/失败终态
+    meta = _read_meta(task_id)
+    meta.pop("ai_error", None)
+    _update_task(task_id, status="running", stage="ai", message="AI 反馈",
+                 stage_started_at=datetime.now().isoformat(timespec="seconds"),
+                 meta_json=json.dumps(meta, ensure_ascii=False))
+    threading.Thread(target=_run_ai_stage, args=(task_id, config),
+                     daemon=True).start()
+    return JSONResponse({"status": "started"}, status_code=202)
+
+
+# ---------------------------------------------------------------------------
 # 后台多段任务：拼音频（stage=merge）→ 转写 pipeline → 每段独立 SRT
 # ---------------------------------------------------------------------------
 def _read_meta(task_id: str) -> dict:

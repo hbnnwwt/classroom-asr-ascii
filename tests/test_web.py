@@ -1398,3 +1398,85 @@ def test_upload_ai_feedback_flag_reaches_meta(client, isolated_db, monkeypatch):
             (r.json()["task_id"],)).fetchone()
     assert json.loads(row["meta_json"])["ai_feedback"] is True
     assert got["ai"] is True
+
+
+# ---------------------------------------------------------------------------
+# 手动补跑 + LLM 状态端点
+# ---------------------------------------------------------------------------
+def test_llm_status_disabled_by_default(client, isolated_db):
+    """config.yaml 无 llm 节（默认仓库配置）→ enabled=false。"""
+    r = client.get("/api/llm/status")
+    assert r.status_code == 200
+    assert r.json() == {"enabled": False, "model": None}
+
+
+def test_llm_status_enabled(client, isolated_db, monkeypatch):
+    """配了 llm 节 → enabled=true + 模型名（前端入口显示依据）。"""
+    from types import SimpleNamespace
+    import asr.web as wm
+    fake = SimpleNamespace(llm=SimpleNamespace(
+        base_url="http://x/v1", api_key="", model="fake-m", timeout=5, max_tokens=1))
+    monkeypatch.setattr(wm, "load_config", lambda *a, **kw: fake)
+    r = client.get("/api/llm/status")
+    assert r.json() == {"enabled": True, "model": "fake-m"}
+
+
+def _mk_done_plain_task(isolated_db, task_id="fb1", status="done"):
+    """造一个无 meta 的任务行——手动补跑的典型对象（上传时没开 AI 开关）。"""
+    import asr.web as wm
+    out_dir = wm.OUTPUT_ROOT / task_id
+    out_dir.mkdir(parents=True, exist_ok=True)
+    segs = json.dumps([{"start": 0.0, "end": 2.0, "text": "上课。"}],
+                      ensure_ascii=False)
+    with closing(wm._db()) as conn:
+        conn.execute(
+            "INSERT INTO tasks (id, name, filename, input_path, output_dir,"
+            " status, progress, created_at, transcript)"
+            " VALUES (?, '课', 'a.mp4', 'x', ?, ?, 1.0, '2026-10-21', ?)",
+            (task_id, str(out_dir), status, segs),
+        )
+
+
+def test_feedback_trigger_202_and_clears_error(client, isolated_db, monkeypatch):
+    """手动补跑通过：清旧 ai_error、status→running/stage→ai、线程跑 _run_ai_stage。
+
+    偏离 brief：brief 原版用真 threading.Thread + Event.wait(5)（竞态），
+    且没 mock llm_enabled——仓库 config.yaml 无 llm 节，真跑会 409 而非 202。
+    此处按 _install_sync_pipeline 模式内联线程 + patch llm_enabled，断言不变。
+    """
+    import types
+    import asr.web as wm
+    _mk_done_plain_task(isolated_db)
+    with closing(wm._db()) as conn:
+        conn.execute("UPDATE tasks SET meta_json=? WHERE id='fb1'",
+                     (json.dumps({"ai_error": "旧错误"}, ensure_ascii=False),))
+    got = {}
+    monkeypatch.setattr(wm, "_run_ai_stage",
+                        lambda tid, cfg: got.update(args=(tid, cfg)))
+    monkeypatch.setattr(wm, "llm_enabled", lambda cfg: True)
+    # 内联线程：post 返回即线程已同步执行完，断言不依赖真线程调度（TOCTOU）
+    monkeypatch.setattr(wm, "threading", types.SimpleNamespace(Thread=_InlineThread))
+    r = client.post("/api/tasks/fb1/feedback")
+    assert r.status_code == 202 and r.json() == {"status": "started"}
+    assert got["args"] == ("fb1", "config.yaml"), "AI stage 线程没跑起来"
+    with closing(wm._db()) as conn:
+        row = conn.execute(
+            "SELECT status, stage, meta_json FROM tasks WHERE id='fb1'").fetchone()
+    assert row["status"] == "running" and row["stage"] == "ai"
+    assert "ai_error" not in json.loads(row["meta_json"])
+
+
+def test_feedback_trigger_rejections(client, isolated_db):
+    """404 任务不存在 / 409 running / 409 非 done / 409 LLM 未配置。
+
+    偏离 brief：原版漏建 fb1（isolated_db 每测试独立库，不建就是 404），
+    补一行 _mk_done_plain_task(isolated_db) 让末条断言真正测到"done+未配置→409"。
+    """
+    _mk_done_plain_task(isolated_db)  # fb1：done（末条断言的对象）
+    _mk_done_plain_task(isolated_db, task_id="fb_running", status="running")
+    _mk_done_plain_task(isolated_db, task_id="fb_pend", status="pending")
+    assert client.post("/api/tasks/nope/feedback").status_code == 404
+    assert client.post("/api/tasks/fb_running/feedback").status_code == 409
+    assert client.post("/api/tasks/fb_pend/feedback").status_code == 409
+    # done 任务但 LLM 未配置（仓库 config.yaml 无 llm 节）→ 409
+    assert client.post("/api/tasks/fb1/feedback").status_code == 409
