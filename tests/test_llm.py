@@ -8,7 +8,7 @@ import requests
 from asr.config import load_config
 from asr.llm import LLMError, chat, llm_enabled
 
-CFG = load_config("config.yaml", strict_models=False)
+CFG = load_config("config.example.yaml", strict_models=False)
 CFG = CFG.model_copy(update={"llm": SimpleNamespace(
     base_url="http://fake:1/v1", api_key="sk-test", model="fake-model",
     timeout=5, max_tokens=512,
@@ -65,6 +65,19 @@ def test_chat_network_error_wrapped():
                side_effect=requests.ConnectionError("refused")):
         with pytest.raises(LLMError, match="ConnectionError"):
             chat(MSG, CFG)
+
+
+def test_chat_proxy_error_says_human_words():
+    """代理不可用 → 报错说人话并给出路（检查代理/加直连），不是 ProxyError 天书。"""
+    with patch("asr.llm.requests.post",
+               side_effect=requests.exceptions.ProxyError(
+                   "Unable to connect to proxy")):
+        with pytest.raises(LLMError, match="代理"):
+            chat(MSG, CFG)
+        try:
+            chat(MSG, CFG)
+        except LLMError as e:
+            assert "直连" in str(e), "要给出加直连规则的出路"
 
 
 def test_chat_bad_structure_raises():

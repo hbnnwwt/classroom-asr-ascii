@@ -43,6 +43,12 @@ def chat(
     try:
         resp = requests.post(url, json=body, headers=headers,
                              timeout=cfg.llm.timeout)
+    except requests.exceptions.ProxyError as e:
+        # 系统代理（注册表/环境变量）不可用或拒绝转发——真实场景：代理客户端
+        # 刚启动/切节点的瞬态抖动，或没给国内服务商配直连规则
+        raise LLMError(
+            "LLM 请求经系统代理被拒——检查代理客户端是否正常（刚启动/切节点"
+            "可稍后重试），或把 LLM 服务商域名加入代理直连规则") from e
     except requests.RequestException as e:  # noqa: BLE001
         raise LLMError(f"LLM 请求失败: {type(e).__name__}: {e}") from e
 
