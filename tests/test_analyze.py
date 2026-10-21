@@ -76,6 +76,13 @@ def test_question_pure_q_mark_and_no_punct():
     assert s["questions"] == {"整体": 2}   # 纯"？"问句 1 + 丢标点"吗"兜底 1
 
 
+def test_question_repeated_punct_counts_once():
+    """连写问号计一问：FunASR 会输出重复标点（"？？"，README FAQ），
+    旧分隔符不带 + 会把 "？？" 拆成两句、一个问句计 2。"""
+    s = compute_stats([_seg(0, 10, "听懂了吗？？还有问题吗？？")])
+    assert s["questions"] == {"整体": 2}
+
+
 def test_filler_word_table_no_single_char():
     """词表不含单字（"啊/嗯"子串误匹配率太高）。"""
     assert all(len(w) >= 2 for w in FILLER_WORDS)

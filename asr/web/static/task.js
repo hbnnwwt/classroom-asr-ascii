@@ -139,7 +139,10 @@ function updateUI(t) {
   if (mergeLi) mergeLi.style.display = isMulti ? "" : "none";
   // AI stage 行显隐不放 done 分支：AI 进行中任务仍是 running，行得跟着每轮轮询走。
   // 三个信号任一命中就显示——开过开关 / 失败过 / 出过产物。
-  const hasAi = Boolean(t.meta && (t.meta.ai_feedback || t.meta.ai_error || t.meta.ai_files));
+  // 转写失败（status=failed）不留 AI 行：meta 里的 ai_feedback 开关只代表
+  // "开过"，任务失败时该行会永远 pending，误导用户在等一个不会来的结果。
+  const hasAi = t.status !== "failed" && Boolean(
+    t.meta && (t.meta.ai_feedback || t.meta.ai_error || t.meta.ai_files));
   const aiLi = document.querySelector('#stages li[data-stage="ai"]');
   if (aiLi) aiLi.style.display = hasAi ? "" : "none";
   const mp4Btn = document.querySelector('#downloads .btn[data-fmt="mp4"]');
@@ -215,7 +218,11 @@ function renderAiUi(t) {
   const meta = t.meta || {};
   const fbBtn = document.querySelector('#downloads .btn[data-fmt="feedback"]');
   const poBtn = document.querySelector('#downloads .btn[data-fmt="polished"]');
-  const hasFiles = Boolean(meta.ai_files);
+  // ai_error 判定前移到 hasFiles 短路之前：已有产物的任务 API 补跑再失败时
+  // meta 两键并存（旧 ai_files + 新 ai_error），必须显示错误条+重试，
+  // 不得拿陈旧下载掩住错误。
+  const hasError = Boolean(meta.ai_error);
+  const hasFiles = Boolean(meta.ai_files) && !hasError;
   if (fbBtn) fbBtn.hidden = !hasFiles;
   if (poBtn) poBtn.hidden = !hasFiles;
 
@@ -242,6 +249,7 @@ $("ai-retry").addEventListener("click", async () => {
       const err = await resp.json().catch(() => ({}));
       throw new Error(err.detail || `触发失败: ${resp.status}`);
     }
+    $("ai-actions").hidden = true;   // 重跑期间收起按钮，防二次点击吃 409
     startPolling();   // 恢复轮询，看 AI stage 进度
   } catch (err) {
     alert(err.message);

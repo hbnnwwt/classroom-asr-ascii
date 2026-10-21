@@ -245,6 +245,7 @@ def test_download_md_not_hijacked_by_ai_files(client, isolated_db):
 
 
 def test_download_feedback_and_polished_fmt(client, isolated_db):
+    """feedback/polished fmt：按 meta 登记名/glob 命中对应 AI 产物文件。"""
     _mk_done_task_with_ai_files(isolated_db)
     r = client.get("/download/dl1/feedback")
     assert r.status_code == 200
@@ -1587,6 +1588,9 @@ def _mk_done_plain_task(isolated_db, task_id="fb1", status="done"):
 def test_feedback_trigger_202_and_clears_error(client, isolated_db, monkeypatch):
     """手动补跑通过：清旧 ai_error、status→running/stage→ai、线程跑 _run_ai_stage。
 
+    meta 读-改-写不许冲掉 parts 等既有键（e041444 同类回归）；progress 归 0、
+    ended_at 清空——202 后不得出现 running+100%+旧结束时间的假象。
+
     偏离 brief：brief 原版用真 threading.Thread + Event.wait(5)（竞态），
     且没 mock llm_enabled——仓库 config.yaml 无 llm 节，真跑会 409 而非 202。
     此处按 _install_sync_pipeline 模式内联线程 + patch llm_enabled，断言不变。
@@ -1595,8 +1599,11 @@ def test_feedback_trigger_202_and_clears_error(client, isolated_db, monkeypatch)
     import asr.web as wm
     _mk_done_plain_task(isolated_db)
     with closing(wm._db()) as conn:
-        conn.execute("UPDATE tasks SET meta_json=? WHERE id='fb1'",
-                     (json.dumps({"ai_error": "旧错误"}, ensure_ascii=False),))
+        conn.execute(
+            "UPDATE tasks SET meta_json=?, ended_at='2026-10-21T09:00:00'"
+            " WHERE id='fb1'",
+            (json.dumps({"ai_error": "旧错误", "parts": ["a.mp4", "b.mp4"]},
+                        ensure_ascii=False),))
     got = {}
     monkeypatch.setattr(wm, "_run_ai_stage",
                         lambda tid, cfg: got.update(args=(tid, cfg)))
@@ -1608,9 +1615,14 @@ def test_feedback_trigger_202_and_clears_error(client, isolated_db, monkeypatch)
     assert got["args"] == ("fb1", "config.yaml"), "AI stage 线程没跑起来"
     with closing(wm._db()) as conn:
         row = conn.execute(
-            "SELECT status, stage, meta_json FROM tasks WHERE id='fb1'").fetchone()
+            "SELECT status, stage, progress, ended_at, meta_json FROM tasks"
+            " WHERE id='fb1'").fetchone()
     assert row["status"] == "running" and row["stage"] == "ai"
-    assert "ai_error" not in json.loads(row["meta_json"])
+    assert row["progress"] == 0, "重跑从 0 开始，不得残留上次的 100%"
+    assert row["ended_at"] is None, "running 不配旧 ended_at"
+    meta = json.loads(row["meta_json"])
+    assert "ai_error" not in meta
+    assert meta["parts"] == ["a.mp4", "b.mp4"], "清 ai_error 不得冲掉 parts 等既有键"
 
 
 def test_feedback_trigger_rejections(client, isolated_db):
@@ -1627,3 +1639,84 @@ def test_feedback_trigger_rejections(client, isolated_db):
     assert client.post("/api/tasks/fb_pend/feedback").status_code == 409
     # done 任务但 LLM 未配置（仓库 config.yaml 无 llm 节）→ 409
     assert client.post("/api/tasks/fb1/feedback").status_code == 409
+
+
+def test_feedback_trigger_config_error_409(client, isolated_db, monkeypatch):
+    """config.yaml 加载失败 → 409 "LLM 未配置"（与 llm_status 降级同口径），不 500。"""
+    import asr.web as wm
+    from asr.config import ConfigLoadError
+    _mk_done_plain_task(isolated_db)
+
+    def _boom(*a, **kw):
+        raise ConfigLoadError("yaml broken")
+
+    monkeypatch.setattr(wm, "load_config", _boom)
+    r = client.post("/api/tasks/fb1/feedback")
+    assert r.status_code == 409
+    assert "LLM 未配置" in r.json()["detail"]
+
+
+# ---------------------------------------------------------------------------
+# AI stage 失败终态收口 + AI 产物按 meta 登记名取
+# ---------------------------------------------------------------------------
+def test_run_ai_stage_failure_sets_progress_done(isolated_db, monkeypatch):
+    """失败分支进度归 1.0：点评成功、优化稿失败时进度停在 0.55，
+    done 终态配 55% 进度条是假象。"""
+    from asr.llm import LLMError
+    wm, out_dir, calls = _mk_ai_task(isolated_db, monkeypatch)
+    state = {"n": 0}
+
+    def chat_first_ok_then_boom(messages, cfg, **kw):
+        state["n"] += 1
+        if state["n"] >= 2:
+            raise LLMError("polish boom")
+        return "# 点评"
+
+    monkeypatch.setattr(wm, "chat", chat_first_ok_then_boom)
+    wm._run_ai_stage("ai1", "config.yaml")
+    with closing(wm._db()) as conn:
+        row = conn.execute(
+            "SELECT status, progress, meta_json FROM tasks WHERE id='ai1'").fetchone()
+    assert row["status"] == "done"
+    assert row["progress"] == 1.0, "失败终态进度必须归 1.0（不配半程进度条）"
+    assert "polish boom" in json.loads(row["meta_json"])["ai_error"]
+
+
+def test_download_feedback_prefers_registered_file(client, isolated_db):
+    """改名重跑后目录里新旧两份并存：按 meta.ai_files 登记名取新文件，
+    glob 顺序不定会抢先命中旧产物。"""
+    import asr.web as wm
+    out_dir = wm.OUTPUT_ROOT / "dl5"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "dl5_a_old.feedback.md").write_text("旧产物", encoding="utf-8")
+    (out_dir / "dl5_z_new.feedback.md").write_text("新产物", encoding="utf-8")
+    with closing(wm._db()) as conn:
+        conn.execute(
+            "INSERT INTO tasks (id, name, filename, input_path, output_dir,"
+            " status, created_at, meta_json) VALUES ('dl5', '新名', 'l.mp4',"
+            " 'x', ?, 'done', '2026-10-21', ?)",
+            (str(out_dir), json.dumps(
+                {"ai_files": {"feedback": "dl5_z_new.feedback.md"}},
+                ensure_ascii=False)),
+        )
+    r = client.get("/download/dl5/feedback")
+    assert r.status_code == 200
+    assert r.text == "新产物"
+
+
+def test_download_feedback_glob_fallback_without_registration(client, isolated_db):
+    """meta 无登记（半程失败的老任务）→ glob 兜底仍可下载已产出的那份。"""
+    import asr.web as wm
+    out_dir = wm.OUTPUT_ROOT / "dl6"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "dl6_课.feedback.md").write_text("兜底产物", encoding="utf-8")
+    with closing(wm._db()) as conn:
+        conn.execute(
+            "INSERT INTO tasks (id, name, filename, input_path, output_dir,"
+            " status, created_at) VALUES ('dl6', '课', 'l.mp4', 'x', ?,"
+            " 'done', '2026-10-21')",
+            (str(out_dir),),
+        )
+    r = client.get("/download/dl6/feedback")
+    assert r.status_code == 200
+    assert r.text == "兜底产物"

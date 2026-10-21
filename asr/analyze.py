@@ -17,7 +17,9 @@ FILLER_WORDS = (
 # 切句保留句末标点（findall 连标点一起取回）：问句判定是两条互补规则——
 # 带标点问句靠"句尾为 ？"识别，ASR 丢标点的问句靠末字"吗/呢/吧"兜底。
 # 若切句吞掉分隔符（re.split），句尾永远不是"？"，纯"？"问句两条规则都够不着。
-_SENT_RE = re.compile(r"[^。！？!?]*[。！？!?]|[^。！？!?]+$")
+# 句末标点带 +：连写标点（"？？"——FunASR 常见重复输出，见 README FAQ）算
+# 一次句末，不拆成空句导致一个问句重复计数。
+_SENT_RE = re.compile(r"[^。！？!?]*[。！？!?]+|[^。！？!?]+$")
 _Q_TAIL_CHARS = ("吗", "呢", "吧")
 
 
@@ -48,7 +50,7 @@ def _speaker_row(name: str, segs: list[dict], total_dur: float) -> dict:
 
 
 def compute_stats(segments: list[dict]) -> dict:
-    """逐字稿 → 课堂数据事实。输入空/缺键不抛错，出零值。"""
+    """逐字稿 → 课堂数据事实。输入空/缺 text、spk 键不抛错（缺 start/end 仍 KeyError）。"""
     if not segments:
         return {"duration_sec": 0.0, "chars": 0, "speed_cpm": 0.0,
                 "filler_top": [], "questions": {}, "speakers": []}

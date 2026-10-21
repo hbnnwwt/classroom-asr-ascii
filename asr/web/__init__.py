@@ -294,8 +294,17 @@ def download(task_id: str, fmt: str):
 
     out_dir = Path(row["output_dir"])
     if fmt in ("feedback", "polished"):
-        # AI 反馈产物：*.feedback.md / *.polished.md
-        files = list(out_dir.glob(f"*.{fmt}.md"))
+        # AI 产物：meta.ai_files 有登记按名取——改名重跑后目录里新旧两份并存，
+        # glob 顺序不定会下到旧文件；无登记（半程失败的老任务）再 glob 兜底，
+        # 兼容"已产出一份"的可下载性
+        try:
+            meta = json.loads(row["meta_json"] or "{}")
+        except ValueError:
+            meta = {}
+        registered = (meta.get("ai_files") or {}).get(fmt)
+        candidate = out_dir / registered if registered else None
+        files = ([candidate] if candidate and candidate.exists()
+                 else list(out_dir.glob(f"*.{fmt}.md")))
     else:
         # 排除分段文件（{两位序号}_ 前缀）和 AI 产物——md 的 *.md glob 会
         # 同时命中 *.feedback.md，而 files[0] 不保证顺序，不排除就是抢占
@@ -660,13 +669,21 @@ def trigger_ai_feedback(task_id: str, config: str = "config.yaml"):
         raise HTTPException(409, "任务处理中，稍后再试")
     if row["status"] != "done":
         raise HTTPException(409, f"任务未完成: {row['status']}")
-    if not llm_enabled(load_config(config, strict_models=False)):
+    # 配置加载失败与"未配置"同口径 409（llm_status 也是降级为未启用，不打 500）
+    try:
+        cfg = load_config(config, strict_models=False)
+    except ConfigLoadError:
+        cfg = None
+    if cfg is None or not llm_enabled(cfg):
         raise HTTPException(409, "LLM 未配置（config.yaml 缺 llm 节）")
 
-    # 清旧错误 + 标 running，起线程；_run_ai_stage 自己管成功/失败终态
+    # 清旧错误 + 标 running，起线程；_run_ai_stage 自己管成功/失败终态。
+    # progress/ended_at 一并复位：202 后不得残留 done 期的 100% 进度条与
+    # 旧结束时间（前端会渲染成 running+100%+冻结计时的假象）
     meta = _read_meta(task_id)
     meta.pop("ai_error", None)
     _update_task(task_id, status="running", stage="ai", message="AI 反馈",
+                 progress=0, ended_at=None,
                  stage_started_at=datetime.now().isoformat(timespec="seconds"),
                  meta_json=json.dumps(meta, ensure_ascii=False))
     threading.Thread(target=_run_ai_stage, args=(task_id, config),
@@ -959,8 +976,11 @@ def _run_ai_stage(task_id: str, config_path: str) -> None:
         logger.exception(f"[web] 任务 {task_id} AI 反馈失败")
         meta = _read_meta(task_id)
         meta["ai_error"] = f"{type(e).__name__}: {e}"
+        # progress 归 1.0：失败常发生在优化稿一步（55%），done 终态不配
+        # 半程进度条
         _update_task(
-            task_id, status="done", stage="ai", message="AI 反馈失败",
+            task_id, status="done", stage="ai", progress=1.0,
+            message="AI 反馈失败",
             ended_at=datetime.now().isoformat(timespec="seconds"),
             meta_json=json.dumps(meta, ensure_ascii=False),
         )
