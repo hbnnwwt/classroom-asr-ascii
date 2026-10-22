@@ -7,7 +7,8 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+import threading
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -15,8 +16,10 @@ from loguru import logger
 
 from . import srt as writers
 from .config import AppConfig
-from .engines.base import ASREngine
+from .artifacts import artifact_path
+from .engines.base import ASREngine, Segment, TranscriptionOptions
 from .engines.funasr_engine import FunASREngine
+from .engines.spec import EngineLoadSpec, selected_asr_path
 from .media import (
     probe, extract_audio, denoise, make_tmpdir, safe_rmtree, get_wav_duration_s,
     NoAudioStreamError,
@@ -35,61 +38,29 @@ class Result:
     written: dict[str, Path]
     replace_log: list[str]
     segments_count: int
+    segments: list[Segment] = field(default_factory=list)
 
 
-# P1-1 引擎缓存：key = (engine, quality, asr 模型, device, diarize, itn, hotword, batch, workers)
-_ENGINE_CACHE: dict[tuple, ASREngine] = {}
+# 缓存只描述加载依赖。语言等选项随每次 transcribe 传入。
+_ENGINE_CACHE: dict[EngineLoadSpec, ASREngine] = {}
+_ENGINE_CACHE_LOCK = threading.RLock()
 
 
-def _asr_model_path(cfg: AppConfig) -> str:
-    """与 FunASREngine._load_model 的模型选择完全一致的实际加载路径。
-
-    镜像 funasr_engine._load_model 的三分支：fast → SenseVoice
-    （models.funasr.asr）；否则配了 paraformer_model → Paraformer；
-    都没有 → 回退 SenseVoice。不直接复用引擎内逻辑是刻意的：pipeline
-    已模块级 import engines，反向 import 会成环（也倒置分层）；
-    改动任一侧必须同步另一侧（test_asr_model_path_mirrors_engine_selection 钉住）。
-    """
-    quality = getattr(cfg, "_quality_override", "balanced")
-    if quality == "fast":
-        return str(cfg.models.funasr.asr)
-    if cfg.asr.paraformer_model:
-        return str(cfg.asr.paraformer_model)
-    return str(cfg.models.funasr.asr)
+def _asr_model_path(cfg: AppConfig, quality: str = "balanced") -> str:
+    return str(selected_asr_path(cfg, quality))
 
 
-def build_engine(cfg: AppConfig, use_cache: bool = True) -> ASREngine:
-    """
-    按 cfg.engine 创建引擎实例。当前仅支持 funasr。
-
-    P1-1：进程内按 (engine, quality, asr 模型, device, diarize,
-    use_itn, hotword_enabled, batch_size_s, num_workers) 缓存引擎，
-    批量/连续上传不再每个文件重载 2GB 模型。R15：后四项直接影响
-    generate 行为，必须进键——长驻 web 进程改这些配置即时生效，
-    不需重启。FunASREngine 惰性加载（构造函数不碰模型），缓存未
-    加载实例无内存代价；缓存实例的 close() 统一由 close_cached_engines()
-    负责（web lifespan 退出时调用），run() 不 close。多线程并发 build
-    同 key 的良性竞争（后写覆盖）可接受，不加锁。
-    """
-    key = (
-        cfg.engine,
-        getattr(cfg, "_quality_override", "balanced"),
-        _asr_model_path(cfg),
-        cfg.device,
-        cfg.diarize.enabled,
-        cfg.asr.use_itn,
-        cfg.asr.hotword_enabled,
-        cfg.asr.batch_size_s,
-        cfg.num_workers,
-    )
-    if use_cache and key in _ENGINE_CACHE:
-        return _ENGINE_CACHE[key]
+def build_engine(cfg: AppConfig, use_cache: bool = True, *, quality: str = "balanced") -> ASREngine:
+    """同一加载规格只构建一个惰性实例；不保存调用者的可变配置。"""
     if cfg.engine != "funasr":
         raise RuntimeError(f"未知引擎: {cfg.engine}（当前仅支持 funasr）")
-    eng = FunASREngine(cfg)
-    if use_cache:
-        _ENGINE_CACHE[key] = eng
-    return eng
+    spec = EngineLoadSpec.from_config(cfg, quality)
+    if not use_cache:
+        return FunASREngine(cfg, load_spec=spec)
+    with _ENGINE_CACHE_LOCK:
+        if spec not in _ENGINE_CACHE:
+            _ENGINE_CACHE[spec] = FunASREngine(cfg, load_spec=spec)
+        return _ENGINE_CACHE[spec]
 
 
 def close_cached_engines() -> None:
@@ -98,9 +69,10 @@ def close_cached_engines() -> None:
     迭代快照（list()）：关停窗口内后台任务线程可能并发 build 插入新 key，
     直接迭代活 dict 会 RuntimeError: dict changed size during iteration。
     """
-    for eng in list(_ENGINE_CACHE.values()):
-        eng.close()
-    _ENGINE_CACHE.clear()
+    with _ENGINE_CACHE_LOCK:
+        for eng in list(_ENGINE_CACHE.values()):
+            eng.close()
+        _ENGINE_CACHE.clear()
 
 
 def _apply_overrides(cfg: AppConfig, overrides: dict) -> None:
@@ -135,6 +107,7 @@ def run(
       交付该组段落（全片时间轴，结果即最终，不回炉）。Web 层用它增量
       写 transcript，页面在识别过程中就能看到文字。
     """
+    cfg = cfg.model_copy(deep=True)
     overrides = overrides or {}
     _apply_overrides(cfg, overrides)  # device/engine/language 落 cfg；须在 build_engine 前
     input_path = Path(input_path)
@@ -193,9 +166,9 @@ def run(
 
         # 5. 引擎加载 + 转写
         _progress("asr", 0.20, "加载模型并识别")
-        cfg._quality_override = overrides.get("quality", "balanced")  # type: ignore[attr-defined]
+        quality = overrides.get("quality", "balanced")
         cfg.diarize.enabled = overrides.get("diarize", cfg.diarize.enabled)  # type: ignore[attr-defined]
-        engine = build_engine(cfg)
+        engine = build_engine(cfg, quality=quality)
         hotwords: list[str] = []
         glossary_path = overrides.get("glossary", None)
         if glossary_path:
@@ -208,7 +181,7 @@ def run(
             total_ratio = 0.20 + 0.70 * ratio
             _progress("asr", total_ratio, msg)
 
-        segs = engine.transcribe(wav, hotwords=hotwords, on_progress=_asr_progress,
+        segs = engine.transcribe(wav, hotwords=hotwords, options=TranscriptionOptions.from_config(cfg), on_progress=_asr_progress,
                                  on_segments=on_segments)
         elapsed_asr = time.time() - t_asr
         logger.info(f"[pipeline] ASR 完成: {len(segs)} 段, {elapsed_asr:.1f}s")
@@ -243,7 +216,7 @@ def run(
             "file": str(input_path),
             "duration": round(duration_s, 2),
             "engine": cfg.engine,
-            "model": str(cfg.asr.paraformer_model if cfg._quality_override != "fast" else cfg.models.funasr.asr),  # type: ignore[attr-defined]
+            "model": _asr_model_path(cfg, quality),
             "language": cfg.language,
             "elapsed_s": round(elapsed_asr, 2),
             "rtf": round(elapsed_asr / max(duration_s, 1.0), 4),
@@ -253,21 +226,20 @@ def run(
 
         # 8. replace.log（有替换才写，便于人工核查；前端按 meta.formats 显隐按钮）
         if replace_log:
-            log_path = base.with_suffix(".replace.log")
+            log_path = artifact_path(base, ".replace.log")
             log_path.write_text("\n".join(replace_log) + "\n", encoding="utf-8")
             written["replace_log"] = log_path
 
         # 9. keep_wav 时保留中间 wav
         keep_wav = overrides.get("keep_wav", cfg.media.keep_wav)
         if keep_wav and wav and wav.exists():
-            wav_dst = output_dir / "_wav" / wav.name
+            wav_dst = output_dir / "_wav" / (stem + ".wav")
             ensure_dir(wav_dst.parent)
             import shutil
             shutil.copy2(wav, wav_dst)
 
     finally:
-        if not (overrides.get("keep_wav", cfg.media.keep_wav)):
-            safe_rmtree(tmpdir)
+        safe_rmtree(tmpdir)
 
     elapsed_total = time.time() - t_total
     rtf = elapsed_total / max(info.duration_s, 1.0)
@@ -282,4 +254,5 @@ def run(
         written=written,
         replace_log=replace_log,
         segments_count=len(segs),
+        segments=segs,
     )

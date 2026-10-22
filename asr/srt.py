@@ -18,6 +18,7 @@ from typing import List
 from loguru import logger
 
 from .config import OutputConfig
+from .artifacts import artifact_path
 from .engines.base import Segment
 from .utils import ensure_dir
 
@@ -221,23 +222,23 @@ def write_all(
     ensure_dir(base_path.parent)
     written: dict[str, Path] = {}
     if "srt" in cfg.formats:
-        p = base_path.with_suffix(".srt")
+        p = artifact_path(base_path, ".srt")
         write_srt(segments, p, cfg)
         written["srt"] = p
     if "vtt" in cfg.formats:
-        p = base_path.with_suffix(".vtt")
+        p = artifact_path(base_path, ".vtt")
         write_vtt(segments, p, cfg)
         written["vtt"] = p
     if "txt" in cfg.formats:
-        p = base_path.with_suffix(".txt")
+        p = artifact_path(base_path, ".txt")
         write_txt(segments, p, with_ts=False)
         written["txt"] = p
     if "md" in cfg.formats:
-        p = base_path.with_suffix(".md")
+        p = artifact_path(base_path, ".md")
         write_md(segments, p, with_speaker=any(s.spk for s in segments))
         written["md"] = p
     if "json" in cfg.formats:
-        p = base_path.with_suffix(".json")
+        p = artifact_path(base_path, ".json")
         write_json(segments, p, meta=meta, replace_log=replace_log)
         written["json"] = p
     return written

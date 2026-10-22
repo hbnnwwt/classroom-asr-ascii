@@ -19,12 +19,15 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import hashlib
+import threading
 from pathlib import Path
 from typing import List, Optional, Callable
 
 from loguru import logger
 
-from .base import ASREngine, Segment
+from .base import ASREngine, Segment, TranscriptionOptions
+from .spec import EngineLoadSpec
 from ..config import AppConfig
 
 
@@ -33,9 +36,10 @@ class FunASREngine(ASREngine):
 
     name = "funasr"
 
-    def __init__(self, cfg: AppConfig):
-        super().__init__(cfg)
-        self.cfg = cfg
+    def __init__(self, cfg: AppConfig, *, load_spec: EngineLoadSpec | None = None):
+        self.load_spec = load_spec or EngineLoadSpec.from_config(cfg)
+        self.default_options = TranscriptionOptions.from_config(cfg)
+        self._inference_lock = threading.RLock()
         # 延迟加载：模型在首次 transcribe 时才 import AutoModel，
         # 这样 FunASR 未装时仍能跑 asr check / asr run --engine whisper(已禁用)
         self._model = None
@@ -50,8 +54,7 @@ class FunASREngine(ASREngine):
     # 模型加载
     # ------------------------------------------------------------------
     def _load_model(self):
-        """加载模型（幂等）。返回 self._model——transcribe 用本地引用调用
-        generate，避免关停线程并发置空 self._model 时的 NoneType 崩溃。"""
+        """加载模型（惰性）；完整转写和释放共用实例锁。"""
         if self._loaded:
             return self._model
         try:
@@ -71,24 +74,13 @@ class FunASREngine(ASREngine):
         #
         # 重要：SenseVoice 是端到端模型，不输出时间戳。如需时间戳，必须用 Paraformer。
         # 因此默认 quality=balanced，让"教师单讲"场景拿到的结果可直接做字幕。
-        quality = getattr(self.cfg, "_quality_override", "balanced")
-        if quality == "fast":
-            asr_path = str(self.cfg.models.funasr.asr)
-            logger.info(f"FunASR fast 模式 → SenseVoice（无时间戳输出）: {asr_path}")
-        elif self.cfg.asr.paraformer_model:
-            asr_path = str(self.cfg.asr.paraformer_model)
-            logger.info(f"FunASR {quality} 模式 → Paraformer-Large: {asr_path}")
-        else:
-            asr_path = str(self.cfg.models.funasr.asr)
-            logger.warning(
-                "paraformer_model 路径未配置，回退到 SenseVoice（无时间戳）"
-            )
+        asr_path = str(self.load_spec.asr)
 
         # 路径校验（再确认一次，启动时已校验，这里兜底）
         for name, p in [
             ("asr", asr_path),
-            ("vad", str(self.cfg.models.funasr.vad)),
-            ("punc", str(self.cfg.models.funasr.punc)),
+            ("vad", str(self.load_spec.vad)),
+            ("punc", str(self.load_spec.punc)),
         ]:
             if not Path(p).exists():
                 raise FileNotFoundError(
@@ -101,13 +93,13 @@ class FunASREngine(ASREngine):
         # GBK 编码炸裂（典型表现：file exists 但报 "No such file"）。
         # 解法：把所有模型路径里的非 ASCII 段重定向到 tmp_models/ 的副本/链接。
         asr_path = self._ensure_ascii_path(asr_path, "asr")
-        vad_path = self._ensure_ascii_path(str(self.cfg.models.funasr.vad), "vad")
+        vad_path = self._ensure_ascii_path(str(self.load_spec.vad), "vad")
 
         # 离线锁：阻止 FunASR 启动时尝试联网
         import os
         os.environ["MODELSCOPE_OFFLINE"] = "1"
 
-        spk_model = str(self.cfg.models.funasr.spk) if self.cfg.diarize.enabled else None
+        spk_model = str(self.load_spec.spk) if self.load_spec.spk else None
         if spk_model:
             spk_model = self._ensure_ascii_path(spk_model, "spk")
 
@@ -119,9 +111,9 @@ class FunASREngine(ASREngine):
             vad_model=vad_path,
             punc_model=None,
             spk_model=spk_model,
-            device=self.cfg.device,
+            device=self.load_spec.device,
             disable_update=True,
-            ncpu=max(1, self.cfg.num_workers),
+            ncpu=self.load_spec.num_workers,
         )
         self._loaded = True
         logger.info("FunASR 模型加载完成（asr+vad，punc 独立）")
@@ -137,14 +129,14 @@ class FunASREngine(ASREngine):
         import os
         os.environ["MODELSCOPE_OFFLINE"] = "1"
 
-        vad_path = self._ensure_ascii_path(str(self.cfg.models.funasr.vad), "vad")
+        vad_path = self._ensure_ascii_path(str(self.load_spec.vad), "vad")
         if not Path(vad_path).exists():
             raise FileNotFoundError(f"VAD 模型路径不存在: {vad_path}")
         self._vad_model = AutoModel(
             model=vad_path,
-            device=self.cfg.device,
+            device=self.load_spec.device,
             disable_update=True,
-            ncpu=max(1, self.cfg.num_workers),
+            ncpu=self.load_spec.num_workers,
         )
         self._vad_loaded = True
         logger.info("独立 VAD 模型加载完成")
@@ -159,12 +151,12 @@ class FunASREngine(ASREngine):
         import os
         os.environ["MODELSCOPE_OFFLINE"] = "1"
 
-        punc_path = self._ensure_ascii_path(str(self.cfg.models.funasr.punc), "punc")
+        punc_path = self._ensure_ascii_path(str(self.load_spec.punc), "punc")
         if not Path(punc_path).exists():
             raise FileNotFoundError(f"punc 模型路径不存在: {punc_path}")
         self._punc_model = AutoModel(
             model=punc_path,
-            device=self.cfg.device,
+            device=self.load_spec.device,
             disable_update=True,
         )
         self._punc_loaded = True
@@ -176,7 +168,7 @@ class FunASREngine(ASREngine):
         """
         Windows 下 sentencepiece 不支持中文路径。
         检测到非 ASCII 时，把整个模型目录用 junction（Windows 目录链接）
-        指向仓库根的 tmp_models/<alias>/，返回新路径。
+        指向 tmp_models/<alias>-<路径摘要>/，返回新路径。
         junction 不占磁盘空间，对 FunASR 透明。
         """
         p_obj = Path(p).resolve()
@@ -189,7 +181,8 @@ class FunASREngine(ASREngine):
         # 非 ASCII：创建 junction
         import os
         tmp_root = Path("tmp_models")
-        tmp_dst = (tmp_root / alias).resolve()
+        digest = hashlib.sha256(str(p_obj).casefold().encode("utf-8")).hexdigest()[:16]
+        tmp_dst = (tmp_root / f"{alias}-{digest}").absolute()
         if not tmp_dst.exists():
             tmp_root.mkdir(parents=True, exist_ok=True)
             logger.warning(
@@ -246,9 +239,16 @@ class FunASREngine(ASREngine):
         self,
         wav: Path,
         hotwords: Optional[List[str]] = None,
+        *,
+        options: TranscriptionOptions | None = None,
         on_progress: Optional["Callable[[float, str], None]"] = None,
         on_segments: Optional["Callable[[List[Segment]], None]"] = None,
     ) -> List[Segment]:
+        with self._inference_lock:
+            return self._transcribe(wav, hotwords, options or self.default_options,
+                                    on_progress, on_segments)
+
+    def _transcribe(self, wav, hotwords, options, on_progress, on_segments):
         """
         转写一个 wav 文件。统一走 VAD 预切路径（见类常量注释）；
         预切机械性失败（非 PCM wave / VAD 模型异常）时降落伞退回整文件
@@ -269,12 +269,12 @@ class FunASREngine(ASREngine):
 
         try:
             return self._transcribe_vad_sliced(
-                wav, duration_total, hotwords, on_progress, on_segments)
+                wav, duration_total, hotwords, on_progress, on_segments, options=options)
         except Exception as e:  # noqa: BLE001 降落伞：任何预切失败都不让任务归零
             logger.error(
                 f"VAD 预切路径失败（{type(e).__name__}: {e}），退回整文件转写: {wav}"
             )
-            return self._transcribe_whole(wav, duration_total, hotwords, on_progress)
+            return self._transcribe_whole(wav, duration_total, hotwords, on_progress, options=options)
 
     def _transcribe_vad_sliced(
         self,
@@ -283,6 +283,7 @@ class FunASREngine(ASREngine):
         hotwords: Optional[List[str]],
         on_progress: Optional["Callable[[float, str], None]"],
         on_segments: Optional["Callable[[List[Segment]], None]"] = None,
+        *, options: TranscriptionOptions | None = None,
     ) -> List[Segment]:
         """VAD 预切主路径：独立 VAD 全文检测 → 分组切片 → 逐片转写 → 偏移拼接。"""
         import wave
@@ -330,7 +331,7 @@ class FunASREngine(ASREngine):
                     )
 
             try:
-                res = self._generate_slice(part_path, b - a, hotwords, _cb)
+                res = self._generate_slice(part_path, b - a, hotwords, _cb, options=options)
             finally:
                 part_path.unlink(missing_ok=True)
 
@@ -366,11 +367,12 @@ class FunASREngine(ASREngine):
         duration_total: float,
         hotwords: Optional[List[str]],
         on_progress: Optional["Callable[[float, str], None]"],
+        *, options: TranscriptionOptions | None = None,
     ) -> List[Segment]:
         """降落伞路径：整文件单次 generate + 文本层 punc。
         会经过 funasr 的长音频合并路径（有已知缺陷，见类常量注释），
         仅在 VAD 预切机械性失败时保底使用。"""
-        results = self._generate_slice(wav, duration_total, hotwords, on_progress)
+        results = self._generate_slice(wav, duration_total, hotwords, on_progress, options=options)
         for item in results or []:
             t = _as_text(item.get("text"))
             if t:
@@ -383,6 +385,7 @@ class FunASREngine(ASREngine):
         duration_s: float,
         hotwords: Optional[List[str]],
         on_progress: Optional["Callable[[float, str], None]"],
+        *, options: TranscriptionOptions | None = None,
     ):
         """
         对一个 wav（切片或整文件）跑 asr 栈 generate（栈内无 punc），
@@ -390,15 +393,15 @@ class FunASREngine(ASREngine):
         on_progress(ratio: 0~1, msg: str)：FunASR 每处理完一个 batch 触发一次，
         用于 UI 显示"已识别 X%"。回调失败不影响主流程。
         """
-        # 本地绑定：关停线程可能在我们拿到模型后并发置空 self._model，
-        # 后续 generate（含 TypeError 重试）都用这个本地引用，无锁。
+        # transcribe 持有实例锁直到推理、标点与回调全部完成。
         model = self._load_model()
         wav = Path(wav)
         if not wav.exists():
             raise FileNotFoundError(f"输入 wav 不存在: {wav}")
 
         # 准备 hotword 字符串（FunASR 1.1+ 已移除此参数，下面会捕获并降级）
-        hotword_str = " ".join(hotwords) if (hotwords and self.cfg.asr.hotword_enabled) else None
+        options = options or self.default_options
+        hotword_str = " ".join(hotwords) if (hotwords and options.hotword_enabled) else None
 
         # FunASR progress_callback(end_idx, num_samples)：VAD 段级进度（不是秒）。
         # monotonic clamp + 上限 0.95（留 5% 给收尾）。msg 会被上层包装成全片口径。
@@ -421,10 +424,10 @@ class FunASREngine(ASREngine):
 
         kwargs = dict(
             input=str(wav),
-            batch_size_s=self.cfg.asr.batch_size_s,
-            language=self.cfg.language,  # R14：--language 真实生效（默认 zh 不变）
-            use_itn=self.cfg.asr.use_itn,
-            return_spk_res=self.cfg.diarize.enabled,
+            batch_size_s=options.batch_size_s,
+            language=options.language,
+            use_itn=options.use_itn,
+            return_spk_res=options.speaker_output,
         )
         if hotword_str and self._hotword_supported:
             kwargs["hotword"] = hotword_str
@@ -548,12 +551,13 @@ class FunASREngine(ASREngine):
         return segments
 
     def close(self) -> None:
-        self._model = None
-        self._loaded = False
-        self._vad_model = None
-        self._vad_loaded = False
-        self._punc_model = None
-        self._punc_loaded = False
+        with self._inference_lock:
+            self._model = None
+            self._loaded = False
+            self._vad_model = None
+            self._vad_loaded = False
+            self._punc_model = None
+            self._punc_loaded = False
 
 
 # ---------------------------------------------------------------------------
@@ -666,6 +670,7 @@ def _split_by_char_ts(text: str, ts: list, duration_s: float | None) -> List[Seg
                 buf.append(ch)
                 out.append(Segment(start=t0 / div, end=t1 / div, text="".join(buf)))
                 buf, t0 = [], None
+                t1 = prev_t1 = cut = cut_end_t = next_t0 = None
             else:
                 buf.append(ch)   # R16：无时间锚的孤立标点并入待收尾处置，不崩不丢
             continue

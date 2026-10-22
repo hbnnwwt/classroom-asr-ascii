@@ -42,9 +42,14 @@ def render_markdown(text: str) -> str:
     out: list[str] = []
     i, n = 0, len(lines)
 
-    def _is_block_start(s: str) -> bool:
+    def _is_table_start(index: int) -> bool:
+        return (lines[index].lstrip().startswith("|") and index + 1 < n
+                and bool(_TABLE_SEP.match(lines[index + 1])))
+
+    def _is_block_start(index: int) -> bool:
+        s = lines[index]
         return bool(_H.match(s) or _UL.match(s) or _OL.match(s)
-                    or s.lstrip().startswith("|"))
+                    or _is_table_start(index))
 
     while i < n:
         ln = lines[i]
@@ -60,7 +65,7 @@ def render_markdown(text: str) -> str:
             continue
 
         # 表格：| 开头且下一行是 |---| 分隔行
-        if ln.lstrip().startswith("|") and i + 1 < n and _TABLE_SEP.match(lines[i + 1]):
+        if _is_table_start(i):
             out.append("<table><thead><tr>"
                        + "".join(f"<th>{_inline(c)}</th>" for c in _cells(ln))
                        + "</tr></thead><tbody>")
@@ -94,7 +99,7 @@ def render_markdown(text: str) -> str:
 
         # 段落：吃到下一个块级标记或空行为止
         para = []
-        while i < n and lines[i].strip() and not _is_block_start(lines[i]):
+        while i < n and lines[i].strip() and not _is_block_start(i):
             para.append(lines[i].strip())
             i += 1
         out.append(f"<p>{_inline(' '.join(para))}</p>")

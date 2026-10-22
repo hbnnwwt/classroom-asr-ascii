@@ -10,7 +10,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 
 @dataclass
@@ -27,6 +27,20 @@ class Segment:
         return max(0.0, self.end - self.start)
 
 
+@dataclass(frozen=True)
+class TranscriptionOptions:
+    language: str = "zh"
+    use_itn: bool = True
+    hotword_enabled: bool = True
+    batch_size_s: int = 300
+    speaker_output: bool = False
+
+    @classmethod
+    def from_config(cls, cfg) -> "TranscriptionOptions":
+        return cls(cfg.language, cfg.asr.use_itn, cfg.asr.hotword_enabled,
+                   cfg.asr.batch_size_s, cfg.diarize.enabled)
+
+
 class ASREngine(ABC):
     """ASR 引擎统一接口"""
 
@@ -36,7 +50,10 @@ class ASREngine(ABC):
         self.cfg = cfg
 
     @abstractmethod
-    def transcribe(self, wav: Path, hotwords: List[str] | None = None) -> List[Segment]:
+    def transcribe(self, wav: Path, hotwords: List[str] | None = None, *,
+                   options: TranscriptionOptions | None = None,
+                   on_progress: Callable[[float, str], None] | None = None,
+                   on_segments: Callable[[List[Segment]], None] | None = None) -> List[Segment]:
         """
         转写一个 wav 文件为带时间戳的段列表。
         - wav: 16kHz 单声道 PCM WAV

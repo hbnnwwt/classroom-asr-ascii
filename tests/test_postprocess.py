@@ -1,9 +1,6 @@
 """postprocess 单测。"""
-from pathlib import Path
-
 import pytest
 
-from asr.config import load_config
 from asr.engines.base import Segment
 from asr.postprocess import (
     apply_itn, load_glossary, apply_glossary, validate_timestamps,
@@ -11,8 +8,11 @@ from asr.postprocess import (
 
 
 @pytest.fixture
-def cfg():
-    return load_config("config.yaml", strict_models=False)
+def cfg(template_config):
+    """只保留本测试要验证的处理项。"""
+    template_config.postprocess.itn = False
+    template_config.postprocess.glossary = ""
+    return template_config
 
 
 # ---------------------------------------------------------------------------
@@ -93,7 +93,7 @@ def test_apply_glossary_no_match_unchanged():
 # ---------------------------------------------------------------------------
 # 断句合并已删除（回归守卫）
 # ---------------------------------------------------------------------------
-def test_apply_does_not_merge_across_silence():
+def test_apply_does_not_merge_across_silence(cfg):
     """断句合并删除回归：短语气词跨大静音（嗯@24 / 想不想@40 / 嗯嗯@52）
     必须保持 3 段独立——旧 merge_short_sentences 不看时间间隙，真机把它们
     合并成一条 29.6s 钉屏字幕。"""
@@ -103,33 +103,24 @@ def test_apply_does_not_merge_across_silence():
         Segment(start=40.23, end=40.88, text="想不想"),
         Segment(start=52.30, end=53.86, text="嗯嗯"),
     ]
-    out, _ = apply_postprocess(segs, _test_cfg(), duration_s=60.0)
+    out, _ = apply_postprocess(segs, cfg, duration_s=60.0)
     assert len(out) == 3
     assert [s.text for s in out] == ["嗯", "想不想", "嗯嗯"]
     assert abs(out[0].end - 24.70) < 0.01   # 时间戳原样，不被插值拉伸
 
-
-def _test_cfg():
-    """测试用最小 postprocess 配置（复用本文件既有 cfg 构造方式）。"""
-    cfg = load_config("config.yaml", strict_models=False)
-    cfg.postprocess.itn = False
-    cfg.postprocess.glossary = ""  # 不读术语表，测试与仓库数据解耦
-    return cfg
-
-
-def test_pipeline_diarize_guard_passes():
+def test_pipeline_diarize_guard_passes(cfg):
     """pipeline.py:147 守卫 any(s.spk ...) 在 postprocess 之后仍为 True。"""
     from asr.postprocess import apply as apply_postprocess
     segs = [Segment(start=0.0, end=2.0, text="好。", spk="spk0")]
-    out, _ = apply_postprocess(segs, _test_cfg(), duration_s=10.0)
+    out, _ = apply_postprocess(segs, cfg, duration_s=10.0)
     assert any(s.spk for s in out)
 
 
-def test_newline_sanitized_in_apply():
+def test_newline_sanitized_in_apply(cfg):
     """P1-12：段内换行写入 SRT 破坏块结构，入口统一清洗。"""
     from asr.postprocess import apply as apply_postprocess
     segs = [Segment(start=0.0, end=1.0, text="第一行\n第二行\r\n第三行")]
-    out, _ = apply_postprocess(segs, _test_cfg(), duration_s=10.0)
+    out, _ = apply_postprocess(segs, cfg, duration_s=10.0)
     assert "\n" not in out[0].text
     assert "\r" not in out[0].text
     assert "第一行 第二行" in out[0].text

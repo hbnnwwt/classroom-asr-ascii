@@ -42,6 +42,13 @@ def batch_run(
     - 单文件失败 → 写 out/_failed/<name>.log，继续处理其他文件
     """
     overrides = overrides or {}
+    by_stem: dict[str, list[Path]] = {}
+    for path in inputs:
+        by_stem.setdefault(Path(path).stem.casefold(), []).append(Path(path))
+    collisions = [paths for paths in by_stem.values() if len(paths) > 1]
+    if collisions:
+        names = "; ".join(", ".join(str(path) for path in paths) for paths in collisions)
+        raise ValueError(f"输出文件名冲突，请先重命名输入文件: {names}")
     if cfg.device.startswith("cuda") and workers > 1:
         logger.warning(f"GPU 模式下强制 workers=1（请求 {workers}）")
         workers = 1
@@ -54,8 +61,7 @@ def batch_run(
 
     def _one(p: Path) -> tuple[Path, str | None]:
         try:
-            # P1-2：pipeline.run 会原位改 cfg（_quality_override / diarize.enabled /
-            # output.formats）。线程池共享一个 cfg 时任务互相踩，每任务深拷贝隔离。
+            # 每个任务独立快照，替换管线或添加批处理扩展时也不共享可变状态。
             r = pipeline_run(p, copy.deepcopy(cfg), overrides)
             return p, None
         except Exception as e:

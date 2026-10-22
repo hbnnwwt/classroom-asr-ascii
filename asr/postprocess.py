@@ -25,36 +25,18 @@ _CN_DIGIT = {"零": "0", "〇": "0", "一": "1", "二": "2", "三": "3", "四": 
              "五": "5", "六": "6", "七": "7", "八": "8", "九": "9"}
 _YEAR_CN_RE = re.compile(r"([零〇一二三四五六七八九]{4})年")
 # 百分号读法："百分之三十" → "30%"
-_PERCENT_CN_RE = re.compile(r"百分之([零〇一二三四五六七八九十百]+)")
+_PERCENT_CN_RE = re.compile(r"百分之([正负+\-零〇一二两三四五六七八九十百千万亿点\d.]+)")
 
 
 def _cn_num_to_int(s: str) -> int | None:
     """中文数字串转 int。支持 0-99 范围（零到九十九）。"""
     digit_map = {"零": 0, "〇": 0, "一": 1, "二": 2, "三": 3, "四": 4,
                  "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
-    if not s:
-        return None
-    # 含"十"处理
-    if "十" in s:
-        parts = s.split("十", 1)
-        tens = parts[0]
-        ones = parts[1] if len(parts) > 1 else ""
-        t = digit_map.get(tens, 1) if tens else 1   # "十" 或 "一十" → 10
-        o = digit_map.get(ones, 0) if ones else 0
-        return t * 10 + o
-    # 含"百"（简化：只支持 X百 形式，不支持 X百Y十Z）
-    if "百" in s:
-        parts = s.split("百", 1)
-        hundreds = digit_map.get(parts[0], 1) if parts[0] else 1
-        rest = parts[1] if len(parts) > 1 else ""
-        r = _cn_num_to_int(rest) if rest else 0
-        return hundreds * 100 + (r or 0)
-    # 纯数字
-    if all(c in digit_map for c in s):
-        try:
-            return int("".join(str(digit_map[c]) for c in s))
-        except Exception:
-            return None
+    if s in digit_map:
+        return digit_map[s]
+    if re.fullmatch(r"[一二三四五六七八九]?十[一二三四五六七八九]?", s):
+        tens, ones = s.split("十")
+        return (digit_map[tens] if tens else 1) * 10 + (digit_map[ones] if ones else 0)
     return None
 
 

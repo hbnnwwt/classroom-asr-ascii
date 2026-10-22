@@ -3,15 +3,14 @@ from pathlib import Path
 
 import pytest
 
-from asr.config import load_config
 from asr.engines.funasr_engine import FunASREngine
 from asr.engines.base import Segment
 
 
 @pytest.fixture
-def cfg():
-    """strict_models=False 避免测试时强校验模型路径。"""
-    return load_config("config.yaml", strict_models=False)
+def cfg(template_config):
+    """只用本次测试的出厂配置，不接触个人配置。"""
+    return template_config
 
 
 def test_engine_class_name():
@@ -144,13 +143,10 @@ class TestParseResultsTextList:
     """funasr 1.4.16 开 spk 后 sentence_info 的 text 可能是 list
     （timestamp_tools.py:155 的空 punc_id_list 分支）。回归：任务 b5a3f6c7a552。"""
 
-    def _engine(self):
-        from asr.config import load_config
-        from asr.engines.funasr_engine import FunASREngine
-        cfg = load_config(Path(__file__).parent.parent / "config.yaml", strict_models=False)
+    def _engine(self, cfg):
         return FunASREngine(cfg)
 
-    def test_sentence_info_text_list_normalized(self):
+    def test_sentence_info_text_list_normalized(self, cfg):
         results = [{
             "key": "x",
             "sentence_info": [
@@ -158,13 +154,13 @@ class TestParseResultsTextList:
                 {"start": 1600, "end": 3000, "text": "今天上课。", "spk": 1},
             ],
         }]
-        segs = self._engine()._parse_results(results)
+        segs = self._engine(cfg)._parse_results(results)
         assert segs[0].text == "你好"
         assert segs[1].text == "今天上课。"
 
-    def test_top_level_text_list_normalized(self):
+    def test_top_level_text_list_normalized(self, cfg):
         results = [{"key": "x", "text": ["大", "家", "好"], "timestamp": [[100, 200]]}]
-        segs = self._engine()._parse_results(results)
+        segs = self._engine(cfg)._parse_results(results)
         assert len(segs) == 1
         assert segs[0].text == "大家好"
 
@@ -200,17 +196,15 @@ class TestEngineCache:
 
     def test_different_quality_is_different_key(self, cfg):
         from asr.pipeline import build_engine
-        cfg_fast = load_config("config.yaml", strict_models=False)
-        cfg_fast._quality_override = "fast"
-        assert build_engine(cfg) is not build_engine(cfg_fast)
+        cfg_fast = cfg.model_copy(deep=True)
+        assert build_engine(cfg) is not build_engine(cfg_fast, quality="fast")
 
-    def test_different_use_itn_is_different_key(self, cfg):
-        """R15：use_itn/hotword_enabled/batch_size_s/num_workers 影响 generate
-        行为，必须进缓存键——长驻 web 进程改这些配置不需重启即生效。"""
+    def test_different_use_itn_reuses_loaded_models(self, cfg):
+        """推理选项随调用传入，不需要加载第二份相同模型。"""
         from asr.pipeline import build_engine
-        cfg2 = load_config("config.yaml", strict_models=False)
+        cfg2 = cfg.model_copy(deep=True)
         cfg2.asr.use_itn = not cfg.asr.use_itn
-        assert build_engine(cfg) is not build_engine(cfg2)
+        assert build_engine(cfg) is build_engine(cfg2)
 
     def test_asr_model_path_mirrors_engine_selection(self, cfg):
         """R15：_asr_model_path 必须镜像 FunASREngine._load_model 的路径选择
@@ -220,11 +214,10 @@ class TestEngineCache:
         # balanced + paraformer_model 已配置 → paraformer（与旧键元素一致）
         assert _asr_model_path(cfg) == str(cfg.asr.paraformer_model)
         # fast → 无视 paraformer，直接 SenseVoice（旧键会错记 paraformer 路径）
-        cfg_fast = load_config("config.yaml", strict_models=False)
-        cfg_fast._quality_override = "fast"
-        assert _asr_model_path(cfg_fast) == str(cfg_fast.models.funasr.asr)
+        cfg_fast = cfg.model_copy(deep=True)
+        assert _asr_model_path(cfg_fast, "fast") == str(cfg_fast.models.funasr.asr)
         # 非 fast 且 paraformer 未配置 → 回退 SenseVoice
-        cfg_nop = load_config("config.yaml", strict_models=False)
+        cfg_nop = cfg.model_copy(deep=True)
         cfg_nop.asr.paraformer_model = None
         assert _asr_model_path(cfg_nop) == str(cfg_nop.models.funasr.asr)
 
@@ -315,11 +308,13 @@ class TestEnsureAsciiPathJunction:
 
         monkeypatch.chdir(tmp_path)     # tmp_root "tmp_models" 相对 CWD
         src = self._nonascii_src(tmp_path)
-        dst = (tmp_path / "tmp_models" / "asr").resolve()
+        destinations = []
 
         def fake_run(args, **kwargs):
             # 模拟并发赢家在本线程 mklink 执行期间建好了目录：
             # rc=1（already exists），但 dst 事实上已可用
+            dst = Path(args[4])
+            destinations.append(dst)
             dst.mkdir(parents=True, exist_ok=True)
             return SimpleNamespace(
                 returncode=1,
@@ -330,7 +325,9 @@ class TestEnsureAsciiPathJunction:
         with patch.object(fem.subprocess, "run", fake_run):
             out = fem.FunASREngine._ensure_ascii_path(str(src), "asr")
 
+        dst = destinations[0]
         assert Path(out) == dst
+        assert dst.name.startswith("asr-")
         assert not (dst / "m.bin").exists()  # 没有 copytree（赢家目录无源文件）
 
     def test_real_failure_falls_back_to_copytree(self, monkeypatch, tmp_path):
@@ -348,18 +345,16 @@ class TestEnsureAsciiPathJunction:
         with patch.object(fem.subprocess, "run", fake_run):
             out = fem.FunASREngine._ensure_ascii_path(str(src), "asr")
 
-        dst = (tmp_path / "tmp_models" / "asr").resolve()
-        assert Path(out) == dst
+        dst = Path(out)
+        assert dst.parent == tmp_path / "tmp_models"
+        assert dst.name.startswith("asr-")
         assert (dst / "m.bin").read_text(encoding="utf-8") == "x"  # 兜底复制发生
 
 
 class TestCharLevelTimestamps:
     """P0-1：timestamp 与字符逐一对齐，按强标点切段，时间戳真实（非插值）。"""
 
-    def _engine(self):
-        from asr.config import load_config
-        from asr.engines.funasr_engine import FunASREngine
-        cfg = load_config(Path(__file__).parent.parent / "config.yaml", strict_models=False)
+    def _engine(self, cfg):
         return FunASREngine(cfg)
 
     def test_split_by_char_ts_basic(self):
@@ -389,13 +384,13 @@ class TestCharLevelTimestamps:
         from asr.engines.funasr_engine import _detect_unit_div
         assert _detect_unit_div([[0.5, 1.0], [50.0, 56.0]], 5628.0) == 1.0
 
-    def test_parse_results_full_pipeline_shape(self):
+    def test_parse_results_full_pipeline_shape(self, cfg):
         # 5 分钟实测形状：单 dict、text str、517 token。合成小样本。
         text = "好。那么我们今天呢，开始正式的上课。好各位同学"
         n_chars = len([c for c in text if c not in "，。；？！"])
         ts = [[500 + i * 100, 580 + i * 100] for i in range(n_chars)]
         results = [{"key": "k", "text": text, "timestamp": ts}]
-        segs = self._engine()._parse_results(results, duration_s=60.0)
+        segs = self._engine(cfg)._parse_results(results, duration_s=60.0)
         assert len(segs) == 3                       # 两个句号 → 3 段
         # review 回归断言：段间必须有真实间隙
         gaps = [segs[i + 1].start - segs[i].end for i in range(len(segs) - 1)]
@@ -403,13 +398,13 @@ class TestCharLevelTimestamps:
         rates = [(s.end - s.start) / len(s.text) for s in segs]
         assert max(rates) - min(rates) > 1e-6       # s/字 不再恒定（插值特征）
 
-    def test_mismatch_short_ts_tail_merges_no_gate(self):
+    def test_mismatch_short_ts_tail_merges_no_gate(self, cfg):
         """门禁删除回归：ts 少于字符不再退回单段——按序对齐，耗尽后的
         残余字符并入末段（守恒不丢字）。真机证据：213 ts/223 字的切片
         曾被钉成一条 35.7s 字幕。"""
         text = "大家好大家好大家好。再见再见"      # 13 锚定字符，ts 只有 11
         ts = [[i * 100, i * 100 + 80] for i in range(11)]
-        segs = self._engine()._parse_results(
+        segs = self._engine(cfg)._parse_results(
             [{"key": "k", "text": text, "timestamp": ts}], duration_s=0.5)
         assert len(segs) == 2
         assert segs[0].text == "大家好大家好大家好。"   # 9 字全锚定
@@ -417,9 +412,9 @@ class TestCharLevelTimestamps:
         assert segs[1].text == "再见再见"
         assert sum(len(s.text) for s in segs) == len(text)
 
-    def test_no_timestamp_spans_duration(self):
+    def test_no_timestamp_spans_duration(self, cfg):
         # fast 模式（SenseVoice）无 timestamp：占满 [0, duration]（P0-4 前半）
-        segs = self._engine()._parse_results(
+        segs = self._engine(cfg)._parse_results(
             [{"key": "k", "text": "大家好", "timestamp": []}], duration_s=100.0)
         assert segs[0].start == 0.0 and segs[0].end == 100.0
 
@@ -444,13 +439,13 @@ class TestCharLevelTimestamps:
         assert segs[0].text == "大家好，今天上课。"
         assert segs[1].text == "再见"
 
-    def test_parse_results_soft_punct_conserved(self):
+    def test_parse_results_soft_punct_conserved(self, cfg):
         """R13 全链路守恒：输入文本 N 个软标点 → 输出各段软标点总数 == N。"""
         from asr.engines.funasr_engine import _NO_TS_CHARS, _HARD_PUNCT
         text = "大家好，今天：上课（开始）。再见、同学们"
         n = sum(1 for c in text if c not in _NO_TS_CHARS and c not in _HARD_PUNCT)
         ts = [[500 + i * 300, 700 + i * 300] for i in range(n)]
-        segs = self._engine()._parse_results(
+        segs = self._engine(cfg)._parse_results(
             [{"key": "k", "text": text, "timestamp": ts}], duration_s=3.0)
         soft = set(_NO_TS_CHARS) - set("\n\r\t ")   # 只统计可见软标点
         n_in = sum(1 for c in text if c in soft)
@@ -487,7 +482,7 @@ class TestCharLevelTimestamps:
         assert segs == []
         assert all(s.text.strip() for s in segs)    # 不产空文本段
 
-    def test_mismatch_within_relative_tolerance_splits(self):
+    def test_mismatch_within_relative_tolerance_splits(self, cfg):
         """长音频回归（94 分钟无分段根因之二）：真实课堂语音的 ts 数与
         字符数存在 ~2%+ 固有差（口吃重复/BPE 合并两字一 ts）。门禁已删，
         任意失配都正常切段——失配的代价只是锚点漂移，不切的代价是整片
@@ -497,7 +492,7 @@ class TestCharLevelTimestamps:
         text = "。".join([unit] * 50) + "。"
         n_text = 50 * 20
         ts = [[i * 100, i * 100 + 80] for i in range(n_text - 26)]  # 差 26（2.6%）
-        segs = self._engine()._parse_results(
+        segs = self._engine(cfg)._parse_results(
             [{"key": "k", "text": text, "timestamp": ts}], duration_s=120.0)
         assert len(segs) == 49                       # 正常切段，不退回单段
         # （49 而非 50：ts 在 974 处耗尽，最后一个 unit 无时间锚，
@@ -539,10 +534,7 @@ class TestVadSlicedTranscribe:
     全部不加载真模型：VAD/punc/asr 均注入假对象；wav 用 stdlib wave 造静音。
     """
 
-    def _engine(self):
-        from asr.config import load_config
-        from asr.engines.funasr_engine import FunASREngine
-        cfg = load_config(Path(__file__).parent.parent / "config.yaml", strict_models=False)
+    def _engine(self, cfg):
         return FunASREngine(cfg)
 
     @staticmethod
@@ -565,10 +557,10 @@ class TestVadSlicedTranscribe:
         assert _group_vad_segments([], 2.0, 30.0) == []
         assert _group_vad_segments(None, 2.0, 30.0) == []
 
-    def test_punctuate_shape_crash_halves_retry(self):
+    def test_punctuate_shape_crash_halves_retry(self, cfg):
         """流式 punc 形状崩溃（1 字文本/1 字迷你句）→ 对半递归重试；
         1 字无标点可加，原样返回。真机回归：孤字语气词组（嗯/对/好）。"""
-        eng = self._engine()
+        eng = self._engine(cfg)
 
         class CrashOnOdd:
             def generate(self, **kw):
@@ -583,9 +575,9 @@ class TestVadSlicedTranscribe:
         # 偶数长度直达
         assert eng._punctuate("abcd") == "abcd。"
 
-    def test_punctuate_conservation_reject(self):
+    def test_punctuate_conservation_reject(self, cfg):
         """punc 输出丢字符 → 守恒校验拒绝 → 退回无标点原文（丢标点不丢内容）。"""
-        eng = self._engine()
+        eng = self._engine(cfg)
 
         class DropsLast:
             def generate(self, **kw):
@@ -595,7 +587,7 @@ class TestVadSlicedTranscribe:
         eng._load_punc_model = lambda: DropsLast()
         assert eng._punctuate("大家好今天上课") == "大家好今天上课"
 
-    def test_transcribe_vad_sliced_offsets_and_cleanup(self, tmp_path):
+    def test_transcribe_vad_sliced_offsets_and_cleanup(self, tmp_path, cfg):
         """两个语音组 → 两次切片转写 → 时间戳按片偏移拼接，临时切片清理。"""
         wav = tmp_path / "in.wav"
         self._make_wav(wav, 4.0)
@@ -617,7 +609,7 @@ class TestVadSlicedTranscribe:
             def generate(self, **kw):
                 return [{"text": kw["input"]}]
 
-        eng = self._engine()
+        eng = self._engine(cfg)
         eng._model = FakeAsr()
         eng._loaded = True
         eng._load_vad_model = lambda: FakeVad()
@@ -634,7 +626,7 @@ class TestVadSlicedTranscribe:
         assert abs(segs[1].start - 2.8) < 0.01 and abs(segs[1].end - 3.6) < 0.01
         assert segs[0].text == "大家好。"
 
-    def test_on_segments_fires_per_group_with_absolute_time(self, tmp_path):
+    def test_on_segments_fires_per_group_with_absolute_time(self, tmp_path, cfg):
         """渐进交付：每完成一个 VAD 组，on_segments 收到该组偏移到全片
         时间轴的段落（组结果即最终结果，可直接渲染）。"""
         wav = tmp_path / "in.wav"
@@ -654,7 +646,7 @@ class TestVadSlicedTranscribe:
             def generate(self, **kw):
                 return [{"text": kw["input"]}]
 
-        eng = self._engine()
+        eng = self._engine(cfg)
         eng._model = FakeAsr()
         eng._loaded = True
         eng._load_vad_model = lambda: FakeVad()
@@ -671,7 +663,7 @@ class TestVadSlicedTranscribe:
         # 交付累计 == 最终返回（组结果不回炉）
         assert [s for b in batches for s in b] == segs
 
-    def test_on_segments_exception_does_not_kill_transcription(self, tmp_path):
+    def test_on_segments_exception_does_not_kill_transcription(self, tmp_path, cfg):
         """回调失败不影响主流程（转写照常返回全量段落）。"""
         wav = tmp_path / "in.wav"
         self._make_wav(wav, 4.0)
@@ -689,7 +681,7 @@ class TestVadSlicedTranscribe:
             def generate(self, **kw):
                 return [{"text": kw["input"]}]
 
-        eng = self._engine()
+        eng = self._engine(cfg)
         eng._model = FakeAsr()
         eng._loaded = True
         eng._load_vad_model = lambda: FakeVad()
@@ -701,7 +693,7 @@ class TestVadSlicedTranscribe:
         segs = eng.transcribe(wav, on_segments=boom)
         assert len(segs) == 2                           # 转写未被回调异常杀死
 
-    def test_on_segments_not_fired_on_parachute(self, tmp_path):
+    def test_on_segments_not_fired_on_parachute(self, tmp_path, cfg):
         """降落伞路径（整文件单次转写）无组边界，不触发渐进交付。"""
         wav = tmp_path / "in.wav"
         self._make_wav(wav, 1.0)
@@ -718,7 +710,7 @@ class TestVadSlicedTranscribe:
         def boom():
             raise RuntimeError("vad model boom")
 
-        eng = self._engine()
+        eng = self._engine(cfg)
         eng._model = FakeAsr()
         eng._loaded = True
         eng._load_vad_model = boom
@@ -729,7 +721,7 @@ class TestVadSlicedTranscribe:
         assert batches == []                            # 降落伞不交付
         assert len(segs) == 1                           # 但结果照常返回
 
-    def test_transcribe_empty_vad_returns_empty(self, tmp_path):
+    def test_transcribe_empty_vad_returns_empty(self, tmp_path, cfg):
         """纯静音：VAD 无语音段 → 空结果（不报错、不进降落伞）。"""
         wav = tmp_path / "in.wav"
         self._make_wav(wav, 1.0)
@@ -738,11 +730,11 @@ class TestVadSlicedTranscribe:
             def generate(self, **kw):
                 return [{"value": []}]
 
-        eng = self._engine()
+        eng = self._engine(cfg)
         eng._load_vad_model = lambda: FakeVad()
         assert eng.transcribe(wav) == []
 
-    def test_transcribe_vad_failure_parachute_whole_file(self, tmp_path):
+    def test_transcribe_vad_failure_parachute_whole_file(self, tmp_path, cfg):
         """VAD 预切机械性失败 → 降落伞整文件单次转写（老合并路径保底）。"""
         wav = tmp_path / "in.wav"
         self._make_wav(wav, 1.0)
@@ -762,7 +754,7 @@ class TestVadSlicedTranscribe:
         def boom():
             raise RuntimeError("vad model boom")
 
-        eng = self._engine()
+        eng = self._engine(cfg)
         eng._model = FakeAsr()
         eng._loaded = True
         eng._load_vad_model = boom

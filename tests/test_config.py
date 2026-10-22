@@ -5,9 +5,9 @@ import pytest
 from asr.config import load_config, ConfigLoadError
 
 
-def test_load_default_config(strict_models=False):
+def test_load_default_config(template_config):
     """出厂模板 config.example.yaml 应能加载通过（strict_models=False 时不验模型）。"""
-    cfg = load_config("config.example.yaml", strict_models=False)
+    cfg = template_config
     assert cfg.engine == "funasr"
     assert cfg.language == "zh"
     assert cfg.device == "cpu"
@@ -21,10 +21,11 @@ def test_load_default_config(strict_models=False):
     assert Path(cfg.models.funasr.spk).is_absolute()
 
 
-def test_load_with_gpu_override(strict_models=False):
+def test_load_with_gpu_override(template_config_path, tmp_path):
     """config.gpu.yaml 不存在时应报错。"""
     with pytest.raises(ConfigLoadError):
-        load_config("config.yaml", overrides_path="config.gpu.yaml", strict_models=False)
+        load_config(template_config_path, overrides_path=tmp_path / "config.gpu.yaml",
+                    strict_models=False)
 
 
 def test_missing_config_error_hints_example(tmp_path):
@@ -41,10 +42,11 @@ def test_missing_config_no_example_no_hint(tmp_path):
     assert "config.example.yaml" not in str(ei.value)
 
 
-def test_strict_models_passes_when_paths_exist():
+def test_strict_models_passes_when_paths_exist(template_config_path, template_config):
     """模型路径存在时 strict_models=True 不抛错（正向场景）。"""
-    # 模型已下载到 ./models/iic/，应当通过
-    cfg = load_config("config.yaml", strict_models=True)
+    for model_path in template_config.models.funasr.model_dump().values():
+        Path(model_path).mkdir(parents=True)
+    cfg = load_config(template_config_path, strict_models=True)
     assert cfg.models.funasr.asr.exists()
 
 
@@ -134,10 +136,10 @@ def test_no_strict_all_missing_still_passes(tmp_path):
 # CLI（asr/cli.py run）组装的 overrides 键即 "device"/"engine"/"language"，
 # 值为字符串；未传的键在 CLI 侧已被 None 过滤，web 侧可能传 None。
 # ---------------------------------------------------------------------------
-def test_overrides_device_engine_language_applied():
+def test_overrides_device_engine_language_applied(template_config):
     """P0-7：overrides 里 device/engine/language 必须落到 cfg。"""
     from asr.pipeline import _apply_overrides
-    cfg = load_config("config.example.yaml", strict_models=False)
+    cfg = template_config
     assert (cfg.device, cfg.engine, cfg.language) == ("cpu", "funasr", "zh")  # 出厂模板基线
     _apply_overrides(cfg, {"device": "cuda:0", "engine": "whisper", "language": "en"})
     assert cfg.device == "cuda:0"
@@ -145,10 +147,10 @@ def test_overrides_device_engine_language_applied():
     assert cfg.language == "en"
 
 
-def test_overrides_none_and_unknown_keys_ignored():
+def test_overrides_none_and_unknown_keys_ignored(template_config):
     """P0-7 契约：None（CLI 未传）不覆盖 cfg；未知键静默忽略。"""
     from asr.pipeline import _apply_overrides
-    cfg = load_config("config.example.yaml", strict_models=False)
+    cfg = template_config
     _apply_overrides(cfg, {"device": None, "language": None, "nonsense": "x", "quality": "fast"})
     assert cfg.device == "cpu"
     assert cfg.language == "zh"

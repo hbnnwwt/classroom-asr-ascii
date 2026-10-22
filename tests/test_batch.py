@@ -7,10 +7,9 @@ output.formats，Task 7 复盘确认）。线程池共享一个 cfg 时并发任
 from pathlib import Path
 
 from asr.batch import batch_run
-from asr.config import load_config
 
 
-def test_worker_gets_isolated_cfg_per_task(monkeypatch, tmp_path):
+def test_worker_gets_isolated_cfg_per_task(monkeypatch, tmp_path, template_config):
     """并发 worker 各拿独立 cfg 副本；共享 cfg 不被任何任务的写入污染。"""
     import asr.batch as bm
 
@@ -26,7 +25,7 @@ def test_worker_gets_isolated_cfg_per_task(monkeypatch, tmp_path):
 
     monkeypatch.setattr(bm, "pipeline_run", fake_run)
 
-    base_cfg = load_config("config.yaml", strict_models=False)
+    base_cfg = template_config
     inputs = [Path(f"f{i}.wav") for i in range(3)]
     res = batch_run(
         inputs, base_cfg,
