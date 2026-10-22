@@ -26,7 +26,7 @@ def wheel(tmp_path_factory):
         shutil.copyfile(ROOT / name, source / name)
     shutil.copytree(
         ROOT / "asr", source / "asr",
-        ignore=shutil.ignore_patterns("__pycache__", "uploads", "*.db", "*.db-*"),
+        ignore=shutil.ignore_patterns("__pycache__", "uploads", "outputs", "*.db", "*.db-*"),
     )
     result = subprocess.run(
         [sys.executable, "-c", "from setuptools.build_meta import build_wheel; build_wheel('dist')"],
