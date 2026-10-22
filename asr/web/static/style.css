@@ -175,7 +175,10 @@ button.primary:hover:not(:disabled) { background: var(--accent-hover); }
 @keyframes spin { to { transform: rotate(360deg); } }
 
 #status-panel { margin-top: 24px; padding-top: 16px; border-top: 1px solid var(--border); }
-.status-row { font-size: 14px; margin-bottom: 12px; }
+/* 摘要块：行 1 状态+用时（常驻），行 2 小字（完成态，task.js 填） */
+#summary { margin-bottom: 12px; }
+.status-row { font-size: 14px; }
+.summary-sub { font-size: 12px; color: var(--text-3); margin-top: 2px; }
 
 /* 阶段列表 */
 .stages {
@@ -224,6 +227,10 @@ button.primary:hover:not(:disabled) { background: var(--accent-hover); }
   color: #fff; font-size: 12px; transition: width 0.3s;
 }
 
+/* 完成态：阶段列表/进度条整体收起——下载区上移成为主角。
+   class 由 task.js 每轮轮询按 status 刷，AI 重跑时自动展开，零特殊情况 */
+body.is-final .stages, body.is-final .progress-bar { display: none; }
+
 /* white-space:pre-line 容纳按件报错的多行文本（一条一行） */
 .error { color: var(--err); background: var(--err-bg); padding: 8px; border-radius: var(--radius-sm); margin-top: 8px; white-space: pre-line; }
 
@@ -237,6 +244,8 @@ button.primary:hover:not(:disabled) { background: var(--accent-hover); }
   display: flex; justify-content: space-between; align-items: center;
   margin-bottom: 8px;
 }
+/* 工具栏右侧动作组（复制全文 + 滚动开关） */
+.transcript-toolbar .toolbar-actions { display: flex; gap: 8px; }
 .transcript-toolbar h3 { margin: 0; font-size: 14px; color: var(--text-2); }
 .transcript-toolbar button {
   background: var(--bg); color: var(--accent); border: 1px solid var(--border-strong);
@@ -252,6 +261,8 @@ button.primary:hover:not(:disabled) { background: var(--accent-hover); }
   padding: 10px 12px; font-size: 13.5px; line-height: 1.75;
   font-family: -apple-system, "Microsoft YaHei", monospace;
 }
+/* 完成态回看是主用途：转写框从 50vh 放大 */
+body.is-final .transcript { height: 70vh; }
 /* 空态：渐进输出第一组交付前的等待提示（零 JS，纯 CSS） */
 .transcript:empty::before {
   content: "等待识别结果…\A识别启动后，这里会随转写进度逐段滚出文字。";
@@ -541,6 +552,9 @@ a.theme-toggle { display: inline-flex; align-items: center; justify-content: cen
     transition-duration: 0.01ms !important;
   }
 }
+
+/* AI 反馈产物区：查看按钮 + 生成/重试，与转写下载分家（显隐条件同 #downloads） */
+#ai-section { margin-top: 16px; }
 
 /* AI 反馈动作区（手动生成/重试） */
 #ai-actions {

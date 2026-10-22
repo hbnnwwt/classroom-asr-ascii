@@ -37,10 +37,17 @@
       <!-- 左栏：状态 + 下载 -->
       <div class="col-left">
         <section id="status-panel">
-          <div class="status-row">
-            状态：<strong id="status">-</strong>
-            <span class="meta">· 已用 <strong id="task-elapsed">-</strong></span>
-            <span class="meta">· ID: <code id="task-id"></code></span>
+          <!-- 摘要块：行 1 状态+用时（运行中即有）；完成态填满时长/段数/说话人（task.js updateSummary），
+               行 2 小字：文件名/创建时间/ID（仅完成态显示） -->
+          <div id="summary">
+            <div class="status-row">
+              状态：<strong id="status">-</strong>
+              <span class="meta">· 已用 <strong id="task-elapsed">-</strong></span>
+              <span class="meta" id="sum-duration" hidden></span>
+              <span class="meta" id="sum-segs" hidden></span>
+              <span class="meta" id="sum-speakers" hidden></span>
+            </div>
+            <div id="summary-sub" class="summary-sub" hidden></div>
           </div>
 
           <ol class="stages" id="stages">
@@ -73,7 +80,21 @@
               <a class="btn" data-fmt="vtt">VTT</a>
               <a class="btn" data-fmt="md">MD</a>
               <a class="btn" data-fmt="json">JSON</a>
-              <!-- AI 产物：有 ai_files 才显示（renderAiUi 控制）；下载收进阅读层 -->
+              <a class="btn" data-fmt="mp4" hidden title="拼接合并后的完整视频（仅旧版合并任务）">MP4 视频</a>
+              <a class="btn" data-fmt="replace.log" hidden title="术语替换日志（调试用，术语命中过才有此文件）">replace.log</a>
+            </div>
+            <!-- 多段任务：每段一份独立 SRT（时间归零，直接配原视频） -->
+            <div id="part-downloads" class="part-downloads" hidden>
+              <h4>每段独立字幕（时间轴归零，配各段原视频）</h4>
+              <ul id="part-downloads-list"></ul>
+            </div>
+          </div>
+
+          <!-- AI 反馈产物：查看（有产物才亮）+ 生成/重试，与转写下载分家。
+               显隐跟随 #downloads 同一条件（done 或 AI 重跑中）；下载收进阅读层 -->
+          <div id="ai-section" hidden>
+            <h3>AI 反馈产物</h3>
+            <div class="download-list">
               <button class="btn btn-view" type="button" data-view="feedback" hidden title="页面内阅读 AI 点评报告">
                 <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></svg>
                 查看 AI 点评
@@ -86,23 +107,14 @@
                 <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></svg>
                 查看深度优化
               </button>
-              <a class="btn" data-fmt="mp4" hidden title="拼接合并后的完整视频（仅旧版合并任务）">MP4 视频</a>
-              <a class="btn" data-fmt="replace.log" title="术语替换日志（调试用）">replace.log</a>
             </div>
-            <!-- 多段任务：每段一份独立 SRT（时间归零，直接配原视频） -->
-            <div id="part-downloads" class="part-downloads" hidden>
-              <h4>每段独立字幕（时间轴归零，配各段原视频）</h4>
-              <ul id="part-downloads-list"></ul>
-            </div>
-          </div>
-
-          <!-- AI 反馈动作：手动生成/重试（done 且 LLM 可用时出现）。
-               点评+优化稿是上传开关的整组；深度优化按需单独生成 -->
-          <div id="ai-actions" hidden>
-            <div id="ai-error" class="error"></div>
-            <div class="btn-row">
-              <button id="ai-retry" type="button" class="btn">生成 AI 反馈</button>
-              <button id="ai-deep" type="button" class="btn">生成深度优化</button>
+            <!-- 生成/重试（done 且 LLM 可用时出现）。点评+优化稿是上传开关的整组；深度优化按需单独生成 -->
+            <div id="ai-actions" hidden>
+              <div id="ai-error" class="error"></div>
+              <div class="btn-row">
+                <button id="ai-retry" type="button" class="btn">生成 AI 反馈</button>
+                <button id="ai-deep" type="button" class="btn">生成深度优化</button>
+              </div>
             </div>
           </div>
         </section>
@@ -113,10 +125,13 @@
         <section id="transcript-panel" hidden>
           <div class="transcript-toolbar">
             <h3>实时转写 <span id="transcript-count" class="count"></span></h3>
-            <button id="live-toggle" type="button" aria-label="暂停或恢复自动滚动">
-              <svg class="icon" viewBox="0 0 24 24" fill="currentColor" stroke="none" aria-hidden="true"><path d="M6 4h4v16H6zM14 4h4v16h-4z"/></svg>
-              暂停滚动
-            </button>
+            <div class="toolbar-actions">
+              <button id="copy-transcript" type="button" title="复制全部转写文本（说话人前缀，不带时间戳）">复制全文</button>
+              <button id="live-toggle" type="button" aria-label="暂停或恢复自动滚动">
+                <svg class="icon" viewBox="0 0 24 24" fill="currentColor" stroke="none" aria-hidden="true"><path d="M6 4h4v16H6zM14 4h4v16h-4z"/></svg>
+                暂停滚动
+              </button>
+            </div>
           </div>
           <div id="transcript" class="transcript"></div>
         </section>

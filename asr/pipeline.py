@@ -251,7 +251,7 @@ def run(
 
         written = writers.write_all(segs, base, cfg.output, meta=meta, replace_log=replace_log)
 
-        # 8. replace.log（始终写出，便于人工核查）
+        # 8. replace.log（有替换才写，便于人工核查；前端按 meta.formats 显隐按钮）
         if replace_log:
             log_path = base.with_suffix(".replace.log")
             log_path.write_text("\n".join(replace_log) + "\n", encoding="utf-8")

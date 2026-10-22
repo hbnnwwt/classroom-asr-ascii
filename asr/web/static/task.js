@@ -57,12 +57,12 @@ async function restoreLastTask() {
   }
 
   currentTaskId = taskId;
+  // ID 已收进完成态摘要小字行（updateSummary），不再单独设
   // 同步 URL：旧版 ?task= 进来时，转成标准 /task/{id}
   if (!window.location.pathname.startsWith("/task/")) setTaskIdInUrl(taskId);
   // 清掉旧 localStorage（迁移完成后不再用）
   localStorage.removeItem("lastTaskId");
 
-  $("task-id").textContent = taskId;
   $("status-panel").hidden = false;
   $("transcript-panel").hidden = false;
   resetStages();
@@ -129,6 +129,9 @@ async function poll() {
 
 function updateUI(t) {
   taskStatus = t.status;
+  // 完成态折叠：阶段列表/进度条收起（CSS body.is-final）。折叠跟 status 走、
+  // 不跟历史走——AI 重跑时 status 回 running，class 自动摘除、阶段列表自动回归
+  document.body.classList.toggle("is-final", t.status === "done");
   // 多段任务专属 UI：拼接阶段行（新任务 meta.parts，旧任务 meta.merge_mode）。
   // MP4 下载按钮只属于旧版"真合并"任务——新方案不产视频，只产字幕。
   const isMulti = Boolean(t.meta && (t.meta.parts || t.meta.merge_mode));
@@ -145,6 +148,10 @@ function updateUI(t) {
   if (aiLi) aiLi.style.display = hasAi ? "" : "none";
   const mp4Btn = document.querySelector('#downloads .btn[data-fmt="mp4"]');
   if (mp4Btn) mp4Btn.hidden = !(t.meta && t.meta.merge_mode);
+  // 术语日志跟管线事实走：写过 replace.log（meta.formats 有登记）才亮按钮，
+  // 没命中术语的任务不再点出 404
+  const rlBtn = document.querySelector('#downloads .btn[data-fmt="replace.log"]');
+  if (rlBtn) rlBtn.hidden = !(t.meta && (t.meta.formats || []).includes("replace_log"));
   $("status").textContent = statusLabel(t.status);
   // 项目名（页面顶部）
   if (t.name && $("project-name").textContent !== t.name) {
@@ -153,6 +160,7 @@ function updateUI(t) {
   }
   // 任务整体已用时间（started_at → now；未启动显示 -；已完成用 ended_at）
   updateTaskElapsed(t);
+  updateSummary(t);
   if (t.stage) renderStages(t.stage, t.message, t.stage_started_at, t.started_at);
 
   // 整体进度条
@@ -168,6 +176,7 @@ function updateUI(t) {
   // 下载区照常显示，别让用户白等一次 LLM。
   if (t.status === "done" || (t.status === "running" && t.stage === "ai")) {
     $("downloads").hidden = false;
+    $("ai-section").hidden = false;   // AI 产物区与下载区同条件显隐
     document.querySelectorAll("#downloads a.btn").forEach((a) => {
       a.href = `/download/${currentTaskId}/${a.dataset.fmt}`;
       a.download = "";
@@ -223,7 +232,7 @@ function renderAiUi(t) {
   const meta = t.meta || {};
   const files = meta.ai_files || {};
   const errs = meta.ai_errors || {};
-  document.querySelectorAll("#downloads .btn-view").forEach((b) => {
+  document.querySelectorAll("#ai-section .btn-view").forEach((b) => {
     b.hidden = !files[b.dataset.view];
   });
   aiPairFiles = Boolean(files.feedback || files.polished);
@@ -386,6 +395,24 @@ $("live-toggle").addEventListener("click", () => {
   }
 });
 
+/** 复制全文：说话人前缀 + 正文，逐段换行（无 spk 就纯文本）。
+ * 用 streamSegments 全量数组而非 DOM——DOM 只留最近 80 段，复制不能跟着截断。
+ * 要时间戳版去下载 TXT，一个出口一种格式。 */
+$("copy-transcript").addEventListener("click", async () => {
+  if (!streamSegments.length) return;
+  const text = streamSegments
+    .map((s) => (s.spk ? `${s.spk}: ${s.text || ""}` : (s.text || "")))
+    .join("\n");
+  const btn = $("copy-transcript");
+  try {
+    await navigator.clipboard.writeText(text);
+    btn.textContent = "已复制";
+    setTimeout(() => { btn.textContent = "复制全文"; }, 1500);
+  } catch (err) {
+    alert(`复制失败：${err.message}`);
+  }
+});
+
 function renderStages(stage, msg, stageStartedAt, taskStartedAt) {
   const idx = STAGE_ORDER.indexOf(stage);
   if (idx < 0) return;
@@ -486,6 +513,49 @@ function formatDuration(secs) {
   return `${Math.floor(secs / 3600)}h${Math.floor((secs % 3600) / 60)}m`;
 }
 
+/**
+ * 完成态摘要：时长/段数/说话人数全部从 transcript 直接算（后端零新增字段）。
+ * 运行中保持最小形态（状态+已用）——"已识别时长"≠"视频时长"，跳动的数字是噪音。
+ * 非分说话人任务 segs 无 spk 字段 → 说话人一项自动不显示，零特殊情况。
+ */
+function updateSummary(t) {
+  const final = t.status === "done";
+  let segs = [];
+  if (t.transcript) {
+    try { segs = JSON.parse(t.transcript) || []; } catch { /* 脏数据按无转写处理 */ }
+  }
+  if (final && segs.length) {
+    const dur = Math.max(...segs.map((s) => s.end || 0));
+    $("sum-duration").textContent = `· 时长 ${formatDuration(Math.round(dur))}`;
+    $("sum-duration").hidden = false;
+    $("sum-segs").textContent = `· ${segs.length} 段`;
+    $("sum-segs").hidden = false;
+    const speakers = new Set(segs.map((s) => s.spk).filter(Boolean));
+    if (speakers.size) {
+      $("sum-speakers").textContent = `· ${speakers.size} 位说话人`;
+      $("sum-speakers").hidden = false;
+    }
+  } else {
+    $("sum-duration").hidden = true;
+    $("sum-segs").hidden = true;
+    $("sum-speakers").hidden = true;
+  }
+  // 小字行：文件名 · 创建时间 · ID（终态专属；failed 排障看 #error，不掺和）
+  const sub = $("summary-sub");
+  if (final) {
+    const parts = [];
+    if (t.filename) parts.push(t.filename);
+    if (t.created_at) {
+      parts.push(`创建于 ${String(t.created_at).replace("T", " ").slice(0, 16)}`);
+    }
+    parts.push(`ID: ${currentTaskId}`);
+    sub.textContent = parts.join(" · ");
+    sub.hidden = false;
+  } else {
+    sub.hidden = true;
+  }
+}
+
 function startElapsedTicker() {
   if (elapsedTimer) clearInterval(elapsedTimer);
   elapsedTimer = setInterval(() => {
@@ -582,7 +652,7 @@ function closeAiViewer() {
   currentModalFmt = null;
 }
 
-document.querySelectorAll("#downloads .btn-view").forEach((b) =>
+document.querySelectorAll("#ai-section .btn-view").forEach((b) =>
   b.addEventListener("click", () => openAiViewer(b.dataset.view)));
 document.querySelectorAll("#ai-modal-tabs .tab").forEach((b) =>
   b.addEventListener("click", () => setAiTab(b.dataset.tab)));
