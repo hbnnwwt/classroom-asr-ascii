@@ -18,15 +18,20 @@ from asr.web import app as fastapi_app
 # Fixtures
 # ---------------------------------------------------------------------------
 @pytest.fixture
-def isolated_db(tmp_path, monkeypatch):
-    """把 SQLite 文件和上传/输出目录都指到 tmp_path，互不污染。"""
-    test_db = tmp_path / "state.db"
-    test_uploads = tmp_path / "uploads"
-    test_outputs = tmp_path / "outputs"
-    test_uploads.mkdir()
-    test_outputs.mkdir()
+def isolated_db(web_runtime, monkeypatch):
+    """配置、SQLite 和上传/输出均来自本次测试的临时目录。"""
+    test_db = web_runtime.db_path
+    test_uploads = web_runtime.upload_dir
+    test_outputs = web_runtime.output_root
+    monkeypatch.chdir(web_runtime.root)
 
     import asr.web as wm
+    from asr.web.runtime import WebRuntime
+    from asr.web.execution import ExecutionManager
+    runtime = WebRuntime(web_runtime.config_path, test_db, test_uploads, test_outputs)
+    monkeypatch.setattr(wm.app.state, "runtime", runtime, raising=False)
+    executor = ExecutionManager()
+    monkeypatch.setattr(wm.app.state, "execution", executor, raising=False)
     monkeypatch.setattr(wm, "DB_PATH", test_db)
     monkeypatch.setattr(wm, "UPLOAD_DIR", test_uploads)
     monkeypatch.setattr(wm, "OUTPUT_ROOT", test_outputs)
@@ -36,13 +41,14 @@ def isolated_db(tmp_path, monkeypatch):
     wm.OUTPUT_ROOT = test_outputs
 
     _init_db()
-    yield tmp_path
+    yield web_runtime.root
+    executor.shutdown()
 
 
 @pytest.fixture
 def client(isolated_db):
     """FastAPI TestClient。"""
-    return TestClient(fastapi_app)
+    return TestClient(fastapi_app, client=("127.0.0.1", 50000), base_url="http://127.0.0.1")
 
 
 # ---------------------------------------------------------------------------
@@ -973,6 +979,24 @@ def test_batch_export_empty_ids(client):
 # ---------------------------------------------------------------------------
 # Helper：同步跑 _run_pipeline（不走后台线程）
 # ---------------------------------------------------------------------------
+class _InlineExecution:
+    """Run admitted work deterministically; production threads are never monkeypatched."""
+    def submit(self, task_id, fn, *, admit=None):
+        if admit:
+            admit()
+        return fn()
+    def is_active(self, task_id):
+        return False
+    def shutdown(self):
+        pass
+
+
+class _DeferredExecution(_InlineExecution):
+    def submit(self, task_id, fn, *, admit=None):
+        if admit:
+            admit()
+
+
 class _InlineThread:
     """threading.Thread 替身：start() 在当前线程直接执行 target。
 
@@ -998,7 +1022,7 @@ def _install_sync_pipeline(monkeypatch):
     import types
     import asr.web as wm
     monkeypatch.setattr(wm, "_run_pipeline", _run_pipeline_sync_patch)
-    monkeypatch.setattr(wm, "threading", types.SimpleNamespace(Thread=_InlineThread))
+    monkeypatch.setattr(wm.app.state, "execution", _InlineExecution())
 
 
 def _run_pipeline_sync_patch(task_id, input_path, output_dir, config_path, diarize, quality):
@@ -1062,7 +1086,7 @@ def test_run_pipeline_writes_transcript_atomically_with_done(isolated_db, monkey
             ("atom1", "x.mp4", "/in/x", str(out_dir), "2026-09-22T00:00:00"),
         )
 
-    cfg_path = str(Path(__file__).parent.parent / "config.yaml")
+    cfg_path = str(isolated_db / "config.yaml")
     wm._run_pipeline("atom1", Path("/in/x"), out_dir, cfg_path, diarize=False, quality="balanced")
 
     # 同步返回即查：done 与全量 transcript 必须同时可见（无后补窗口）
@@ -1117,7 +1141,7 @@ def test_run_pipeline_streams_transcript_incrementally(isolated_db, monkeypatch)
             ("inc1", "x.mp4", "/in/x", str(out_dir), "2026-09-22T00:00:00"),
         )
 
-    cfg_path = str(Path(__file__).parent.parent / "config.yaml")
+    cfg_path = str(isolated_db / "config.yaml")
     wm._run_pipeline("inc1", Path("/in/x"), out_dir, cfg_path, diarize=False, quality="balanced")
 
     # 识别过程中 DB 已有增量文字（前端轮询可见）
@@ -1224,7 +1248,7 @@ def test_create_project_multi_files(client, monkeypatch):
 
     monkeypatch.setattr(wm, "_run_multi_task", _fake_multi)
     import types
-    monkeypatch.setattr(wm, "threading", types.SimpleNamespace(Thread=_InlineThread))
+    monkeypatch.setattr(wm.app.state, "execution", _InlineExecution())
 
     r = client.post("/api/projects",
                     files=[("files", ("a.mp4", b"X", "video/mp4")),
@@ -1256,7 +1280,7 @@ def test_create_project_single_file_plain(client, monkeypatch):
 
     monkeypatch.setattr(wm, "_run_pipeline", _fake_pipeline)
     import types
-    monkeypatch.setattr(wm, "threading", types.SimpleNamespace(Thread=_InlineThread))
+    monkeypatch.setattr(wm.app.state, "execution", _InlineExecution())
 
     r = client.post("/api/projects", files=[("files", ("a.mp4", b"X", "video/mp4"))])
     assert r.status_code == 200, r.text
@@ -1301,7 +1325,8 @@ def test_create_project_requires_files(client):
 
 def test_download_legacy_merged_mp4(client):
     """旧版合并任务（meta.merge_mode）的 merged.mp4 仍可下载（存量不破坏）。"""
-    out_dir = OUTPUT_ROOT / "legacy1"
+    import asr.web as wm
+    out_dir = wm.OUTPUT_ROOT / "legacy1"
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "merged.mp4").write_bytes(b"MERGED")
     with _db() as c:
@@ -1421,7 +1446,8 @@ def test_download_part_srt(client, monkeypatch):
 
 def test_download_part_srt_rejects_undone(client):
     """任务未完成 → 409（与主下载路由口径一致）。"""
-    out_dir = OUTPUT_ROOT / "undone1"
+    import asr.web as wm
+    out_dir = wm.OUTPUT_ROOT / "undone1"
     out_dir.mkdir(parents=True, exist_ok=True)
     with _db() as c:
         c.execute(
@@ -1618,7 +1644,7 @@ def test_run_ai_stage_failure_keeps_done(isolated_db, monkeypatch):
     meta = json.loads(row["meta_json"])
     assert "boom" in meta["ai_errors"]["feedback"]
     assert "boom" in meta["ai_errors"]["polished"]
-    assert "ai_files" not in meta, "全失败不得登记产物"
+    assert not meta.get("ai_files"), "全失败不得登记产物"
     assert not list(out_dir.glob("*.feedback.md"))
     assert not list(out_dir.glob("*.polished.md"))
 
@@ -1714,13 +1740,13 @@ def test_start_ai_run_keeps_ended_at(isolated_db, monkeypatch):
         def start(self):
             pass
 
-    monkeypatch.setattr(wm.threading, "Thread", _NoThread)
+    monkeypatch.setattr(wm.app.state, "execution", _DeferredExecution())
     resp = wm._start_ai_run("ai1", "config.yaml", ("feedback",))
     assert resp.status_code == 202
     with closing(wm._db()) as conn:
         row = conn.execute(
             "SELECT status, ended_at FROM tasks WHERE id='ai1'").fetchone()
-    assert row["status"] == "running"
+    assert row["status"] == "pending"
     assert row["ended_at"] == PIPE_END
 
 
@@ -1738,7 +1764,7 @@ def test_upload_ai_feedback_flag_reaches_meta(client, isolated_db, monkeypatch):
     # 内联线程（同 _install_sync_pipeline 模式）：post 返回前 wrapper 已同步执行完，
     # 否则 got["ai"] 依赖真线程与断言的调度竞态（TOCTOU 间歇假红）
     import types
-    monkeypatch.setattr(wm, "threading", types.SimpleNamespace(Thread=_InlineThread))
+    monkeypatch.setattr(wm.app.state, "execution", _InlineExecution())
     r = client.post("/api/projects",
                     files={"files": ("a.mp3", b"x", "audio/mpeg")},
                     data={"name": "AI课", "ai_feedback": "true"})
@@ -1760,7 +1786,7 @@ def test_llm_status_disabled_by_default(client, isolated_db):
     不许用仓库根 config.yaml 当夹具——那是用户个人文件（含 key），
     内容随本机配置变，测试会环境敏感。
     """
-    r = client.get("/api/llm/status", params={"config": "config.example.yaml"})
+    r = client.get("/api/llm/status", params={"config": "default"})
     assert r.status_code == 200
     assert r.json() == {"enabled": False, "model": None}
 
@@ -1781,7 +1807,8 @@ def test_llm_status_enabled(client, isolated_db, monkeypatch):
 # ---------------------------------------------------------------------------
 def _write_settings_cfg(tmp_path, llm_block=""):
     """可加载的最小 config（strict_models=False 不验模型路径），llm 块可选。"""
-    cfg = tmp_path / "settings_cfg.yaml"
+    import asr.web as wm
+    cfg = wm._runtime().config_path
     cfg.write_text(
         "# 顶部注释，不许动\n"
         "device: cpu\n"
@@ -1805,17 +1832,17 @@ def test_llm_settings_get_roundtrip(client, isolated_db, tmp_path):
         "llm:\n  base_url: http://o/v1\n  api_key: k1\n"
         "  model: m1\n  timeout: 60\n"
     ))
-    r = client.get("/api/llm/settings", params={"config": str(cfg)})
+    r = client.get("/api/llm/settings", params={"config": "default"})
     assert r.status_code == 200
     d = r.json()
-    assert d == {"base_url": "http://o/v1", "api_key": "k1", "model": "m1",
+    assert d == {"base_url": "http://o/v1", "api_key": None, "api_key_set": True, "api_key_masked": "********", "model": "m1",
                  "timeout": 60, "max_tokens": 16384}
 
 
 def test_llm_settings_get_absent_defaults(client, isolated_db, tmp_path):
     """无 llm 节 → 全空/默认（设置页表单空态）。"""
     cfg = _write_settings_cfg(tmp_path)
-    r = client.get("/api/llm/settings", params={"config": str(cfg)})
+    r = client.get("/api/llm/settings", params={"config": "default"})
     assert r.status_code == 200
     assert r.json()["base_url"] == ""
     assert r.json()["model"] == ""
@@ -1825,7 +1852,7 @@ def test_llm_settings_get_absent_defaults(client, isolated_db, tmp_path):
 def test_llm_settings_save_surgery_and_status(client, isolated_db, tmp_path):
     """POST 保存：注释模板被替换为活节、其他注释保住、status 端点立刻反映。"""
     cfg = _write_settings_cfg(tmp_path, "# llm:\n#   base_url: old\n")
-    r = client.post("/api/llm/settings", params={"config": str(cfg)},
+    r = client.post("/api/llm/settings", params={"config": "default"},
                     json=_LLM_BODY)
     assert r.status_code == 200
     assert r.json() == {"status": "saved", "enabled": True}
@@ -1833,19 +1860,19 @@ def test_llm_settings_save_surgery_and_status(client, isolated_db, tmp_path):
     assert "# 顶部注释，不许动" in text
     assert "#   base_url: old" not in text
     assert '\n  model: "fake-glm"\n' in text
-    r2 = client.get("/api/llm/status", params={"config": str(cfg)})
+    r2 = client.get("/api/llm/status", params={"config": "default"})
     assert r2.json() == {"enabled": True, "model": "fake-glm"}
 
 
 def test_llm_settings_save_disable(client, isolated_db, tmp_path):
     """清空 base_url/model 保存 = 功能关闭（表单即状态，无第二个开关）。"""
     cfg = _write_settings_cfg(tmp_path, "llm:\n  base_url: http://o/v1\n  model: m1\n")
-    r = client.post("/api/llm/settings", params={"config": str(cfg)},
+    r = client.post("/api/llm/settings", params={"config": "default"},
                     json={"base_url": "", "api_key": "", "model": "",
                           "timeout": 300, "max_tokens": 16384})
     assert r.status_code == 200
     assert r.json()["enabled"] is False
-    r2 = client.get("/api/llm/status", params={"config": str(cfg)})
+    r2 = client.get("/api/llm/status", params={"config": "default"})
     assert r2.json()["enabled"] is False
 
 
@@ -1855,15 +1882,17 @@ def test_llm_settings_save_validates(client, isolated_db, tmp_path):
     for bad in ({**_LLM_BODY, "base_url": "ftp://x"},
                 {**_LLM_BODY, "timeout": 0},
                 {**_LLM_BODY, "max_tokens": -1}):
-        r = client.post("/api/llm/settings", params={"config": str(cfg)}, json=bad)
+        r = client.post("/api/llm/settings", params={"config": "default"}, json=bad)
         assert r.status_code == 422, bad
     assert "llm:" not in cfg.read_text(encoding="utf-8")
 
 
-def test_llm_settings_save_missing_file_409(client, isolated_db, tmp_path):
+def test_llm_settings_save_missing_file_409(client, isolated_db, tmp_path, monkeypatch):
     """config 文件不存在 → 409（不许静默新建一个空配置）。"""
+    import asr.web as wm
+    monkeypatch.setattr(wm._runtime(), "config_path", tmp_path / "nope.yaml")
     r = client.post("/api/llm/settings",
-                    params={"config": str(tmp_path / "nope.yaml")},
+                    params={"config": "default"},
                     json=_LLM_BODY)
     assert r.status_code == 409
 
@@ -1959,10 +1988,10 @@ def test_feedback_trigger_202_and_clears_error(client, isolated_db, monkeypatch)
                         lambda tid, cfg, fmts=None: got.update(args=(tid, cfg, fmts)))
     monkeypatch.setattr(wm, "llm_enabled", lambda cfg: True)
     # 内联线程：post 返回即线程已同步执行完，断言不依赖真线程调度（TOCTOU）
-    monkeypatch.setattr(wm, "threading", types.SimpleNamespace(Thread=_InlineThread))
+    monkeypatch.setattr(wm.app.state, "execution", _InlineExecution())
     r = client.post("/api/tasks/fb1/feedback")
     assert r.status_code == 202 and r.json() == {"status": "started"}
-    assert got["args"] == ("fb1", "config.yaml", ("feedback", "polished")), \
+    assert got["args"] == ("fb1", str(wm._runtime().config_path), ("feedback", "polished")), \
         "整组重跑必须是显式的点评+优化稿两件"
     with closing(wm._db()) as conn:
         row = conn.execute(
@@ -1987,14 +2016,14 @@ def test_feedback_trigger_rejections(client, isolated_db):
     _mk_done_plain_task(isolated_db, task_id="fb_pend", status="pending")
     # config 指出厂模板（无 llm 节）；仓库根 config.yaml 是用户个人文件，禁止当夹具
     assert client.post("/api/tasks/nope/feedback",
-                       params={"config": "config.example.yaml"}).status_code == 404
+                       params={"config": "default"}).status_code == 404
     assert client.post("/api/tasks/fb_running/feedback",
-                       params={"config": "config.example.yaml"}).status_code == 409
+                       params={"config": "default"}).status_code == 409
     assert client.post("/api/tasks/fb_pend/feedback",
-                       params={"config": "config.example.yaml"}).status_code == 409
+                       params={"config": "default"}).status_code == 409
     # done 任务但 LLM 未配置（出厂模板无 llm 节）→ 409
     assert client.post("/api/tasks/fb1/feedback",
-                       params={"config": "config.example.yaml"}).status_code == 409
+                       params={"config": "default"}).status_code == 409
 
 
 def test_feedback_trigger_config_error_409(client, isolated_db, monkeypatch):
@@ -2030,10 +2059,10 @@ def test_ai_single_fmt_trigger(client, isolated_db, monkeypatch):
     monkeypatch.setattr(wm, "_run_ai_stage",
                         lambda tid, cfg, fmts=None: got.update(args=(tid, cfg, fmts)))
     monkeypatch.setattr(wm, "llm_enabled", lambda cfg: True)
-    monkeypatch.setattr(wm, "threading", types.SimpleNamespace(Thread=_InlineThread))
+    monkeypatch.setattr(wm.app.state, "execution", _InlineExecution())
     r = client.post("/api/tasks/fb1/ai/deep")
     assert r.status_code == 202 and r.json() == {"status": "started"}
-    assert got["args"] == ("fb1", "config.yaml", ("deep",)), "必须只重跑 deep"
+    assert got["args"] == ("fb1", str(wm._runtime().config_path), ("deep",)), "必须只重跑 deep"
     with closing(wm._db()) as conn:
         row = conn.execute(
             "SELECT status, stage, progress, ended_at, meta_json FROM tasks"
@@ -2041,7 +2070,7 @@ def test_ai_single_fmt_trigger(client, isolated_db, monkeypatch):
     assert row["status"] == "running" and row["stage"] == "ai"
     assert row["progress"] == 0 and row["ended_at"] is None
     meta = json.loads(row["meta_json"])
-    assert meta["ai_files"] == {"feedback": "旧.feedback.md"}, "deep 旧登记必须出清"
+    assert meta["ai_files"] == {"feedback": "旧.feedback.md", "deep": "旧.deep.md"}, "重跑保留上次完整稿"
     assert "ai_errors" not in meta and "ai_error" not in meta
     assert meta["parts"] == ["a.mp4"], "出清不得冲掉无关键"
 
@@ -2052,12 +2081,12 @@ def test_ai_single_fmt_trigger_rejections(client, isolated_db):
     _mk_done_plain_task(isolated_db, task_id="fb_running", status="running")
     # 出厂模板无 llm 节；仓库根 config.yaml 是用户个人文件，禁止当夹具
     assert client.post("/api/tasks/fb1/ai/nope",
-                       params={"config": "config.example.yaml"}).status_code == 400
+                       params={"config": "default"}).status_code == 400
     assert client.post("/api/tasks/missing/ai/deep").status_code == 404
     assert client.post("/api/tasks/fb_running/ai/deep",
-                       params={"config": "config.example.yaml"}).status_code == 409
+                       params={"config": "default"}).status_code == 409
     assert client.post("/api/tasks/fb1/ai/deep",
-                       params={"config": "config.example.yaml"}).status_code == 409
+                       params={"config": "default"}).status_code == 409
 
 
 # ---------------------------------------------------------------------------
@@ -2132,7 +2161,7 @@ def test_run_ai_stage_per_fmt_failure_no_collateral(isolated_db, monkeypatch):
             "SELECT status, meta_json FROM tasks WHERE id='ai1'").fetchone()
     assert row["status"] == "done", "单件失败不拖垮任务"
     meta = json.loads(row["meta_json"])
-    assert set(meta["ai_files"]) == {"polished", "deep"}, "失败件的旧登记必须清掉"
+    assert set(meta["ai_files"]) == {"feedback", "polished", "deep"}, "失败件保留上次完整稿"
     assert "fb boom" in meta["ai_errors"]["feedback"]
     assert "polished" not in meta["ai_errors"] and "deep" not in meta["ai_errors"]
     assert "ai_error" not in meta, "写侧退役全局 ai_error，按件记 ai_errors"

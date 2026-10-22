@@ -1,0 +1,6 @@
+# Run with the project interpreter: python -m pip install -r requirements-dev.txt
+-r requirements.txt
+pytest>=8.3
+httpx>=0.27
+packaging>=24.0
+setuptools>=68

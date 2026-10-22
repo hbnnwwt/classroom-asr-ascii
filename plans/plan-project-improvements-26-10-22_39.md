@@ -1,7 +1,7 @@
 # 项目可靠性与 UI/UX 改进实施计划
 
-日期：2026-10-22（Asia/Shanghai）  
-状态：用户已确认“开始实施”；在独立工作区执行中。
+日期：2026-10-22（Asia/Shanghai）
+状态：T0–T10 已实施并验收；保存在独立工作分支 `codex/project-improvements`。
 
 > 给执行代理：本计划是新的代码实施计划，前一份项目分析计划不等于本计划已经获批。确认后按任务逐项执行、勾选并记录证据。并行任务必须划定文件所有权；共享管线、Web 编排与样式的任务顺序执行。
 
@@ -13,9 +13,9 @@
 
 **需求依据：**
 
-- [项目改进报告](/E:/classroom-asr-ascii/review/project-improvement-2026-10-22.md)
-- [UI/UX 补充分析](/E:/classroom-asr-ascii/review/uiux-improvement-2026-10-22.md)
-- [项目设计约束](/E:/classroom-asr-ascii/.impeccable.md)
+- [项目改进报告](../review/project-improvement-2026-10-22.md)
+- [UI/UX 补充分析](../review/uiux-improvement-2026-10-22.md)
+- [项目设计约束](../.impeccable.md)
 - 用户要求：“ok，请你根据改进报告和uiux补充分析，开始改进”。
 
 ## 一、核心判断与已选方案
@@ -163,9 +163,9 @@ assert artifact_path(Path("lesson.2"), ".replace.log").name == "lesson.2.replace
 
 - [x] 五件套、替换日志、保留 WAV 统一完整 stem；不同输入 WAV 均保留，工作临时目录始终清理。
 - [x] batch 在启动任何识别前检查同 stem/同目标路径冲突，明确报错并列输入，不自动猜测重命名。
-- [ ] 新任务写 `meta.output_files`；下载优先登记并校验所属目录，保留无登记旧任务和旧分段/MP4 产物兼容。
-- [ ] 验证仅请求 SRT 时最终 transcript 仍可供前端阅读；重命名项目不改变文件定位。
-- [ ] 运行 `python -m pytest -q tests/test_artifacts.py tests/test_srt.py tests/test_pipeline.py tests/test_batch.py tests/test_web.py`，验收为 0 failed。
+- [x] 新任务写 `meta.output_files`；下载优先登记并校验所属目录，保留无登记旧任务和旧分段/MP4 产物兼容。
+- [x] 验证仅请求 SRT 时最终 transcript 仍可供前端阅读；重命名项目不改变文件定位。
+- [x] 运行 `python -m pytest -q tests/test_artifacts.py tests/test_srt.py tests/test_pipeline.py tests/test_batch.py tests/test_web.py`，验收为 0 failed。
 
 ### T3：限定 Web 文件、配置与访问范围（R1）
 
@@ -173,11 +173,11 @@ assert artifact_path(Path("lesson.2"), ".replace.log").name == "lesson.2.replace
 
 接口：runtime 暴露固定 `config_path`；Web 请求按第 3 节契约校验；现有 URL 保留。
 
-- [ ] 先用合成临时文件写边界回归：目录外静态文件不可返回；任意 HTTP 配置路径被拒绝且目标不变。
-- [ ] 静态目录采用受限服务或规范路径所属检查，继续保留 no-cache 行为。
-- [ ] 密钥 GET 不含明文；保存/测试按 null、非空、空串三态处理；所有错误不得回显密钥。
-- [ ] 加入 loopback/远端/认证回归：伪造 Host、转发头无效；下载与页面同样受保护。
-- [ ] 运行 `python -m pytest -q tests/test_web_access.py tests/test_web.py tests/test_config.py`，验收为 0 failed。
+- [x] 先用合成临时文件写边界回归：目录外静态文件不可返回；任意 HTTP 配置路径被拒绝且目标不变。
+- [x] 静态目录采用受限服务或规范路径所属检查，继续保留 no-cache 行为。
+- [x] 密钥 GET 不含明文；保存/测试按 null、非空、空串三态处理；所有错误不得回显密钥。
+- [x] 加入 loopback/远端/认证回归：伪造 Host、转发头无效；下载与页面同样受保护。
+- [x] 运行 `python -m pytest -q tests/test_web_access.py tests/test_web.py tests/test_config.py`，验收为 0 failed。
 
 ### T4：冻结模型加载身份，显式传任务选项（R8、R12 配置部分）
 
@@ -201,14 +201,14 @@ assert artifact_path(Path("lesson.2"), ".replace.log").name == "lesson.2.replace
 
 接口：repository 提供条件准入和上传凭证事务；execution 管理器默认 1 worker、8 个等待位置，统一接收普通、多段、自动 AI、手动 AI 任务。
 
-- [ ] 先写并发准入/取消竞争测试：两次 AI 请求恰好一个 202；取消与受理恰好一个获胜，响应丢失可查到准确 task_id。
-- [ ] 用有界容量预留与事务协调确保队满 503 无残留；拒绝重复凭证生成第二个任务。
-- [ ] 业务执行不再各自创建无主 daemon 线程；任务携带本次执行身份，超时后的晚到回调不得复活终态。
-- [ ] 重启时转写遗留任务标记中断；仅 AI 中断保住转写和旧稿，记录失败，恢复不自动调用 LLM。
-- [ ] pending/running/执行者仍活跃的删除为 409；批删逐项说明。转写到自动 AI 的所有权交接也在管理器内完成。
-- [ ] 关闭先停止准入，再协调在途任务，执行者未退出不并发释放模型。看门狗文案明确“标记失败”，不声称底层已停止。
-- [ ] 验证多段第二文件失败、probe 期间取消、当前半截文件尚未登记等清理场景。
-- [ ] 运行 `python -m pytest -q tests/test_task_repository.py tests/test_execution.py tests/test_upload_sessions.py tests/test_web.py`，验收为 0 failed。
+- [x] 先写并发准入/取消竞争测试：两次 AI 请求恰好一个 202；取消与受理恰好一个获胜，响应丢失可查到准确 task_id。
+- [x] 用有界容量预留与事务协调确保队满 503 无残留；拒绝重复凭证生成第二个任务。
+- [x] 业务执行不再各自创建无主 daemon 线程；任务携带本次执行身份，超时后的晚到回调不得复活终态。
+- [x] 重启时转写遗留任务标记中断；仅 AI 中断保住转写和旧稿，记录失败，恢复不自动调用 LLM。
+- [x] pending/running/执行者仍活跃的删除为 409；批删逐项说明。转写到自动 AI 的所有权交接也在管理器内完成。
+- [x] 关闭先停止准入，再协调在途任务，执行者未退出不并发释放模型。看门狗文案明确“标记失败”，不声称底层已停止。
+- [x] 验证多段第二文件失败、probe 期间取消、当前半截文件尚未登记等清理场景。
+- [x] 运行 `python -m pytest -q tests/test_task_repository.py tests/test_execution.py tests/test_upload_sessions.py tests/test_web.py`，验收为 0 failed。
 
 ### T6：AI 完整性校验与原子发布（R9）
 
@@ -216,56 +216,56 @@ assert artifact_path(Path("lesson.2"), ".replace.log").name == "lesson.2.replace
 
 接口：新增 `atomic_write_text(path: Path, text: str) -> None`，同目录临时文件写完并关闭后原子替换，失败清理临时文件；发布与登记按第 3.3 节规则执行。
 
-- [ ] mock 非空正文配 `finish_reason="length"`，先断言会抛 `LLMError`；覆盖过滤、异常类型和空正文。
-- [ ] 写入中断/替换失败时，断言旧完整文件逐字节不变，未发布半成品不可下载。
-- [ ] 新尝试单独记账；成功才替换 `ai_files`，单件失败不拖累其他件或转写成果。
-- [ ] 记录输入字符数、输出字符数和可用结束原因；不引入自动续写、重复付费或未经验证的分块合并。
-- [ ] 运行 `python -m pytest -q tests/test_llm.py tests/test_artifacts.py tests/test_web.py`，验收为 0 failed。
+- [x] mock 非空正文配 `finish_reason="length"`，先断言会抛 `LLMError`；覆盖过滤、异常类型和空正文。
+- [x] 写入中断/替换失败时，断言旧完整文件逐字节不变，未发布半成品不可下载。
+- [x] 新尝试单独记账；成功才替换 `ai_files`，单件失败不拖累其他件或转写成果。
+- [x] 记录输入字符数、输出字符数和可用结束原因；不引入自动续写、重复付费或未经验证的分块合并。
+- [x] 运行 `python -m pytest -q tests/test_llm.py tests/test_artifacts.py tests/test_web.py`，验收为 0 failed。
 
 ### T7：上传、列表与质量选择交互（UI 第一批）
 
 文件：`asr/web/static/index.html`、`list.js`；浏览器测试入口由 T10 固化。CSS 需求交 T8 所有者合并。
 
-- [ ] 接入上传凭证、XHR 真实进度与取消确认，完整实现第 3.2 节全部状态文案。
-- [ ] 搜索/筛选立即清空选择；首次空态和搜索空态分开；批删前展示名称和不可删除项。
-- [ ] 质量与说话人文案使用第 3.4 节确切含义；仅显示实际可用的下载和删除动作。
-- [ ] 浏览器验证慢上传、取消先赢、受理先赢、网络未确认、筛选后选择、批删部分失败；预期不显示虚假的取消成功、不删除隐藏选择。
+- [x] 接入上传凭证、XHR 真实进度与取消确认，完整实现第 3.2 节全部状态文案。
+- [x] 搜索/筛选立即清空选择；首次空态和搜索空态分开；批删前展示名称和不可删除项。
+- [x] 质量与说话人文案使用第 3.4 节确切含义；仅显示实际可用的下载和删除动作。
+- [x] 浏览器验证慢上传、取消先赢、受理先赢、网络未确认、筛选后选择、批删部分失败；预期不显示虚假的取消成功、不删除隐藏选择。
 
 ### T8：任务阅读、设置与可访问性（UI 第二批）
 
 文件：`task.html`、`task.js`、`settings.html`、`settings.js`、`style.css`、必要的本地小型脚本模块；保留现有测试锚点。
 
-- [ ] 将主任务阶段、AI 阶段和下载可用性分开呈现；保留工程详情与真实进度。
-- [ ] 实现运行态最近 80 段、完成态每页 80 段与全文段落搜索；翻页和搜索不截断复制全文数据。
-- [ ] 首层 SRT/TXT 与更多格式分组；长 AI 稿可选全屏，失败重生明确上次版本。
-- [ ] 设置中文/高级字段折叠/来源返回；密钥未编辑发送 null，显式清空发送空串；保存和导航不自动生成 AI。
-- [ ] 阅读层打开时进入焦点、Tab 保持在层内、Escape 关闭并返回原按钮，背景不可交互；动态消息提供适当状态提示。
-- [ ] 窄屏保留项目名，长文 16px 起点，浅深主题与减少动画不回退。
-- [ ] 真实浏览器验证 1440×900、768×1024、390×844、桌面 200% 缩放；使用至少 200 段和长表格/长标题合成稿，验证能读到第 1/81/161 段及搜索命中、键盘完整流程。保存必要截图。
-- [ ] 补充 320px 窄屏、700/701px 与 900/901px 断点边界、浅/深主题和 reduced-motion，核对布局无页面级溢出且核心操作可达；未经浏览器测量不报告对比度合格。
+- [x] 将主任务阶段、AI 阶段和下载可用性分开呈现；保留工程详情与真实进度。
+- [x] 实现运行态最近 80 段、完成态每页 80 段与全文段落搜索；翻页和搜索不截断复制全文数据。
+- [x] 首层 SRT/TXT 与更多格式分组；长 AI 稿可选全屏，失败重生明确上次版本。
+- [x] 设置中文/高级字段折叠/来源返回；密钥未编辑发送 null，显式清空发送空串；保存和导航不自动生成 AI。
+- [x] 阅读层打开时进入焦点、Tab 保持在层内、Escape 关闭并返回原按钮，背景不可交互；动态消息提供适当状态提示。
+- [x] 窄屏保留项目名，长文 16px 起点，浅深主题与减少动画不回退。
+- [x] 真实浏览器验证 1440×900、768×1024、390×844、桌面 200% 缩放；使用至少 200 段和长表格/长标题合成稿，验证能读到第 1/81/161 段及搜索命中、键盘完整流程。保存必要截图。
+- [x] 补充 320px 窄屏、700/701px 与 900/901px 断点边界、浅/深主题和 reduced-motion，核对布局无页面级溢出且核心操作可达；未经浏览器测量不报告对比度合格。
 
 ### T9：安全启动、统一解释器与版本契约（R6、R11）
 
 文件：`setup.bat`、`run_web.bat`、`pyproject.toml`、`requirements.txt`、`.gitignore`、`scripts/download_models.py`；新增 `requirements-dev.txt`、`constraints/cpu-py312.txt`、模型 revision 清单、`tests/test_launchers.py`、`tests/test_installation.py`。
 
-- [ ] **批次 A 优先完成：**删除所有按端口无条件 taskkill 的逻辑，端口占用给出明确提示；用命令替身检查，不运行真实终止命令。
-- [ ] 安装创建项目 `.venv`，启动使用同一个解释器，缺少时给安装指引；模型下载脚本保留显式执行，不在回归测试自动下载。
-- [ ] `requires-python` 统一为 `>=3.10,<3.13`，3.12 为本机已验证的单测环境；真实模型支持范围与轻量测试结果分别说明。
-- [ ] 运行依赖由 `requirements.txt` 作为单一来源供 pyproject 读取，测试依赖拆出；显式打包本地静态资源。
-- [ ] CPU 约束记录经过核验的版本，不把整个全局环境一股脑冻结。模型 revision 从可核验公开元数据取得，下载显式传入 revision；不可核验者明确记录边界，不编造哈希或宣称已复现。
-- [ ] 验证脚本参数转发、`.venv` 选择、模型下载 revision 参数、端口占用；运行 `python -m pytest -q tests/test_launchers.py tests/test_installation.py`，验收为 0 failed。
+- [x] **批次 A 优先完成：**删除所有按端口无条件 taskkill 的逻辑，端口占用给出明确提示；用命令替身检查，不运行真实终止命令。
+- [x] 安装创建项目 `.venv`，启动使用同一个解释器，缺少时给安装指引；模型下载脚本保留显式执行，不在回归测试自动下载。
+- [x] `requires-python` 统一为 `>=3.10,<3.13`，3.12 为本机已验证的单测环境；真实模型支持范围与轻量测试结果分别说明。
+- [x] 运行依赖由 `requirements.txt` 作为单一来源供 pyproject 读取，测试依赖拆出；显式打包本地静态资源。
+- [x] CPU 约束记录经过核验的版本，不把整个全局环境一股脑冻结。模型 revision 从可核验公开元数据取得，下载显式传入 revision；不可核验者明确记录边界，不编造哈希或宣称已复现。
+- [x] 验证脚本参数转发、`.venv` 选择、模型下载 revision 参数、端口占用；运行 `python -m pytest -q tests/test_launchers.py tests/test_installation.py`，验收为 0 failed。
 
 ### T10：端到端、文档与独立复核（R10 后半、R11、V1）
 
-文件：新增受版本控制的 `tests/test_workflow.py`、`tests/ui/` 浏览器入口、`.github/workflows/tests.yml`、`docs/validation.md`；修改 README、DEVNOTES、配置模板和必要设计记录。
+文件：新增受版本控制的 `tests/test_workflow_e2e.py`、`tests/browser/verify_ui.py`、`.github/workflows/tests.yml`、`docs/validation.md`、`docs/web-contract.md`；修改 README、DEVNOTES 和必要设计记录。配置模板保留现有兼容默认值。
 
-- [ ] 合成 WAV＋临时 SQLite＋fake 引擎/LLM 串起上传、队列、渐进转写、全部输出、AI 重生失败保旧稿、重启和删除；不依赖 TEMP 中丢失的旧 E2E 脚本。
-- [ ] CI 默认只跑轻量单测/集成；Python 3.10、3.11、3.12 矩阵配置明确，未触发的远端 CI 不能报告为已通过。
-- [ ] 文档区分双击 8765 和模块默认 8000；说明访问密码、固定 Web 配置、密钥三态、取消边界、质量能力和已知限制。
-- [ ] V1 建立真实多人样本协议：跨组同一人、不同人局部同号、轮换与重叠发言；GPU、吞吐、长期内存也仅记录真实测量结果。
-- [ ] 使用 `python -m pytest -q` 跑默认全套，运行 T7/T8 浏览器流程，检查 JS 语法、工作区差异与旧任务迁移。
-- [ ] 由独立 code-reviewer 复核，安全与可访问性问题交相应专家确认；修复发现后重跑关联检查。
-- [ ] 更新本计划勾选项和下方 Review，报告实际修改、测试结果、兼容迁移和仍待真实数据验收的项目。
+- [x] 合成 WAV＋临时 SQLite＋fake 引擎/LLM 串起上传、队列、渐进转写、全部输出、AI 重生失败保旧稿、重启和删除；不依赖 TEMP 中丢失的旧 E2E 脚本。
+- [x] CI 默认只跑轻量单测/集成；Python 3.10、3.11、3.12 矩阵配置明确，未触发的远端 CI 不能报告为已通过。
+- [x] 文档区分双击 8765 和模块默认 8000；说明访问密码、固定 Web 配置、密钥三态、取消边界、质量能力和已知限制。
+- [x] V1 建立真实多人样本协议：跨组同一人、不同人局部同号、轮换与重叠发言；GPU、吞吐、长期内存也仅记录真实测量结果。
+- [x] 使用 `python -m pytest -q` 跑默认全套，运行 T7/T8 浏览器流程，检查 JS 语法、工作区差异与旧任务迁移。
+- [x] 由独立 code-reviewer 复核，安全与可访问性问题交相应专家确认；修复发现后重跑关联检查。
+- [x] 更新本计划勾选项和下方 Review，报告实际修改、测试结果、兼容迁移和仍待真实数据验收的项目。
 
 ## 六、五个必须覆盖的交互边界
 
@@ -290,9 +290,17 @@ assert artifact_path(Path("lesson.2"), ".replace.log").name == "lesson.2.replace
 - [x] 已自查报告覆盖、任务依赖和验收边界：R1–R12 均有任务映射，V1 保留为真实样本验收，未把未知能力写成已实现。
 - [x] 用户确认本实施计划（2026-10-22：开始实施）。
 - [x] 建立工作区、记录新的执行账本与基线（codex/project-improvements，BASE 231baa6）。
-- [ ] 完成 T0–T10 并逐项验收。
-- [ ] 独立代码审查完成，Review 记录完整。
+- [x] 完成 T0–T10 并逐项验收。
+- [x] 独立代码审查完成，Review 记录完整。
 
-### Review（实施结束填写）
+### Review（2026-10-22）
 
-本节最终记录：实际变更与文件、R1–R12 和 UI 建议的完成映射、测试/浏览器结果、已发生的接口收紧、未执行的真实模型/GPU 验收，以及回滚与使用说明。当前没有把任何业务修复标为已完成。
+已完成全部 T0–T10，详细映射与证据见 [实施验收记录](../review/implementation-2026-10-22.md)。主要变更为结果正确性与产物完整命名、冻结模型身份与逐次选项、统一任务所有权与上传取消裁决、配置/认证边界、AI 完整发布及失败保旧稿，以及原生前端的上传、分页阅读、状态、设置和移动端交互。
+
+最终本机 Python 3.12.10 默认全套 **367 passed，2 warnings（33.24s）**；禁用重模型导入后仍 **367 passed（34.43s）**。浏览器 96 组布局、200 段阅读/搜索/复制、受控 XHR 取消竞争、弹层焦点和设置三态通过；原生 200% 缩放实测 factor=2。四个 JS 语法检查通过。独立 code-reviewer 运行 144 项相关用例、安全专项运行 63 项相关用例；无剩余阻断项。可访问性补查确认 320px 三页无横溢、正文 16px、弹层反向 Tab/背景拦截；AI/转写错误增加 alert，重复相同内容不重新播报。
+
+审查发现的 DNS 重绑定、替换日志登记别名和最终空稿残留均先复现再修复。HTTP 任意配置路径现拒绝；GET 不再回显密钥；无密码时同时要求真实回环连接与本机 Host。旧 Result 构造、历史文件、HTTP 成功字段和 CLI 入口保留兼容。
+
+真实模型、GPU、跨组多人身份、长期内存、长课吞吐与远端 CI 未运行；CPU 候选约束和可变 master 不等于完全可复现环境。真实数据验收按 [协议](../docs/validation.md) 执行。两条宿主依赖警告保留。P3 后续项：任务页标题层级、收起上传面板后的焦点返回；未宣称屏幕阅读器或 WCAG 全面合规。
+
+变更仅在应用管理的独立工作区和 `codex/project-improvements` 本地提交；未复制主目录个人配置、模型、真实数据库或媒体。推送、合并、部署未执行。回滚以工作分支提交为单位进行，保留基线 `231baa6`，无需改动用户已有运行数据。

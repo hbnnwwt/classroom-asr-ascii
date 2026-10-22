@@ -12,8 +12,6 @@ const MAX_VISIBLE_LINES = 80;    // DOM 中最多保留的段数（防长 transc
 let currentTaskId = null;
 let pollTimer = null;
 let streamSegments = [];      // 当前任务的全部分段
-let streamRendered = 0;       // 已渲染到 DOM 的分段数
-let collapsedShown = 0;       // DOM 因 MAX_VISIBLE 被折叠掉的段数
 let liveMode = true;          // true=auto-scroll 到底；false=用户自由滚动
 let elapsedTimer = null;      // 阶段级每秒 ticker（区别于任务级 taskElapsedTimer）
 let taskStartTimeMs = 0;     // 任务 started_at 毫秒
@@ -23,6 +21,12 @@ let currentStage = null;      // 当前阶段名（用于 elapsed 显示）
 let stageStartTime = 0;       // 当前阶段开始时间（来自后端 stage_started_at，刷新不重置）
 let taskStatus = null;        // 当前任务状态（done 时一次性渲染 transcript）
 let llmAvailable = false;     // LLM 是否配置（未配置时点"生成 AI 反馈"跳设置页）
+let transcriptionFinished = false;
+let transcriptPage = 0;
+let transcriptQuery = "";
+let lastTranscript = null;
+let lastTranscriptFinal = false;
+let polling = false;
 
 /**
  * 页面加载时恢复任务：URL 路径 /task/{id} 优先（管理界面跳转过来），
@@ -57,6 +61,7 @@ async function restoreLastTask() {
   }
 
   currentTaskId = taskId;
+  $("task-settings-link").href = `/settings?from_task=${encodeURIComponent(taskId)}`;
   // ID 已收进完成态摘要小字行（updateSummary），不再单独设
   // 同步 URL：旧版 ?task= 进来时，转成标准 /task/{id}
   if (!window.location.pathname.startsWith("/task/")) setTaskIdInUrl(taskId);
@@ -67,8 +72,6 @@ async function restoreLastTask() {
   $("transcript-panel").hidden = false;
   resetStages();
   streamSegments = [];
-  streamRendered = 0;
-  collapsedShown = 0;
   liveMode = true;
   $("live-toggle").innerHTML = LIVE_ON;
   startPolling();
@@ -102,7 +105,8 @@ function stopPolling() {
 }
 
 async function poll() {
-  if (!currentTaskId) return;
+  if (!currentTaskId || polling) return;
+  polling = true;
   try {
     const resp = await fetch(`/status/${currentTaskId}`);
     if (resp.status === 404) {
@@ -116,22 +120,25 @@ async function poll() {
     const t = await resp.json();
     updateUI(t);
     // AI 反馈可能还在 done 之后跑：开关开了且没有产物/错误 → 继续轮询
-    const aiPending = t.status === "done" && t.meta
+    const aiPending = ["queued", "running"].includes(t.ai_status) || t.execution_active || (t.status === "done" && t.meta
       && t.meta.ai_feedback && !t.meta.ai_files && !t.meta.ai_error
-      && !t.meta.ai_errors;
-    if ((t.status === "done" && !aiPending) || t.status === "failed") {
+      && !t.meta.ai_errors);
+    if ((t.status === "done" || t.status === "failed") && !aiPending) {
       stopPolling();
     }
   } catch (err) {
     showError(err.message);
+  } finally {
+    polling = false;
   }
 }
 
 function updateUI(t) {
   taskStatus = t.status;
+  transcriptionFinished = t.transcription_status === "done" || t.status === "done" || t.stage === "ai";
   // 完成态折叠：阶段列表/进度条收起（CSS body.is-final）。折叠跟 status 走、
   // 不跟历史走——AI 重跑时 status 回 running，class 自动摘除、阶段列表自动回归
-  document.body.classList.toggle("is-final", t.status === "done");
+  document.body.classList.toggle("is-final", transcriptionFinished);
   // 多段任务专属 UI：拼接阶段行（新任务 meta.parts，旧任务 meta.merge_mode）。
   // MP4 下载按钮只属于旧版"真合并"任务——新方案不产视频，只产字幕。
   const isMulti = Boolean(t.meta && (t.meta.parts || t.meta.merge_mode));
@@ -152,7 +159,8 @@ function updateUI(t) {
   // 没命中术语的任务不再点出 404
   const rlBtn = document.querySelector('#downloads .btn[data-fmt="replace.log"]');
   if (rlBtn) rlBtn.hidden = !(t.meta && (t.meta.formats || []).includes("replace_log"));
-  $("status").textContent = statusLabel(t.status);
+  $("status").textContent = transcriptionFinished ? "转写已完成" : statusLabel(t.status);
+  $("error").hidden = true;
   // 项目名（页面顶部）
   if (t.name && $("project-name").textContent !== t.name) {
     $("project-name").textContent = t.name;
@@ -162,28 +170,53 @@ function updateUI(t) {
   updateTaskElapsed(t);
   updateSummary(t);
   if (t.stage) renderStages(t.stage, t.message, t.stage_started_at, t.started_at);
+  renderMainPhases(t);
 
   // 整体进度条
-  const pct = Math.round((t.progress || 0) * 100);
+  const pct = transcriptionFinished ? 100 : Math.max(0, Math.min(100, Math.round((t.progress || 0) * 100)));
   $("progress-fill").style.width = pct + "%";
   $("progress-fill").textContent = pct + "%";
+  document.querySelector(".progress-bar").setAttribute("aria-valuenow", String(pct));
 
   // 伪实时转写：transcript 是 JSON 编码的 segments 数组
-  if (t.transcript) handleTranscript(t.transcript);
+  if (t.transcript || transcriptionFinished) handleTranscript(t.transcript || "[]");
 
-  if (t.status === "failed") showError(t.error || "失败");
+  if (t.status === "failed" && !transcriptionFinished) showError(t.error || "转写失败，请检查录音和设置后重试。");
   // AI stage（running+stage=ai）期间转写产物已最终落盘，后端已放行下载：
   // 下载区照常显示，别让用户白等一次 LLM。
-  if (t.status === "done" || (t.status === "running" && t.stage === "ai")) {
+  if (transcriptionFinished) {
     $("downloads").hidden = false;
     $("ai-section").hidden = false;   // AI 产物区与下载区同条件显隐
     document.querySelectorAll("#downloads a.btn").forEach((a) => {
+      const formats = t.available_formats || t.meta?.formats || [];
+      const format = a.dataset.fmt;
+      a.hidden = !formats.includes(format) && !(format === "replace.log" && formats.includes("replace_log")) && !(format === "mp4" && t.meta?.merge_mode);
       a.href = `/download/${currentTaskId}/${a.dataset.fmt}`;
       a.download = "";
     });
+    $("more-formats").hidden = !Array.from(document.querySelectorAll("#more-formats a")).some((a) => !a.hidden);
+    const fast = t.meta?.quality === "fast";
+    $("quality-note").hidden = !fast;
+    $("quality-note").textContent = "本任务使用快速文字模式，字幕时间信息较粗；制作精细字幕建议选择字幕转写模式。";
     renderPartDownloads(t.meta);
     renderAiUi(t);
   }
+}
+
+function renderMainPhases(t) {
+  const phase = ["asr"].includes(t.stage) ? 1 : ["postprocess", "write", "done", "ai"].includes(t.stage) ? 2 : 0;
+  document.querySelectorAll("#main-phases li").forEach((li, i) => {
+    li.classList.toggle("done", transcriptionFinished || i < phase);
+    li.classList.toggle("active", !transcriptionFinished && t.status === "running" && i === phase);
+    if (!transcriptionFinished && i === phase) li.setAttribute("aria-current", "step");
+    else li.removeAttribute("aria-current");
+  });
+  const aiActive = ["queued", "running"].includes(t.ai_status) || (t.stage === "ai" && ["pending", "running"].includes(t.status));
+  $("phase-message").textContent = transcriptionFinished
+    ? `转写已完成，可以阅读和下载。${aiActive ? "AI 内容正在生成，可稍后查看。" : ""}`
+    : t.status === "failed" ? "转写未完成，请查看下方原因。"
+    : t.status === "pending" ? "任务已接收，正在排队。开始后将逐段显示文字。"
+    : ["正在准备录音，第一批文字出现前可能需要等待。", "正在生成文字，可在右侧查看已识别内容。", "文字已生成，正在整理时间轴和下载文件。"][phase];
 }
 
 /**
@@ -223,8 +256,8 @@ function renderPartDownloads(meta) {
  * 不连坐）谁失败报谁；动作按钮：点评+优化稿整组、深度优化单独，各配
  * 生成/重新生成/重试三态（confirm 防误触烧 token）。
  */
-const AI_NAMES = { feedback: "AI 点评", polished: "优化稿", deep: "深度优化" };
-const AI_TITLES = { feedback: "AI 点评报告", polished: "优化逐字稿", deep: "深度优化讲义" };
+const AI_NAMES = { feedback: "教学点评", polished: "整理后的逐字稿", deep: "课堂讲义" };
+const AI_TITLES = AI_NAMES;
 let aiPairFiles = false;   // 点击时判定 confirm 用（产物可能被上一轮 renderAiUi 刷新）
 let aiDeepFiles = false;
 
@@ -238,39 +271,46 @@ function renderAiUi(t) {
   aiPairFiles = Boolean(files.feedback || files.polished);
   aiDeepFiles = Boolean(files.deep);
 
+  const active = ["queued", "running"].includes(t.ai_status) || (t.stage === "ai" && ["pending", "running"].includes(t.status));
+  $("ai-state-message").textContent = active ? (t.ai_status === "queued" ? "AI 内容正在排队，转写结果已经可以下载。" : "AI 内容生成中，转写结果已经可以下载。") : "教学点评帮助回顾课堂；整理后的逐字稿便于阅读；课堂讲义用于课后复习。";
+
   const box = $("ai-actions");
-  if (t.status !== "done") { box.hidden = true; return; }
-  box.hidden = false;
+  box.hidden = active || t.execution_active;
+  $("ai-modal-regen").disabled = active || Boolean(t.execution_active);
 
   // 错误条：全局 ai_error（无转写/LLM 未配置等前置失败）+ 按件 ai_errors，
   // 一条一行；已有产物 + 补跑再失败时两键并存，不得拿陈旧产物掩住错误
   const lines = [];
   if (meta.ai_error) lines.push(`AI 反馈失败：${meta.ai_error}`);
   Object.entries(errs).forEach(([fmt, msg]) =>
-    lines.push(`${AI_NAMES[fmt] || fmt}失败：${msg}`));
+    lines.push(`${AI_NAMES[fmt] || fmt}本次生成失败：${msg}${files[fmt] ? "。仍可查看上次版本。" : ""}`));
+  Object.entries(meta.ai_attempts || {}).forEach(([fmt, attempt]) => {
+    if (attempt.status === "failed" && !errs[fmt]) lines.push(`${AI_NAMES[fmt] || fmt}本次生成失败。${files[fmt] ? "仍可查看上次版本。" : "请重试。"}`);
+  });
   const errBox = $("ai-error");
   errBox.hidden = !lines.length;
-  errBox.textContent = lines.join("\n");
+  const errorText = lines.join("\n");
+  if (errBox.textContent !== errorText) errBox.textContent = errorText;
 
   const pairErr = errs.feedback || errs.polished || meta.ai_error;
   $("ai-retry").textContent = pairErr ? "重试 AI 反馈"
     : (aiPairFiles ? "重新生成 AI 反馈" : "生成 AI 反馈");
-  $("ai-deep").textContent = errs.deep ? "重试深度优化"
-    : (aiDeepFiles ? "重新生成深度优化" : "生成深度优化");
+  $("ai-deep").textContent = errs.deep ? "重试课堂讲义"
+    : (aiDeepFiles ? "重新生成课堂讲义" : "生成课堂讲义");
 }
 
 // 手动生成/重新生成（任务页两键 + 阅读层单件键共用）：POST 触发后台
 // AI stage，收起动作区防二次点击吃 409，恢复轮询看进度（失败只 alert）
 async function triggerAiRun(path, btn, confirmMsg) {
   // 未配置 LLM：不 POST（必吃 409），直接送去设置页
-  if (!llmAvailable) { window.location.href = "/settings"; return; }
+  if (!llmAvailable) { window.location.href = `/settings?from_task=${encodeURIComponent(currentTaskId)}`; return; }
   if (confirmMsg && !confirm(confirmMsg)) return;
   btn.disabled = true;
   try {
     const resp = await fetch(`/api/tasks/${currentTaskId}${path}`, { method: "POST" });
     if (!resp.ok) {
       const err = await resp.json().catch(() => ({}));
-      throw new Error(err.detail || `触发失败: ${resp.status}`);
+      throw new Error(typeof err.detail === "string" ? err.detail : err.detail?.message || `触发失败: ${resp.status}`);
     }
     closeAiViewer();
     $("ai-actions").hidden = true;   // 重跑期间收起按钮，防二次点击吃 409
@@ -296,93 +336,71 @@ $("ai-modal-regen").addEventListener("click", () => {
 });
 
 /**
- * 收到新的 transcript JSON：解析成 segments，把未渲染的段全部补上。
- *
- * 识别进行中后端逐组增量写 transcript（见 asr/web/__init__.py _on_segs），
- * 轮询到的数组 append-only 增长；任务 done 时改用最终 .json 整体覆盖
- * （后处理 ITN/术语替换可能改写已渲染的文本，甚至丢段）——检测到前缀
- * 变化就整体重置重绘，否则只补尾部。
+ * 识别中展示最近 80 段；完成后按最终数组分页，搜索覆盖全部段落。
+ * 未变化的轮询不重绘，保留用户当前页与阅读位置。
  */
 function handleTranscript(transcriptJson) {
   let segs;
   try { segs = JSON.parse(transcriptJson); } catch { return; }
-  if (!Array.isArray(segs) || segs.length === 0) return;
-
-  // 前缀变化检测：新数组比已渲染的短，或已渲染位置文本不一致 → done 覆盖
-  let prefixIntact = segs.length >= streamRendered;
-  for (let i = 0; prefixIntact && i < streamRendered; i++) {
-    if (!segs[i] || segs[i].text !== streamSegments[i].text) prefixIntact = false;
-  }
-  if (!prefixIntact) resetTranscriptDom();
-
+  if (!Array.isArray(segs)) return;
+  if (lastTranscript === transcriptJson && lastTranscriptFinal === transcriptionFinished) return;
+  if (lastTranscriptFinal !== transcriptionFinished) transcriptPage = 0;
+  lastTranscript = transcriptJson;
+  lastTranscriptFinal = transcriptionFinished;
   streamSegments = segs;
   $("transcript-panel").hidden = false;
-
-  while (streamRendered < streamSegments.length) {
-    renderNextSegment();
-  }
-  // 渲染完毕：去掉末段的 current 高亮（旧流式路径由停表时清理）
-  const cur = document.querySelector(".transcript .line.current");
-  if (cur) cur.classList.remove("current");
+  renderTranscript();
 }
 
-/** 清空 transcript DOM 与渲染计数（done 覆盖改写前缀时整体重绘用）。 */
-function resetTranscriptDom() {
-  $("transcript").innerHTML = "";
-  streamRendered = 0;
-  collapsedShown = 0;
-}
-
-function renderNextSegment() {
-  const seg = streamSegments[streamRendered];
-  const div = document.createElement("div");
-  div.className = "line";
-  div.style.animationDelay = "0s";
-  div.innerHTML =
-    `<span class="ts">${fmtTs(seg.start)}</span>` +
-    `<span class="txt"></span>`;
-  div.querySelector(".txt").textContent = seg.text || "";
-
-  // 去掉上一段的 current 高亮
-  const prev = document.querySelector(".transcript .line.current");
-  if (prev) prev.classList.remove("current");
-  div.classList.add("current");
-
+/** 全量数组始终保留；仅当前页或最近 80 段进入 DOM。 */
+function renderTranscript() {
   const container = $("transcript");
-
-  // 折叠提示：删掉最早的"折叠 X 段"占位（保留最新一个）
-  const oldCollapsed = container.querySelector(".collapsed-placeholder");
-  if (oldCollapsed) oldCollapsed.remove();
-
-  container.appendChild(div);
-
-  // DOM 截断：超过 MAX_VISIBLE_LINES 就删最老的 .line，加折叠提示
-  const lines = container.querySelectorAll(".line");
-  if (lines.length > MAX_VISIBLE_LINES) {
-    const toRemove = lines.length - MAX_VISIBLE_LINES;
-    for (let i = 0; i < toRemove; i++) {
-      const first = container.querySelector(".line");
-      if (first) {
-        container.removeChild(first);
-        collapsedShown++;
-      }
-    }
-    // 在最前面加折叠提示（独立 class，不参与 .line 计数）
-    const placeholder = document.createElement("div");
-    placeholder.className = "collapsed-placeholder";
-    placeholder.textContent = `··· 已折叠 ${collapsedShown} 段（查看完整请下载 JSON）···`;
-    container.insertBefore(placeholder, container.firstChild);
+  const previousScroll = container.scrollTop;
+  const query = transcriptQuery.toLocaleLowerCase();
+  const matching = streamSegments.map((segment, index) => ({ segment, index }))
+    .filter(({ segment }) => !transcriptionFinished || !query || `${segment.spk || ""} ${segment.text || ""}`.toLocaleLowerCase().includes(query));
+  const pages = Math.max(1, Math.ceil(matching.length / MAX_VISIBLE_LINES));
+  transcriptPage = Math.max(0, Math.min(transcriptPage, pages - 1));
+  const start = transcriptionFinished ? transcriptPage * MAX_VISIBLE_LINES : Math.max(0, matching.length - MAX_VISIBLE_LINES);
+  const rows = matching.slice(start, start + MAX_VISIBLE_LINES);
+  const fragment = document.createDocumentFragment();
+  for (const { segment: seg, index } of rows) {
+    const line = document.createElement("div");
+    line.className = "line";
+    line.dataset.segment = String(index + 1);
+    const ts = document.createElement("span");
+    ts.className = "ts";
+    ts.textContent = fmtTs(seg.start);
+    const text = document.createElement("span");
+    text.className = "txt";
+    text.textContent = `${seg.spk ? `${seg.spk}：` : ""}${seg.text || ""}`;
+    line.append(ts, text);
+    fragment.appendChild(line);
   }
+  container.replaceChildren(fragment);
+  $("transcript-heading").textContent = transcriptionFinished ? "完整逐字稿" : "实时转写";
+  $("transcript-reading").hidden = !transcriptionFinished;
+  $("live-toggle").hidden = transcriptionFinished;
+  $("copy-transcript").disabled = !streamSegments.length;
+  $("transcript-count").textContent = `（共 ${streamSegments.length} 段）`;
+  $("transcript-page").textContent = `${transcriptPage + 1} / ${pages} 页${query ? ` · ${matching.length} 个匹配段落` : ""}`;
+  $("transcript-prev").disabled = transcriptPage === 0;
+  $("transcript-next").disabled = transcriptPage + 1 >= pages;
+  $("transcript-note").textContent = transcriptionFinished
+    ? (!matching.length ? "没有匹配的段落，请修改搜索内容。" : `显示第 ${start + 1}–${start + rows.length} 个${query ? "匹配" : ""}段落。搜索与复制覆盖完整逐字稿。`)
+    : streamSegments.length ? `已识别 ${streamSegments.length} 段，显示最近 ${rows.length} 段。完成后可分页阅读与搜索全文。`
+    : "正在准备录音。第一批文字出现前可能需要等待，请查看处理阶段。";
+  container.scrollTop = transcriptionFinished ? previousScroll : liveMode ? container.scrollHeight : previousScroll;
+}
 
-  // live 模式下自动滚到底；paused 时不打扰用户
-  if (liveMode) {
-    container.scrollTop = container.scrollHeight;
-  }
-
-  // 顶部计数器：已显示 / 总段数（先自增再显示，终态 (N/N) 而非差一的 (N-1/N)）
-  const total = streamSegments.length;
-  streamRendered++;
-  $("transcript-count").textContent = `(${streamRendered}/${total})`;
+$("transcript-search").addEventListener("input", (e) => {
+  transcriptQuery = e.target.value.trim();
+  transcriptPage = 0;
+  renderTranscript();
+  $("transcript").scrollTop = 0;
+});
+for (const [id, delta] of [["transcript-prev", -1], ["transcript-next", 1]]) {
+  $(id).addEventListener("click", () => { transcriptPage += delta; renderTranscript(); $("transcript").scrollTop = 0; });
 }
 
 /** 暂停/恢复自动滚动 */
@@ -514,23 +532,22 @@ function formatDuration(secs) {
 }
 
 /**
- * 完成态摘要：时长/段数/说话人数全部从 transcript 直接算（后端零新增字段）。
- * 运行中保持最小形态（状态+已用）——"已识别时长"≠"视频时长"，跳动的数字是噪音。
- * 非分说话人任务 segs 无 spk 字段 → 说话人一项自动不显示，零特殊情况。
+ * 摘要使用录音真实时长 meta.duration_s；段数与说话人数来自完整逐字稿。
  */
 function updateSummary(t) {
-  const final = t.status === "done";
+  const final = transcriptionFinished;
   let segs = [];
   if (t.transcript) {
     try { segs = JSON.parse(t.transcript) || []; } catch { /* 脏数据按无转写处理 */ }
   }
   if (final && segs.length) {
-    const dur = Math.max(...segs.map((s) => s.end || 0));
-    $("sum-duration").textContent = `· 时长 ${formatDuration(Math.round(dur))}`;
-    $("sum-duration").hidden = false;
+    const dur = Number(t.meta?.duration_s);
+    $("sum-duration").textContent = `· 录音时长 ${formatDuration(Math.round(dur))}`;
+    $("sum-duration").hidden = !Number.isFinite(dur) || dur <= 0;
     $("sum-segs").textContent = `· ${segs.length} 段`;
     $("sum-segs").hidden = false;
     const speakers = new Set(segs.map((s) => s.spk).filter(Boolean));
+    $("sum-speakers").hidden = !speakers.size;
     if (speakers.size) {
       $("sum-speakers").textContent = `· ${speakers.size} 位说话人`;
       $("sum-speakers").hidden = false;
@@ -598,7 +615,7 @@ function statusLabel(s) {
   return ({ pending: "等待中", running: "处理中", done: "完成", failed: "失败" })[s] || s;
 }
 function showError(msg) {
-  $("error").textContent = msg;
+  if ($("error").textContent !== msg) $("error").textContent = msg;
   $("error").hidden = false;
 }
 // ---------------------------------------------------------------------------
@@ -609,11 +626,16 @@ function showError(msg) {
 // ---------------------------------------------------------------------------
 let aiCache = {};           // {clean: {name,html,diff}, diff: {...}}，每次打开重置
 let currentModalFmt = null; // 当前阅读的产物件（重新生成按钮的 POST 目标）
+let modalOpener = null;
+let modalRequest = 0;
+let modalTab = "clean";
+let previousBodyOverflow = "";
 
 function loadAiTab(fmt, tab) {
+  const request = ++modalRequest;
   const body = $("ai-modal-body");
   const fill = (d) => {
-    if (d.name) $("ai-modal-title").textContent = d.name;
+    $("ai-modal-title").textContent = AI_TITLES[fmt];
     // diff 页签但后端给不了（原逐字稿缺失）→ 老实说，别渲染成正文
     body.innerHTML = (tab === "diff" && !d.diff)
       ? "<p>原逐字稿缺失，无法比对修改痕迹。</p>"
@@ -623,34 +645,56 @@ function loadAiTab(fmt, tab) {
   body.textContent = "加载中…";
   fetch(`/api/tasks/${currentTaskId}/ai/${fmt}${tab === "diff" ? "?diff=1" : ""}`)
     .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
-    .then((d) => { aiCache[tab] = d; fill(d); })
-    .catch((e) => { body.textContent = `✗ 加载失败：${e.message}`; });
+    .then((d) => { if (request !== modalRequest || currentModalFmt !== fmt || modalTab !== tab) return; aiCache[tab] = d; fill(d); })
+    .catch((e) => { if (request === modalRequest && currentModalFmt === fmt) body.textContent = `加载失败：${e.message}。请关闭后重试。`; });
 }
 
 function setAiTab(tab) {
-  document.querySelectorAll("#ai-modal-tabs .tab").forEach((b) =>
-    b.classList.toggle("active", b.dataset.tab === tab));
+  modalTab = tab;
+  document.querySelectorAll("#ai-modal-tabs .tab").forEach((b) => {
+    b.classList.toggle("active", b.dataset.tab === tab);
+    b.setAttribute("aria-pressed", String(b.dataset.tab === tab));
+  });
   loadAiTab(currentModalFmt, tab);
 }
 
 function openAiViewer(fmt) {
+  modalOpener = document.activeElement;
   currentModalFmt = fmt;
   aiCache = {};
   // 正文页签文案随件走：深度优化是讲义成稿，不叫"优化稿"
   // （双向设置：先看 deep 再看 polished 时不得残留"讲义"）
   document.querySelector('#ai-modal-tabs .tab[data-tab="clean"]').textContent =
-    fmt === "deep" ? "讲义" : "优化稿";
+    fmt === "deep" ? "讲义正文" : "逐字稿正文";
   $("ai-modal-tabs").hidden = fmt === "feedback";
   $("ai-modal-title").textContent = AI_TITLES[fmt];
   $("ai-modal-dl").href = `/download/${currentTaskId}/${fmt}`;
   $("ai-modal").hidden = false;
-  loadAiTab(fmt, "clean");
+  document.querySelector("main").inert = true;
+  previousBodyOverflow = document.body.style.overflow;
+  document.body.style.overflow = "hidden";
+  setAiTab("clean");
+  $("ai-modal-title").focus();
 }
 
 function closeAiViewer() {
+  if ($("ai-modal").hidden) return;
   $("ai-modal").hidden = true;
+  $("ai-modal").classList.remove("is-expanded");
+  $("ai-modal-expand").setAttribute("aria-pressed", "false");
+  $("ai-modal-expand").textContent = "全屏阅读";
+  document.querySelector("main").inert = false;
+  document.body.style.overflow = previousBodyOverflow;
+  modalRequest++;
   currentModalFmt = null;
+  if (modalOpener && modalOpener.isConnected) modalOpener.focus();
 }
+
+$("ai-modal-expand").addEventListener("click", () => {
+  const expanded = $("ai-modal").classList.toggle("is-expanded");
+  $("ai-modal-expand").setAttribute("aria-pressed", String(expanded));
+  $("ai-modal-expand").textContent = expanded ? "退出全屏阅读" : "全屏阅读";
+});
 
 document.querySelectorAll("#ai-section .btn-view").forEach((b) =>
   b.addEventListener("click", () => openAiViewer(b.dataset.view)));
@@ -662,5 +706,15 @@ $("ai-modal").addEventListener("click", (e) => {
   if (e.target === $("ai-modal")) closeAiViewer();   // 点遮罩关闭
 });
 document.addEventListener("keydown", (e) => {
-  if (e.key === "Escape" && !$("ai-modal").hidden) closeAiViewer();
+  if ($("ai-modal").hidden) return;
+  if (e.key === "Escape") { e.preventDefault(); closeAiViewer(); return; }
+  if (e.key !== "Tab") return;
+  const focusable = Array.from($("ai-modal").querySelectorAll('a[href], button:not([disabled]), [tabindex="0"]')).filter((el) => el.getClientRects().length);
+  const first = focusable[0];
+  const last = focusable[focusable.length - 1];
+  if (e.shiftKey && (document.activeElement === first || document.activeElement === $("ai-modal-title"))) { e.preventDefault(); last?.focus(); }
+  else if (!e.shiftKey && (document.activeElement === last || document.activeElement === $("ai-modal-title"))) { e.preventDefault(); first?.focus(); }
+});
+document.addEventListener("focusin", (e) => {
+  if (!$("ai-modal").hidden && !$("ai-modal").contains(e.target)) $("ai-modal-title").focus();
 });

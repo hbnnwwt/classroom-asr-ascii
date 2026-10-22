@@ -1,0 +1,16 @@
+# Windows x86-64 / CPython 3.12 CPU candidate profile, verified 2026-10-22.
+# Install with -r requirements.txt -c constraints/cpu-py312.txt
+#   --extra-index-url https://download.pytorch.org/whl/cpu
+# Partial constraints, not a full transitive lock or a real-model acceptance claim.
+# PyTorch/TorchAudio pairing: https://pytorch.org/get-started/previous-versions/
+# cp312 Windows CPU wheel HEAD requests returned HTTP 200 for both artifacts.
+torch==2.6.0+cpu
+torchaudio==2.6.0+cpu
+# Exact releases and Python support checked at https://pypi.org/pypi/NAME/VERSION/json
+# funasr/modelscope metadata match the locally available packages; no model was loaded.
+funasr==1.4.16
+modelscope==1.35.3
+numpy==1.26.4
+# These versions are present in the lightweight Python 3.12 test environment.
+pydantic==2.12.5
+fastapi==0.141.1

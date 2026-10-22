@@ -94,3 +94,19 @@ def test_chat_disabled_config_raises():
         base_url="", api_key="", model="", timeout=5, max_tokens=512)})
     with pytest.raises(LLMError, match="未配置"):
         chat(MSG, off)
+
+
+@pytest.mark.parametrize("reason", ["length", "content_filter"])
+def test_nonempty_truncated_reply_is_not_a_complete_artifact(reason):
+    body = {"choices": [{"finish_reason": reason, "message": {"content": "已经返回但不完整"}}]}
+    with patch("asr.llm.requests.post", return_value=_resp(body=body)):
+        with pytest.raises(LLMError, match=reason):
+            chat(MSG, CFG)
+
+
+@pytest.mark.parametrize("content", [123, ["text"], {"text": "value"}, None])
+def test_nonstring_content_is_wrapped_as_llmerror(content):
+    body = {"choices": [{"finish_reason": "stop", "message": {"content": content}}]}
+    with patch("asr.llm.requests.post", return_value=_resp(body=body)):
+        with pytest.raises(LLMError):
+            chat(MSG, CFG)

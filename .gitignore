@@ -1,6 +1,12 @@
 __pycache__/
 *.pyc
 .pytest_cache/
+.venv/
+build/
+dist/
+*.egg-info/
+test-results/
+playwright-report/
 .superpowers/
 .workbuddy/
 

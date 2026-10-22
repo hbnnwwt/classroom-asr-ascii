@@ -17,14 +17,14 @@
   --border-strong: #d2d2d7;
   --text: #1d1d1f;
   --text-2: #6e6e73;
-  --text-3: #86868b;
+  --text-3: #6e6e73;
   --accent: #0071e3;        /* 文字/链接用 */
   --accent-btn: #0071e3;    /* 填充底用（深色下与 --accent 分离保白字对比） */
   --accent-hover: #005bb5;
   --accent-bg: #e3f2ff;
-  --ok: #28a745;
+  --ok: #187a37;
   --ok-bg: #e8f9ee;
-  --ok-strong: #34c759;     /* 白字填充底（进度条/完成勾） */
+  --ok-strong: #187a37;     /* 白字填充底（进度条/完成勾） */
   --err: #d70015;
   --err-bg: #ffe5e9;
   --disabled-bg: #999;
@@ -51,7 +51,7 @@
     --accent-bg: #1a2f45;
     --ok: #30d158;
     --ok-bg: #1d3326;
-    --ok-strong: #248a3d;
+    --ok-strong: #217b36;
     --err: #ff6961;
     --err-bg: #3d2224;
     --disabled-bg: #55555a;
@@ -77,7 +77,7 @@
   --accent-bg: #1a2f45;
   --ok: #30d158;
   --ok-bg: #1d3326;
-  --ok-strong: #248a3d;
+  --ok-strong: #217b36;
   --err: #ff6961;
   --err-bg: #3d2224;
   --disabled-bg: #55555a;
@@ -133,6 +133,7 @@ svg.icon {
 @media (max-width: 900px) {
   .layout { grid-template-columns: 1fr; }
 }
+.col-left, .col-right { min-width: 0; }
 .col-right { position: sticky; top: 24px; }  /* 转写框滚动时粘顶部 */
 
 h1 { margin-top: 0; }
@@ -258,8 +259,9 @@ body.is-final .stages, body.is-final .progress-bar { display: none; }
   height: 50vh; overflow-y: auto;  /* 固定视口高度的一半 */
   background: var(--surface-2); border: 1px solid var(--border);
   border-radius: var(--radius-sm);
-  padding: 10px 12px; font-size: 13.5px; line-height: 1.75;
-  font-family: -apple-system, "Microsoft YaHei", monospace;
+  padding: 14px 16px; font-size: 16px; line-height: 1.8;
+  font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+  overflow-wrap: anywhere;
 }
 /* 完成态回看是主用途：转写框从 50vh 放大 */
 body.is-final .transcript { height: 70vh; }
@@ -516,8 +518,12 @@ a.theme-toggle { display: inline-flex; align-items: center; justify-content: cen
 }
 
 @media (max-width: 700px) {
-  #projects-table th:nth-child(2),
-  #projects-table td:nth-child(2),
+  #projects-table th:nth-child(3),
+  #projects-table td:nth-child(3),
+  #projects-table th:nth-child(5),
+  #projects-table td:nth-child(5),
+  #projects-table th:nth-child(7),
+  #projects-table td:nth-child(7),
   #projects-table th:nth-child(6),
   #projects-table td:nth-child(6) { display: none; }
 }
@@ -622,7 +628,7 @@ a.theme-toggle { display: inline-flex; align-items: center; justify-content: cen
 }
 
 /* 报告正文：render_markdown 产物（h1-h4 / p / ul / ol / table / code） */
-.report { padding: 8px 24px 20px; overflow-y: auto; font-size: 14.5px; line-height: 1.75; }
+.report { padding: 12px 24px 24px; overflow: auto; font-size: 16px; line-height: 1.8; overflow-wrap: anywhere; }
 .report h1 { font-size: 20px; margin: 18px 0 10px; }
 .report h2 { font-size: 17px; margin: 18px 0 8px; padding-bottom: 4px; border-bottom: 1px solid var(--border); }
 .report h3 { font-size: 15px; margin: 14px 0 6px; }
@@ -671,4 +677,98 @@ a.theme-toggle { display: inline-flex; align-items: center; justify-content: cen
   text-decoration: none;
   color: var(--ok); background: var(--ok-bg);
   border-radius: 2px; padding: 0 1px;
+}
+
+/* 上传、完整阅读与移动端：保留项目名和真实状态作为首要信息。 */
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+.field-note { font-size: 13px; margin: 4px 0; }
+.upload-feedback { border-top: 1px solid var(--border); padding-top: 10px; }
+.upload-feedback p { margin: 0 0 8px; overflow-wrap: anywhere; }
+#upload-progress { width: 100%; height: 16px; accent-color: var(--accent); }
+#upload-task-link, #upload-check-btn { margin-top: 8px; }
+.dropzone:focus-within { outline: 2px solid var(--accent); outline-offset: 3px; }
+summary { cursor: pointer; color: var(--accent); padding-block: 8px; }
+.technical-details { margin-bottom: 12px; }
+.technical-details .stages { margin: 8px 0; }
+body.is-final .technical-details .stages { display: flex; }
+.main-phases { list-style: none; display: grid; grid-template-columns: repeat(3, 1fr); padding: 0; margin: 16px 0 10px; gap: 8px; }
+.main-phases li { border-top: 3px solid var(--border-strong); padding-top: 8px; font-size: 14px; color: var(--text-2); }
+.main-phases li.active { color: var(--accent); border-color: var(--accent); font-weight: 600; }
+.main-phases li.done { color: var(--ok); border-color: var(--ok); }
+.main-phases li.done::before { content: "✓ "; }
+#phase-message { font-size: 14px; }
+.reading-controls { margin: 12px 0 8px; }
+#transcript-search { width: 100%; min-width: 0; }
+.pagination { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 8px; font-size: 13px; color: var(--text-2); }
+.pagination button { background: var(--bg); color: var(--accent); border: 1px solid var(--border-strong); min-height: 40px; padding: 6px 12px; }
+.pagination button:disabled { color: var(--text-2); opacity: 0.55; }
+#transcript-note { margin: 8px 0; }
+.transcript .line { opacity: 1; animation: none; padding-block: 6px; }
+#more-formats { margin-top: 8px; }
+.settings-advanced { border-top: 1px solid var(--border); margin-top: 4px; }
+.settings-advanced label { margin-top: 10px; }
+.settings-advanced .form-row label { flex: 1; min-width: 0; }
+#return-task { margin-top: 12px; }
+.modal-head h3 { flex: 1; min-width: 0; }
+.modal-head .btn { font-size: 12px; padding: 6px 9px; flex-shrink: 0; }
+.modal-head .modal-x { min-width: 40px; min-height: 40px; }
+.modal.is-expanded { padding: 12px; }
+.modal.is-expanded .modal-card { width: min(1100px, 100%); height: calc(100dvh - 24px); max-height: none; }
+.modal.is-expanded .report { flex: 1; }
+.modal-foot { flex-wrap: wrap; }
+.modal-card { min-height: 0; }
+.report { min-height: 0; }
+.report > * { max-width: 100%; }
+#project-name, .project-link, .summary-sub { overflow-wrap: anywhere; }
+.actions-cell { flex-wrap: wrap; }
+.action-btn:disabled { color: var(--text-2); background: var(--surface-2); opacity: 0.6; }
+
+@media (max-width: 900px) {
+  .col-right { position: static; }
+  .layout { gap: 12px; }
+  .transcript-toolbar { flex-wrap: wrap; gap: 10px; }
+  .stages li { flex-wrap: wrap; }
+  .stages li .msg { margin-left: 28px; }
+}
+@media (max-width: 700px) {
+  body { padding: 12px; }
+  main { padding: 16px; }
+  .page-header { flex-wrap: wrap; gap: 12px; align-items: flex-start; }
+  .page-header > div:first-child { min-width: 0; max-width: 100%; }
+  .header-actions { flex-wrap: wrap; }
+  #toolbar { flex-wrap: wrap; gap: 8px; }
+  #search-input { min-width: 0; flex-basis: 100%; }
+  #total-count { margin-left: 0; }
+  #projects-table { table-layout: fixed; }
+  #projects-table th, #projects-table td { padding: 8px 4px; }
+  #projects-table th:nth-child(4) { width: 80px; }
+  #projects-table th:last-child { width: 76px; }
+  #projects-table td:nth-child(2) { overflow-wrap: anywhere; }
+  .actions-cell { white-space: normal; }
+  .status-badge { white-space: normal; padding: 3px 5px; }
+  .status-badge::before { flex-shrink: 0; }
+  .action-btn { min-height: 36px; padding: 6px 8px; }
+  .form-row { gap: 12px; }
+  .form-row > label { max-width: 100%; }
+  input, select { max-width: 100%; }
+  #upload-panel { padding: 12px; }
+  .part-row { flex-wrap: wrap; gap: 6px; padding: 8px; }
+  .part-name { min-width: 100px; }
+  .part-ops button { min-width: 36px; min-height: 36px; }
+  .part-downloads a { flex-wrap: wrap; overflow-wrap: anywhere; }
+  .part-downloads .part-fname { display: none; }
+  .transcript { padding: 10px; }
+  .transcript-toolbar .toolbar-actions { flex-wrap: wrap; }
+  .transcript-toolbar button { min-height: 40px; }
+  .pagination { flex-wrap: wrap; }
+  .pagination span { order: 3; flex-basis: 100%; text-align: center; }
+  .modal, .modal.is-expanded { padding: 8px; }
+  .modal-card { max-height: calc(100dvh - 16px); }
+  .modal.is-expanded .modal-card { height: calc(100dvh - 16px); }
+  .modal-head, .modal-foot { padding: 10px; gap: 6px; }
+  .modal-head h3 { white-space: normal; font-size: 14px; }
+  .report { padding: 10px 14px 20px; }
+  .modal-foot .btn { padding: 8px 10px; }
+  #ai-actions .btn-row { flex-wrap: wrap; }
+  .meta { margin-left: 0; margin-right: 8px; }
 }

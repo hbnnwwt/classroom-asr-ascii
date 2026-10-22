@@ -24,12 +24,14 @@ from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from loguru import logger
 from pydantic import BaseModel
+from starlette.concurrency import run_in_threadpool
 
 from ..analyze import compute_stats
+from ..artifacts import atomic_write_text
 from ..config import LLMConfig, ConfigLoadError, load_config, write_llm_section
 from ..feedback import (
     build_deep_messages,
@@ -42,6 +44,10 @@ from ..mdrender import render_diff, render_markdown
 from ..merge import merge_audios, write_part_srts
 from ..pipeline import close_cached_engines
 from ..pipeline import run as pipeline_run
+from .access import AccessMiddleware, loopback
+from .runtime import WebRuntime
+from .repository import AdmissionError, TaskRepository, task_dict
+from .execution import ExecutionManager, QueueFull, TaskBusy, current_owner
 
 
 # ---------------------------------------------------------------------------
@@ -52,6 +58,49 @@ STATIC_DIR = PACKAGE_DIR / "static"
 DB_PATH = PACKAGE_DIR / "web_state.db"
 UPLOAD_DIR = PACKAGE_DIR / "uploads"
 OUTPUT_ROOT = PACKAGE_DIR / "outputs"
+DEFAULT_RUNTIME = WebRuntime.from_environment()
+_executor_lock = threading.Lock()
+
+
+def _runtime() -> WebRuntime:
+    injected = getattr(app.state, "runtime", None)
+    if injected is not None:
+        return injected
+    # Compatibility constants remain useful to embedded callers; configuration stays fixed.
+    return WebRuntime(DEFAULT_RUNTIME.config_path, DB_PATH, UPLOAD_DIR, OUTPUT_ROOT,
+                      STATIC_DIR, DEFAULT_RUNTIME.password, settings_lock=DEFAULT_RUNTIME.settings_lock)
+
+
+def _repository() -> TaskRepository:
+    return TaskRepository(_runtime().db_path)
+
+
+def _executor() -> ExecutionManager:
+    with _executor_lock:
+        manager = getattr(app.state, "execution", None)
+        if manager is None:
+            runtime = _runtime()
+            manager = ExecutionManager(runtime.workers, runtime.max_waiting)
+            app.state.execution = manager
+        return manager
+
+
+def _config_path(value=None) -> Path:
+    try:
+        return _runtime().resolve_config(value)
+    except ValueError:
+        raise HTTPException(400, {"code": "config_not_allowed", "message": "Web 配置由服务器固定"})
+
+
+def _admission_error(exc):
+    if isinstance(exc, QueueFull):
+        return HTTPException(503, {"code": "queue_full"}, headers={"Retry-After": "5"})
+    code = "task_busy" if isinstance(exc, TaskBusy) else exc.code
+    status = 404 if code in ("task_not_found", "upload_not_found") else 409
+    detail = {"code": code}
+    if getattr(exc, "task_id", None):
+        detail["task_id"] = exc.task_id
+    return HTTPException(status, detail)
 
 # 多段拼接：单次段数上限
 MAX_MERGE_PARTS = 20
@@ -66,78 +115,33 @@ ASR_STALL_TIMEOUT_S = 30 * 60
 # SQLite 持久化
 # ---------------------------------------------------------------------------
 def _db() -> sqlite3.Connection:
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(DB_PATH), timeout=10.0, isolation_level=None)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    return conn
+    return _repository().connect()
 
 
 def _init_db() -> None:
-    """建表 + 增量迁移（老库加新列时用 ALTER TABLE，不会重建表/丢数据）。"""
-    with closing(_db()) as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS tasks (
-                id           TEXT PRIMARY KEY,
-                filename     TEXT NOT NULL,
-                input_path   TEXT NOT NULL,
-                output_dir   TEXT NOT NULL,
-                status       TEXT NOT NULL,
-                progress     REAL DEFAULT 0,
-                stage        TEXT DEFAULT '',
-                message      TEXT DEFAULT '',
-                error        TEXT DEFAULT '',
-                created_at   TEXT NOT NULL,
-                started_at   TEXT,
-                ended_at     TEXT,
-                meta_json    TEXT DEFAULT '',
-                transcript   TEXT DEFAULT ''
-            )
-        """)
-        # 迁移：补齐缺失列（PRIMARY KEY 不在迁移范围）
-        existing = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
-        for col, decl in _MIGRATIONS:
-            if col not in existing:
-                conn.execute(f"ALTER TABLE tasks ADD COLUMN {col} {decl}")
-
-
-# 新增列只需往这里加一行（PRIMARY KEY 已含在 CREATE TABLE 中，不要重复）
-_MIGRATIONS = [
-    ("transcript", "TEXT DEFAULT ''"),
-    ("name", "TEXT DEFAULT ''"),
-    ("stage_started_at", "TEXT DEFAULT ''"),
-]
+    """Additive schema migrations preserve existing tasks."""
+    _repository().initialize()
 
 
 def _row_to_dict(row: sqlite3.Row) -> dict:
-    return {
-        "id": row["id"],
-        "name": row["name"] or "",
-        "filename": row["filename"],
-        "input_path": row["input_path"],
-        "output_dir": row["output_dir"],
-        "status": row["status"],
-        "progress": row["progress"],
-        "stage": row["stage"],
-        "message": row["message"],
-        "error": row["error"],
-        "created_at": row["created_at"],
-        "started_at": row["started_at"],
-        "ended_at": row["ended_at"],
-        "stage_started_at": row["stage_started_at"] or "",
-        "meta": json.loads(row["meta_json"] or "{}"),
-        "transcript": row["transcript"] or "",
-    }
+    item = task_dict(row)
+    meta = item["meta"]
+    active = _executor().is_active(item["id"])
+    item["execution_active"] = active
+    item["can_delete"] = not active and item["status"] not in ("pending", "running")
+    item["transcription_status"] = "done" if item["stage"] == "ai" else item["status"]
+    attempts = meta.get("ai_attempts", {})
+    states = [a.get("status") for a in attempts.values()]
+    legacy_ai = ("running" if item["stage"] == "ai" and item["status"] in ("pending", "running") else
+                 "failed" if meta.get("ai_error") or meta.get("ai_errors") else
+                 "succeeded" if meta.get("ai_files") else "idle")
+    item["ai_status"] = next((s for s in ("running", "queued", "failed", "succeeded") if s in states), legacy_ai)
+    item["available_formats"] = _available_formats(Path(item["output_dir"]), meta) if item["transcription_status"] == "done" else []
+    return item
 
 
 def _update_task(task_id: str, **fields) -> None:
-    if not fields:
-        return
-    cols = ", ".join(f"{k}=?" for k in fields)
-    vals = list(fields.values()) + [task_id]
-    with closing(_db()) as conn:
-        conn.execute(f"UPDATE tasks SET {cols} WHERE id=?", vals)
+    return _repository().update(task_id, owner=current_owner(), **fields)
 
 
 def _update_task_failed_if_running(task_id: str, error: str) -> bool:
@@ -173,23 +177,28 @@ def _read_transcript(json_path) -> str:
 # ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
+    runtime = _runtime()
+    runtime.upload_dir.mkdir(parents=True, exist_ok=True)
+    runtime.output_root.mkdir(parents=True, exist_ok=True)
     _init_db()
-    logger.info(f"[web] 数据库: {DB_PATH}")
+    _repository().recover_interrupted()
+    _executor()
+    logger.info(f"[web] 数据库: {runtime.db_path}")
     yield
-    # P1-1：进程退出前释放缓存的引擎（模型内存/显存）
+    _executor().shutdown()
+    del app.state.execution
     close_cached_engines()
 
 
 app = FastAPI(title="Classroom ASR", version="1.0", lifespan=lifespan)
+app.add_middleware(AccessMiddleware, password=lambda: _runtime().password)
 
 
 @app.get("/", response_class=HTMLResponse)
 def index() -> FileResponse:
     """管理界面：项目列表。"""
     return FileResponse(
-        str(STATIC_DIR / "index.html"),
+        str(_runtime().static_dir / "index.html"),
         headers={"Cache-Control": "no-cache, must-revalidate"},
     )
 
@@ -198,7 +207,7 @@ def index() -> FileResponse:
 def task_page(task_id: str) -> FileResponse:
     """项目详情页：单项目转写进度 + transcript。"""
     return FileResponse(
-        str(STATIC_DIR / "task.html"),
+        str(_runtime().static_dir / "task.html"),
         headers={"Cache-Control": "no-cache, must-revalidate"},
     )
 
@@ -207,7 +216,7 @@ def task_page(task_id: str) -> FileResponse:
 def settings_page() -> FileResponse:
     """设置页：LLM 配置表单（AI 反馈入口跳转目标）。"""
     return FileResponse(
-        str(STATIC_DIR / "settings.html"),
+        str(_runtime().static_dir / "settings.html"),
         headers={"Cache-Control": "no-cache, must-revalidate"},
     )
 
@@ -215,8 +224,8 @@ def settings_page() -> FileResponse:
 @app.get("/static/{path:path}")
 def static_file(path: str) -> FileResponse:
     """静态文件：no-cache 保证改了前端立即生效。"""
-    file_path = STATIC_DIR / path
-    if not file_path.exists() or not file_path.is_file():
+    file_path = _safe_file(_runtime().static_dir, path)
+    if file_path is None:
         raise HTTPException(404, "not found")
     return FileResponse(
         str(file_path),
@@ -224,46 +233,105 @@ def static_file(path: str) -> FileResponse:
     )
 
 
+@app.post("/api/uploads", status_code=201)
+def create_upload_session():
+    return _repository().create_upload()
+
+
+@app.get("/api/uploads/{upload_id}")
+def get_upload_session(upload_id: str):
+    session = _repository().get_upload(upload_id)
+    if session is None:
+        raise HTTPException(404, {"code": "upload_not_found"})
+    return session
+
+
+@app.post("/api/uploads/{upload_id}/cancel")
+def cancel_upload_session(upload_id: str):
+    try:
+        return _repository().cancel_upload(upload_id)
+    except AdmissionError as exc:
+        raise _admission_error(exc)
+
+
+async def _accept_upload(files, name, config, diarize, quality, ai_feedback, upload_id, *, legacy=False):
+    config_path = _config_path(config)
+    if not files or len(files) > MAX_MERGE_PARTS:
+        raise HTTPException(400, f"请选择 1 至 {MAX_MERGE_PARTS} 个文件")
+    if quality not in ("fast", "balanced", "high"):
+        raise HTTPException(400, "不支持的质量档位")
+    runtime = _runtime()
+    runtime.upload_dir.mkdir(parents=True, exist_ok=True)
+    task_id = uuid.uuid4().hex[:12]
+    out_dir = runtime.output_root / task_id
+    parts_dir = runtime.upload_dir / f"{task_id}_parts"
+    multi = len(files) > 1
+    saved = []
+    accepted = False
+    try:
+        if multi:
+            parts_dir.mkdir(parents=True)
+        names = []
+        for index, file in enumerate(files):
+            if not file.filename:
+                raise HTTPException(400, "文件名为空")
+            filename = Path(file.filename.replace("\\", "/")).name
+            if filename in ("", ".", ".."):
+                raise HTTPException(400, "文件名无效")
+            names.append(filename)
+            dest = parts_dir / f"{index:02d}_{filename}" if multi else runtime.upload_dir / f"{task_id}_{filename}"
+            saved.append(dest)  # register before opening: partial writes/probe failure must be cleaned
+            with dest.open("wb") as output:
+                while chunk := await file.read(1024 * 1024):
+                    output.write(chunk)
+            if not legacy:
+                try:
+                    info = await run_in_threadpool(probe, dest)
+                except Exception:
+                    raise HTTPException(400, f"无法探测 {filename}，请检查媒体文件")
+                if not info.audio_streams:
+                    raise HTTPException(400, f"{filename} 没有音轨")
+        out_dir.mkdir(parents=True)
+        final_name = name.strip() or Path(names[0]).stem
+        display = " + ".join(names)
+        meta = {"ai_feedback": ai_feedback, "quality": quality}
+        if multi:
+            meta["parts"] = names
+        task = {"id": task_id, "name": final_name, "filename": display,
+                "input_path": str(out_dir / "merged.wav" if multi else saved[0]),
+                "output_dir": str(out_dir), "meta_json": json.dumps(meta, ensure_ascii=False)}
+        def work():
+            if not _repository().claim(task_id, current_owner()):
+                return
+            target = _run_multi_task if multi else _run_single_task
+            target(task_id, saved if multi else saved[0], out_dir,
+                   str(config_path), diarize, quality, ai_feedback)
+        try:
+            _executor().submit(task_id, work,
+                               admit=lambda: _repository().accept_task(task, upload_id))
+        except (QueueFull, TaskBusy, AdmissionError) as exc:
+            raise _admission_error(exc)
+        accepted = True
+        data = {"task_id": task_id, "filename": display}
+        if not legacy:
+            data["name"] = final_name
+        return JSONResponse(data)
+    finally:
+        if not accepted:
+            for path in saved:
+                path.unlink(missing_ok=True)
+            if multi:
+                shutil.rmtree(parts_dir, ignore_errors=True)
+            shutil.rmtree(out_dir, ignore_errors=True)
+
+
 @app.post("/upload")
 async def upload(
-    file: UploadFile = File(...),
-    config: str = Form("config.yaml"),
-    diarize: bool = Form(False),
-    quality: str = Form("balanced"),
+    file: UploadFile = File(...), config: str = Form("config.yaml"),
+    diarize: bool = Form(False), quality: str = Form("balanced"),
+    upload_id: str | None = Header(None, alias="X-Upload-Id"),
 ) -> JSONResponse:
-    """接收上传文件，创建后台任务，返回 task_id。"""
-    if not file.filename:
-        raise HTTPException(400, "文件名为空")
-
-    task_id = uuid.uuid4().hex[:12]
-    ts = datetime.now().isoformat(timespec="seconds")
-    save_path = UPLOAD_DIR / f"{task_id}_{Path(file.filename).name}"
-
-    # 保存上传文件
-    with open(save_path, "wb") as f:
-        while chunk := await file.read(1024 * 1024):
-            f.write(chunk)
-
-    # 任务输出目录：每个任务一个目录，输出文件存在这里
-    out_dir = OUTPUT_ROOT / task_id
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    with closing(_db()) as conn:
-        conn.execute(
-            """INSERT INTO tasks
-               (id, filename, input_path, output_dir, status, created_at)
-               VALUES (?, ?, ?, ?, 'pending', ?)""",
-            (task_id, file.filename, str(save_path), str(out_dir), ts),
-        )
-
-    # 后台启动 pipeline
-    threading.Thread(
-        target=_run_pipeline,
-        args=(task_id, save_path, out_dir, config, diarize, quality),
-        daemon=True,
-    ).start()
-
-    return JSONResponse({"task_id": task_id, "filename": file.filename})
+    return await _accept_upload([file], "", config, diarize, quality, False, upload_id, legacy=True)
 
 
 @app.get("/status/{task_id}")
@@ -298,12 +366,39 @@ def _ai_artifact(out_dir: Path, meta: dict, fmt: str) -> Path | None:
     会取到旧文件；无登记（半程失败的老任务）glob 兜底，兼容"已产出
     一份"的可下载性。
     """
-    registered = (meta.get("ai_files") or {}).get(fmt)
-    candidate = out_dir / registered if registered else None
-    if candidate and candidate.exists():
-        return candidate
+    if "ai_files" in meta:
+        return _safe_file(out_dir, (meta.get("ai_files") or {}).get(fmt))
     files = sorted(out_dir.glob(f"*.{fmt}.md"))
-    return files[0] if files else None
+    return next((f for f in files if _safe_file(out_dir, f.name)), None)
+
+
+def _safe_file(root: Path, name) -> Path | None:
+    if not isinstance(name, (str, Path)) or not str(name):
+        return None
+    root = Path(root).resolve()
+    candidate = (root / name).resolve()
+    if not candidate.is_relative_to(root) or not candidate.is_file():
+        return None
+    return candidate
+
+
+def _output_artifact(out_dir: Path, meta: dict, fmt: str) -> Path | None:
+    if fmt in _AI_FMTS:
+        return _ai_artifact(out_dir, meta, fmt)
+    if "output_files" in meta:
+        files = meta.get("output_files") or {}
+        key = "replace_log" if fmt == "replace.log" else fmt
+        return _safe_file(out_dir, files.get(fmt, files.get(key)))
+    # Old task compatibility is deliberately restricted to its own output directory.
+    files = sorted(out_dir.glob(f"*.{fmt}"))
+    return next((f for f in files if not re.match(r"^\d{2}_", f.name)
+                 and not re.search(r"\.(?:feedback|polished|deep)\.md$", f.name)
+                 and _safe_file(out_dir, f.name)), None)
+
+
+def _available_formats(out_dir, meta):
+    return [fmt for fmt in ("srt", "txt", "vtt", "md", "json", "replace.log", "mp4", *_AI_FMTS)
+            if _output_artifact(out_dir, meta, fmt)]
 
 
 # AI 产物三件：点评报告 / 优化逐字稿 / 深度优化讲义（成稿化）
@@ -329,21 +424,8 @@ def download(task_id: str, fmt: str):
         raise HTTPException(409, f"任务未完成: {row['status']}")
 
     out_dir = Path(row["output_dir"])
-    if fmt in _AI_FMTS:
-        try:
-            meta = json.loads(row["meta_json"] or "{}")
-        except ValueError:
-            meta = {}
-        target = _ai_artifact(out_dir, meta, fmt)
-    else:
-        # 排除分段文件（{两位序号}_ 前缀）和 AI 产物——md 的 *.md glob 会
-        # 同时命中 *.feedback.md，而 files[0] 不保证顺序，不排除就是抢占
-        files = [
-            f for f in out_dir.glob(f"*.{fmt}")
-            if not re.match(r"^\d{2}_", f.name)
-            and not re.search(r"\.(?:feedback|polished|deep)\.md$", f.name)
-        ]
-        target = files[0] if files else None
+    meta = task_dict(row)["meta"]
+    target = _output_artifact(out_dir, meta, fmt)
     if target is None:
         raise HTTPException(404, f"输出文件不存在: {fmt}")
     # 剥后缀只认白名单：任务名/文件名里的点号（"3.2节 复习.mp4" 的 ".2节 复习"
@@ -417,8 +499,8 @@ def download_part_srt(task_id: str, index: int):
     if not 0 <= index < len(part_files):
         raise HTTPException(404, "分段字幕不存在")
 
-    target = Path(row["output_dir"]) / part_files[index]
-    if not target.exists():
+    target = _safe_file(Path(row["output_dir"]), part_files[index])
+    if target is None:
         raise HTTPException(404, f"分段字幕文件缺失: {part_files[index]}")
     # 下载名用该段原名（去真实后缀），用户拿到即可对上原视频；
     # 段名含点号（"3.2节 复习.mp4"）不许被截断，兜底名（.srt）不双后缀
@@ -472,97 +554,12 @@ def get_project(task_id: str):
 
 @app.post("/api/projects")
 async def create_project(
-    files: list[UploadFile] = File(...),
-    name: str = Form(""),
-    config: str = Form("config.yaml"),
-    diarize: bool = Form(False),
-    quality: str = Form("balanced"),
-    ai_feedback: bool = Form(False),
+    files: list[UploadFile] = File(...), name: str = Form(""),
+    config: str = Form("config.yaml"), diarize: bool = Form(False),
+    quality: str = Form("balanced"), ai_feedback: bool = Form(False),
+    upload_id: str | None = Header(None, alias="X-Upload-Id"),
 ):
-    """新建项目：files=[1 个] 普通转写；files=[多个] 逐段抽音轨拼接后一次转写。
-
-    单/多差异只在落盘布局与 meta——转写路径同一条（拼接产物就是普通输入）。
-    """
-    if not files:
-        raise HTTPException(400, "未选择文件")
-    if len(files) > MAX_MERGE_PARTS:
-        raise HTTPException(400, f"单次最多拼接 {MAX_MERGE_PARTS} 段")
-
-    task_id = uuid.uuid4().hex[:12]
-    ts = datetime.now().isoformat(timespec="seconds")
-    out_dir = OUTPUT_ROOT / task_id
-    out_dir.mkdir(parents=True, exist_ok=True)
-    multi = len(files) > 1
-    parts_dir = UPLOAD_DIR / f"{task_id}_parts"
-    if multi:
-        parts_dir.mkdir(parents=True, exist_ok=True)
-
-    # 保存 + 逐个探测（无音轨/损坏文件当场 400，不进任务队列）
-    saved: list[Path] = []
-    try:
-        for i, f in enumerate(files):
-            if not f.filename:
-                raise HTTPException(400, "文件名为空")
-            fname = Path(f.filename).name
-            # 多段：{序号}_{原名}（序号保序、防重名）；单段：老路径布局
-            dest = parts_dir / f"{i:02d}_{fname}" if multi else UPLOAD_DIR / f"{task_id}_{fname}"
-            with open(dest, "wb") as out:
-                while chunk := await f.read(1024 * 1024):
-                    out.write(chunk)
-            try:
-                info = probe(dest)
-            except Exception as e:  # noqa: BLE001
-                raise HTTPException(400, f"无法探测 {fname}: {e}")
-            if not info.audio_streams:
-                raise HTTPException(400, f"{fname} 没有音轨")
-            saved.append(dest)
-    except HTTPException:
-        # 半截会话不留垃圾
-        for p in saved:
-            p.unlink(missing_ok=True)
-        if multi:
-            shutil.rmtree(parts_dir, ignore_errors=True)
-        raise
-
-    names = [Path(f.filename).name for f in files]
-    display = " + ".join(names)
-    final_name = name.strip() or Path(names[0]).stem
-
-    if multi:
-        meta = {"parts": names, "ai_feedback": ai_feedback}
-        input_path = str(out_dir / "merged.wav")
-        with closing(_db()) as conn:
-            conn.execute(
-                """INSERT INTO tasks
-                   (id, name, filename, input_path, output_dir, status, created_at, meta_json)
-                   VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)""",
-                (task_id, final_name, display, input_path, str(out_dir), ts,
-                 json.dumps(meta, ensure_ascii=False)),
-            )
-        threading.Thread(
-            target=_run_multi_task,
-            args=(task_id, saved, out_dir, config, diarize, quality, ai_feedback),
-            daemon=True,
-        ).start()
-    else:
-        # ai_feedback 开关随任务落 meta（False 也写）：done 的 meta 读-改-写
-        # 依赖它非空才能保序，前端/AI stage 也靠它判断是否补跑
-        with closing(_db()) as conn:
-            conn.execute(
-                """INSERT INTO tasks
-                   (id, name, filename, input_path, output_dir, status, created_at, meta_json)
-                   VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)""",
-                (task_id, final_name, names[0], str(saved[0]), str(out_dir), ts,
-                 json.dumps({"ai_feedback": ai_feedback}, ensure_ascii=False)),
-            )
-        threading.Thread(
-            target=_run_single_task,
-            args=(task_id, saved[0], out_dir, config, diarize, quality, ai_feedback),
-            daemon=True,
-        ).start()
-
-    filename = display if multi else names[0]
-    return JSONResponse({"task_id": task_id, "name": final_name, "filename": filename})
+    return await _accept_upload(files, name, config, diarize, quality, ai_feedback, upload_id)
 
 
 @app.patch("/api/projects/{task_id}")
@@ -593,23 +590,27 @@ def delete_project(task_id: str):
 
 
 def _delete_one(task_id: str) -> bool:
-    """删除单个项目（DB + 磁盘）。返回 True 成功，False 不存在。"""
-    with closing(_db()) as conn:
-        row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
-        if row is None:
-            return False
-        conn.execute("DELETE FROM tasks WHERE id=?", (task_id,))
-
-    import shutil as _sh
-    out_dir = Path(row["output_dir"])
-    if out_dir.exists():
-        _sh.rmtree(out_dir, ignore_errors=True)
-    in_path = Path(row["input_path"])
-    if in_path.exists():
-        try:
-            in_path.unlink()
-        except OSError:
-            pass
+    manager = _executor()
+    try:
+        with manager.mutation_lock():
+            if manager.is_active(task_id):
+                raise TaskBusy(task_id)
+            row = _repository().delete_terminal(task_id)
+    except (TaskBusy, AdmissionError) as exc:
+        raise _admission_error(exc)
+    if row is None:
+        return False
+    runtime = _runtime()
+    out_dir = Path(row["output_dir"]).resolve()
+    if out_dir.is_relative_to(runtime.output_root) and out_dir != runtime.output_root:
+        shutil.rmtree(out_dir, ignore_errors=True)
+    in_path = Path(row["input_path"]).resolve()
+    if in_path.is_relative_to(runtime.upload_dir) and in_path.is_file():
+        in_path.unlink(missing_ok=True)
+    parts_dir = runtime.upload_dir / f"{task_id}_parts"
+    resolved_parts = parts_dir.resolve()
+    if resolved_parts.is_relative_to(runtime.upload_dir) and resolved_parts != runtime.upload_dir and parts_dir.is_dir():
+        shutil.rmtree(parts_dir, ignore_errors=True)
     return True
 
 
@@ -626,15 +627,20 @@ def batch_delete(payload: dict):
     if len(ids) > 50:
         raise HTTPException(400, "单次最多删除 50 个项目")
 
-    deleted, failed = [], []
+    deleted, failed, failure_details = [], [], []
     for tid in ids:
         if not isinstance(tid, str):
             continue
-        if _delete_one(tid):
-            deleted.append(tid)
-        else:
+        try:
+            if _delete_one(tid):
+                deleted.append(tid)
+            else:
+                failed.append(tid)
+                failure_details.append({"id": tid, "code": "task_not_found"})
+        except HTTPException as exc:
             failed.append(tid)
-    return JSONResponse({"deleted": deleted, "failed": failed})
+            failure_details.append({"id": tid, **(exc.detail if isinstance(exc.detail, dict) else {"code": "delete_failed"})})
+    return JSONResponse({"deleted": deleted, "failed": failed, "failure_details": failure_details})
 
 
 @app.post("/api/projects/batch-export")
@@ -654,7 +660,7 @@ def batch_export(payload: dict):
     # stage 一并取出：running+stage=ai 的任务转写产物已终态，也要进 ZIP。
     with closing(_db()) as conn:
         rows = conn.execute(
-            "SELECT id, name, filename, output_dir, status, stage FROM tasks WHERE id IN ({})".format(
+            "SELECT id, name, filename, output_dir, status, stage, meta_json FROM tasks WHERE id IN ({})".format(
                 ",".join("?" * len(ids))
             ),
             ids,
@@ -675,6 +681,9 @@ def batch_export(payload: dict):
                     continue
                 # 每个项目一个子目录：<项目名>/<原文件名>.srt 等
                 folder = row["name"] or row["filename"] or row["id"]
+                folder = Path(folder.replace("\\", "/")).name
+                if folder in ("", ".", ".."):
+                    folder = row["id"]
                 # 防重名
                 folder_unique = folder
                 suffix = 2
@@ -686,9 +695,11 @@ def batch_export(payload: dict):
                 out_dir = Path(row["output_dir"])
                 if not out_dir.exists():
                     continue
-                for f in out_dir.glob("*"):
-                    if f.is_file():
-                        zf.write(f, arcname=f"{folder_unique}/{f.name}")
+                meta = task_dict(row)["meta"]
+                files = {_output_artifact(out_dir, meta, fmt) for fmt in _available_formats(out_dir, meta)}
+                files.update(_safe_file(out_dir, name) for name in meta.get("part_files", []))
+                for f in sorted((f for f in files if f is not None), key=lambda f: f.name):
+                    zf.write(f, arcname=f"{folder_unique}/{f.name}")
 
             # 把失败/无输出的项目写到 manifest 里，让用户知道。
             # 已进 ZIP 的（含 AI stage 任务）不得再列成 skipped，否则 manifest 自相矛盾
@@ -722,8 +733,9 @@ def llm_status(config: str = "config.yaml"):
 
     配置加载失败也按"未启用"返回——状态查询不许被配置错误打挂。
     """
+    config_path = _config_path(config)
     try:
-        cfg = load_config(config, strict_models=False)
+        cfg = load_config(config_path, strict_models=False)
     except ConfigLoadError:
         return JSONResponse({"enabled": False, "model": None})
     return JSONResponse({"enabled": llm_enabled(cfg),
@@ -733,7 +745,7 @@ def llm_status(config: str = "config.yaml"):
 class _LLMBody(BaseModel):
     """设置页表单体。全字段可空——表单即状态：清空 base_url/model 保存 = 关闭功能。"""
     base_url: str = ""
-    api_key: str = ""
+    api_key: str | None = None
     model: str = ""
     timeout: int = 300
     max_tokens: int = 16384
@@ -742,12 +754,15 @@ class _LLMBody(BaseModel):
 @app.get("/api/llm/settings")
 def llm_settings_get(config: str = "config.yaml"):
     """设置页回填：llm 节当前值。配置加载失败按空态返回（页面不许被打挂）。"""
+    config_path = _config_path(config)
     try:
-        cfg = load_config(config, strict_models=False)
+        cfg = load_config(config_path, strict_models=False)
     except ConfigLoadError:
         cfg = None
     llm = cfg.llm if cfg is not None else LLMConfig()
-    return JSONResponse({"base_url": llm.base_url, "api_key": llm.api_key,
+    return JSONResponse({"base_url": llm.base_url, "api_key": None,
+                         "api_key_set": bool(llm.api_key),
+                         "api_key_masked": "********" if llm.api_key else "",
                          "model": llm.model, "timeout": llm.timeout,
                          "max_tokens": llm.max_tokens})
 
@@ -755,94 +770,77 @@ def llm_settings_get(config: str = "config.yaml"):
 @app.post("/api/llm/settings")
 def llm_settings_save(body: _LLMBody, config: str = "config.yaml"):
     """保存 llm 节：文本手术写回（保注释，见 write_llm_section），原子替换。"""
+    path = _config_path(config)
     base_url = body.base_url.strip()
     if base_url and not re.match(r"^https?://", base_url):
         raise HTTPException(422, "base_url 必须以 http:// 或 https:// 开头")
     if body.timeout <= 0 or body.max_tokens <= 0:
         raise HTTPException(422, "timeout / max_tokens 必须为正整数")
-    path = Path(config)
     if not path.is_file():
         # 不静默新建：这个文件承载全部 ASR 配置，凭空造一个空的等于毁配置
         raise HTTPException(409, f"配置文件不存在: {config}")
 
-    new_text = write_llm_section(
-        path.read_text(encoding="utf-8"),
-        {"base_url": base_url, "api_key": body.api_key.strip(),
-         "model": body.model.strip(), "timeout": body.timeout,
-         "max_tokens": body.max_tokens},
-    )
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(new_text, encoding="utf-8")
-    os.replace(tmp, path)   # 原子替换：写一半断电也不会毁掉整个 config.yaml
+    with _runtime().settings_lock:
+        try:
+            current = load_config(path, strict_models=False).llm
+        except ConfigLoadError:
+            raise HTTPException(409, "服务器配置加载失败，请检查配置文件")
+        key = current.api_key if body.api_key is None else body.api_key.strip()
+        new_text = write_llm_section(
+            path.read_text(encoding="utf-8"),
+            {"base_url": base_url, "api_key": key,
+             "model": body.model.strip(), "timeout": body.timeout,
+             "max_tokens": body.max_tokens},
+        )
+        atomic_write_text(path, new_text)
     enabled = bool(base_url and body.model.strip())
     return JSONResponse({"status": "saved", "enabled": enabled})
 
 
 @app.post("/api/llm/test")
-def llm_test(body: _LLMBody):
+def llm_test(body: _LLMBody, config: str = "config.yaml"):
     """测试连接：拿传入值试调一次（不落盘）。结果是数据不是错误，永远 200。"""
+    config_path = _config_path(config)
     if not (body.base_url.strip() and body.model.strip()):
         return JSONResponse({"ok": False, "error": "base_url 与 model 不能为空"})
     # 测试调用上限 30s / 16 token：点一下按钮挂 300 秒是烂体验
+    try:
+        saved_key = load_config(config_path, strict_models=False).llm.api_key
+    except ConfigLoadError:
+        saved_key = ""
+    key = saved_key if body.api_key is None else body.api_key.strip()
     cfg = SimpleNamespace(llm=LLMConfig(
-        base_url=body.base_url, api_key=body.api_key, model=body.model,
+        base_url=body.base_url, api_key=key, model=body.model,
         timeout=min(body.timeout, 30), max_tokens=body.max_tokens))
     try:
         reply = chat([{"role": "user", "content": "请只回复：ok"}], cfg,
                      max_tokens=16)
     except LLMError as e:
-        return JSONResponse({"ok": False, "error": str(e)})
+        error = str(e).replace(key, "********") if key else str(e)
+        return JSONResponse({"ok": False, "error": error})
     return JSONResponse({"ok": True, "reply": (reply or "")[:50]})
 
 
 def _start_ai_run(task_id: str, config: str, fmts: tuple) -> JSONResponse:
-    """AI 产物重跑的公共前置：校验 → 出清重跑件旧登记 → 起线程。
-
-    重跑件的旧登记/旧错误在起跑前出清：重建期间旧文件不作数，也不许
-    AI 视图读到半新不旧的登记名；全局 ai_error 一并清（前置失败的旧状态）。
-    """
-    with closing(_db()) as conn:
-        row = conn.execute(
-            "SELECT status FROM tasks WHERE id=?", (task_id,)).fetchone()
+    config_path = _config_path(config)
+    row = _repository().get(task_id)
     if row is None:
         raise HTTPException(404, "任务不存在")
-    if row["status"] == "running":
-        raise HTTPException(409, "任务处理中，稍后再试")
     if row["status"] != "done":
-        raise HTTPException(409, f"任务未完成: {row['status']}")
-    # 配置加载失败与"未配置"同口径 409（llm_status 也是降级为未启用，不打 500）
+        raise HTTPException(409, {"code": "task_busy" if row["status"] in ("pending", "running") else "task_not_done"})
     try:
-        cfg = load_config(config, strict_models=False)
+        cfg = load_config(config_path, strict_models=False)
     except ConfigLoadError:
         cfg = None
     if cfg is None or not llm_enabled(cfg):
         raise HTTPException(409, "LLM 未配置（config.yaml 缺 llm 节）")
-
-    # 清旧错误 + 标 running，起线程；_run_ai_stage 自己管成功/失败终态。
-    # progress 复位：202 后不得残留 done 期的 100% 进度条（前端渲染成
-    # running+100% 假象）。ended_at 不动：它是转写管线的终点，AI 重生成只记
-    # 阶段账（stage_started_at）；清了它，前端重载页面会从 started_at 起跳计时
-    meta = _read_meta(task_id)
-    meta.pop("ai_error", None)
-    files = meta.get("ai_files") or {}
-    errors = meta.get("ai_errors") or {}
-    for f in fmts:
-        files.pop(f, None)
-        errors.pop(f, None)
-    if files:
-        meta["ai_files"] = files
-    else:
-        meta.pop("ai_files", None)
-    if errors:
-        meta["ai_errors"] = errors
-    else:
-        meta.pop("ai_errors", None)
-    _update_task(task_id, status="running", stage="ai", message="AI 反馈",
-                 progress=0,
-                 stage_started_at=datetime.now().isoformat(timespec="seconds"),
-                 meta_json=json.dumps(meta, ensure_ascii=False))
-    threading.Thread(target=_run_ai_stage, args=(task_id, config, fmts),
-                     daemon=True).start()
+    def work():
+        if _repository().claim(task_id, current_owner()):
+            _run_ai_stage(task_id, str(config_path), fmts)
+    try:
+        _executor().submit(task_id, work, admit=lambda: _repository().queue_ai(task_id, fmts))
+    except (QueueFull, TaskBusy, AdmissionError) as exc:
+        raise _admission_error(exc)
     return JSONResponse({"status": "started"}, status_code=202)
 
 
@@ -939,15 +937,16 @@ def _run_multi_task(
             "parts": part_names,
             "part_files": [p.name for p in part_files],
         })
-        _update_task(task_id, meta_json=json.dumps(meta, ensure_ascii=False))
+        _repository().update(task_id, meta_json=json.dumps(meta, ensure_ascii=False))
 
         # AI 反馈（可选）：拼接字幕写完后串行追加
         if ai_feedback:
-            _run_ai_stage(task_id, config_path)
+            _auto_ai(task_id, config_path)
     except Exception as e:  # noqa: BLE001
-        logger.exception(f"[web] 拼接任务 {task_id} 失败")
+        logger.error("[web] merge task {} failed ({})", task_id, type(e).__name__)
+        error = "服务器配置加载失败" if isinstance(e, ConfigLoadError) else f"{type(e).__name__}: {e}"
         _update_task(
-            task_id, status="failed", error=f"{type(e).__name__}: {e}",
+            task_id, status="failed", error=error,
             ended_at=datetime.now().isoformat(timespec="seconds"),
         )
     finally:
@@ -967,245 +966,159 @@ def _run_multi_task(
 # ---------------------------------------------------------------------------
 # 后台 pipeline 包装
 # ---------------------------------------------------------------------------
-def _run_pipeline(
-    task_id: str,
-    input_path: Path,
-    output_dir: Path,
-    config_path: str,
-    diarize: bool,
-    quality: str,
-) -> None:
-    """后台线程：调用 pipeline.run()，通过回调更新 SQLite 进度。"""
-    ts = datetime.now().isoformat(timespec="seconds")
-    _update_task(task_id, status="running", started_at=ts, message="开始处理")
+def _auto_ai(task_id, config_path):
+    # Keep this task's executor ownership through the handoff; no unregistered thread.
+    _repository().queue_ai(task_id, ("feedback", "polished"), owner=current_owner())
+    if _repository().claim(task_id, current_owner()):
+        _run_ai_stage(task_id, config_path)
 
-    # ASR 看门狗：如果 pipeline 跑在后台线程里卡住（比如 FunASR PUNC 阶段死锁），
-    # 超过 ASR_STALL_TIMEOUT_S 分钟没有任何回调，就主动标 failed 并抛异常退出。
-    # 这样前端会看到"失败"而不是"永远处理中"。
-    import time as _t
-    last_cb_time = [_t.time()]
-    watchdog_exc: list[Exception | None] = [None]
-    stop = threading.Event()
 
-    last_stage = [""]  # 闭包：记录上次 callback 的 stage，变了就更新时间戳
-
-    def _cb(stage: str, ratio: float, msg: str) -> None:
-        last_cb_time[0] = _t.time()
-        fields: dict = {"progress": ratio, "stage": stage, "message": msg}
-        # 阶段切换：写 stage_started_at（前端用来显示"已用时间"，不被页面刷新重置）
+def _run_pipeline(task_id, input_path, output_dir, config_path, diarize, quality) -> None:
+    """Persist progress only while this execution still owns a nonterminal task."""
+    import time
+    owner = current_owner()
+    _update_task(task_id, status="running", started_at=datetime.now().isoformat(timespec="seconds"), message="开始处理")
+    last_callback = [time.monotonic()]
+    last_stage = [""]
+    stop, expired = threading.Event(), threading.Event()
+    def progress(stage, ratio, message):
+        if expired.is_set():
+            return
+        last_callback[0] = time.monotonic()
+        fields = {"progress": ratio, "stage": stage, "message": message}
         if stage != last_stage[0]:
             fields["stage_started_at"] = datetime.now().isoformat(timespec="seconds")
             last_stage[0] = stage
-        _update_task(task_id, **fields)
-
-    def _watchdog() -> None:
-        while not stop.wait(60):          # wait 兼做 sleep + 可中断
-            elapsed = _t.time() - last_cb_time[0]
+        _repository().update(task_id, owner=owner, **fields)
+    def watchdog():
+        while not stop.wait(min(60, max(0.01, ASR_STALL_TIMEOUT_S / 4))):
+            elapsed = time.monotonic() - last_callback[0]
             if elapsed >= ASR_STALL_TIMEOUT_S:
-                err = f"ASR 阶段无回调超过 {int(elapsed // 60)} 分钟，主动终止"
-                watchdog_exc[0] = RuntimeError(err)
-                logger.error(f"[web] 任务 {task_id} 看门狗触发: {err}")
-                _update_task_failed_if_running(task_id, str(watchdog_exc[0]))
+                expired.set()
+                error = "ASR 长时间无回调，任务已标记失败；底层执行可能仍在运行"
+                if owner is not None:
+                    _repository().update(task_id, owner=owner, status="failed", error=error,
+                                         ended_at=datetime.now().isoformat(timespec="seconds"))
+                else:
+                    _update_task_failed_if_running(task_id, error)
                 return
-
-    threading.Thread(target=_watchdog, daemon=True).start()
-
+    watcher = threading.Thread(target=watchdog, daemon=True)
+    watcher.start()
     try:
         cfg = load_config(config_path, strict_models=False)
-        overrides = {
-            "output_dir": str(output_dir),
-            "diarize": diarize,
-            "quality": quality,
-        }
-        # 渐进 transcript：引擎每交付一个 VAD 组的段落就累积写库，前端
-        # 轮询 /status 时在识别过程中就能看到文字（94 分钟课约 2~3 分钟
-        # 出第一段，之后每 ~10s 滚出一组）。组结果即最终结果，无回炉；
-        # done 时仍用最终 .json 覆盖（后处理 ITN/术语替换可能改写文本）。
-        acc: list[dict] = []
-
-        def _on_segs(new_segs) -> None:
-            acc.extend(
-                {"start": s.start, "end": s.end, "text": s.text} for s in new_segs
-            )
-            _update_task(task_id, transcript=json.dumps(acc, ensure_ascii=False))
-
-        result = pipeline_run(input_path, cfg, overrides, on_progress=_cb,
-                              on_segments=_on_segs)
-        # pipeline_run 返回前再检查一次看门狗：可能在最后一次 callback 之后卡住
-        if watchdog_exc[0] is not None:
-            raise watchdog_exc[0]
-
-        meta = {
-            "duration_s": result.duration_s,
-            "elapsed_s": result.elapsed_s,
-            "rtf": result.rtf,
-            "segments_count": result.segments_count,
-            "formats": list(result.written.keys()),
-        }
-        # 读-改-写：done 前写入的键（parts/merge_mode/ai_feedback…）不许被冲掉
-        meta = {**_read_meta(task_id), **meta}
-
-        # 抽 transcript（从 .json 读 segments 数组）。必须与 done 同一笔 UPDATE：
-        # 前端见 done 即停止轮询，done 之后再后补的段永远到不了页面。
-        # （旧版 _stream_transcript 线程每 0.15~0.5s 逐段"伪直播"——94 分钟课
-        #  1004 段要推 ~150s，前端早就停轮询，页面冻在第一段。）
-        transcript_json = _read_transcript(result.written.get("json"))
-
-        # 标记 done：阶段立刻推进，下载按钮立刻可用（transcript 原子一并写入）
-        _update_task(
-            task_id,
-            status="done",
-            progress=1.0,
-            stage="done",
-            message=f"完成：{result.segments_count} 段",
-            ended_at=datetime.now().isoformat(timespec="seconds"),
-            meta_json=json.dumps(meta, ensure_ascii=False),
-            transcript=transcript_json,
-        )
-
-    except (ConfigLoadError, FileNotFoundError, RuntimeError) as e:
-        logger.exception(f"[web] 任务 {task_id} 失败")
-        _update_task(
-            task_id,
-            status="failed",
-            error=f"{type(e).__name__}: {e}",
-            ended_at=datetime.now().isoformat(timespec="seconds"),
-        )
-    except Exception as e:  # noqa: BLE001
-        logger.exception(f"[web] 任务 {task_id} 未预期失败")
-        _update_task(
-            task_id,
-            status="failed",
-            error=f"Unexpected: {type(e).__name__}: {e}",
-            ended_at=datetime.now().isoformat(timespec="seconds"),
-        )
+        accumulated = []
+        def segments(new_segments):
+            if expired.is_set():
+                return
+            accumulated.extend({"start": s.start, "end": s.end, "text": s.text,
+                                **({"spk": s.spk} if getattr(s, "spk", None) else {})} for s in new_segments)
+            _repository().update(task_id, owner=owner, transcript=json.dumps(accumulated, ensure_ascii=False))
+        result = pipeline_run(input_path, cfg,
+                              {"output_dir": str(output_dir), "diarize": diarize, "quality": quality},
+                              on_progress=progress, on_segments=segments)
+        if expired.is_set():
+            return
+        meta = {**_read_meta(task_id), "duration_s": result.duration_s,
+                "elapsed_s": result.elapsed_s, "rtf": result.rtf,
+                "segments_count": result.segments_count, "formats": list(result.written),
+                "output_files": {fmt: Path(file).name for fmt, file in result.written.items()},
+                "quality": quality}
+        final = getattr(result, "segments", None)
+        # Legacy Result constructors may supply only a JSON file and count.
+        # A real zero-segment result is authoritative and must clear progress.
+        has_final = final is not None and (bool(final) or result.segments_count == 0)
+        transcript = (json.dumps([{"start": s.start, "end": s.end, "text": s.text,
+                                  **({"spk": s.spk} if getattr(s, "spk", None) else {})} for s in final], ensure_ascii=False)
+                      if has_final else _read_transcript(result.written.get("json")))
+        _update_task(task_id, status="done", progress=1.0, stage="done",
+                     message=f"完成：{result.segments_count} 段",
+                     ended_at=datetime.now().isoformat(timespec="seconds"),
+                     meta_json=json.dumps(meta, ensure_ascii=False), transcript=transcript)
+    except Exception as exc:
+        logger.error("[web] task {} failed ({})", task_id, type(exc).__name__)
+        if not expired.is_set():
+            error = "服务器配置加载失败" if isinstance(exc, ConfigLoadError) else f"{type(exc).__name__}: {exc}"
+            _update_task(task_id, status="failed", error=error,
+                         ended_at=datetime.now().isoformat(timespec="seconds"))
     finally:
-        stop.set()  # pipeline 结束（成功/失败都算）：停掉看门狗线程
+        stop.set()
+        watcher.join()
 
 
 # ---------------------------------------------------------------------------
 # AI 反馈 stage（点评 + 优化稿）。铁律：AI 失败不拖垮转写成果。
 # ---------------------------------------------------------------------------
-def _run_ai_stage(task_id: str, config_path: str,
-                  fmts: tuple = ("feedback", "polished")) -> None:
-    """按 fmts 逐件生成 AI 产物（点评/优化稿/深度优化）。
-
-    单件失败不连坐：记 meta.ai_errors[fmt]、该件登记出清，其余件照常产出
-    ——不再像旧版那样 feedback 成功 + polished 失败 = 白烧一次 LLM 全作废。
-    前置失败（LLM 未配置/无转写结果）才落全局 meta.ai_error。
-    """
-    ts = datetime.now().isoformat(timespec="seconds")
-    try:
-        cfg = load_config(config_path, strict_models=False)
-        if not llm_enabled(cfg):
-            raise LLMError("LLM 未配置")
-
-        with closing(_db()) as conn:
-            row = conn.execute(
-                "SELECT output_dir, name, filename FROM tasks WHERE id=?",
-                (task_id,),
-            ).fetchone()
-        if row is None:
-            return
-        stem = row["name"] or Path(row["filename"]).stem
-
-        segs = _read_final_segments(task_id)
-        if not segs:
-            raise LLMError("无转写结果，无法生成 AI 反馈")
-
-        # 补旗标：手动补跑的老任务也要让前端显示 AI stage 行；
-        # 重跑件的旧登记先出清（失败件不得残留"上次的产物"登记）
-        meta = _read_meta(task_id)
-        meta["ai_feedback"] = True
-        files = meta.get("ai_files") or {}
-        errors = meta.get("ai_errors") or {}
-        for f in fmts:
-            files.pop(f, None)
-            errors.pop(f, None)
-        _update_task(task_id, meta_json=json.dumps(meta, ensure_ascii=False),
-                     status="running", stage="ai", message="统计课堂数据",
-                     stage_started_at=ts)
-
-        # 正文从 segments 重建（单一事实源，不依赖 .txt 排版）
-        transcript = "\n".join(
-            f"{s.get('spk')}: {s['text']}" if s.get("spk") else s["text"]
-            for s in segs
-        )
-        out_dir = Path(row["output_dir"])
-        # 固定顺序的步骤表：点评依赖统计，只有重跑点评才算 stats
-        steps = []
-        if "feedback" in fmts:
-            stats = compute_stats(segs)
-            steps.append(("feedback", "生成点评报告",
-                          build_feedback_messages(transcript, stats)))
-        if "polished" in fmts:
-            steps.append(("polished", "生成优化逐字稿",
-                          build_polish_messages(transcript)))
-        if "deep" in fmts:
-            steps.append(("deep", "生成深度优化讲义",
-                          build_deep_messages(transcript)))
-
-        n = len(steps)
-        for i, (fmt, label, messages) in enumerate(steps):
-            _update_task(task_id, progress=(i + 0.5) / n, stage="ai",
-                         message=label)
-            try:
-                content = chat(messages, cfg)
-                path = out_dir / f"{task_id}_{stem}.{fmt}.md"
-                path.write_text(content, encoding="utf-8")
-                files[fmt] = path.name
-                errors.pop(fmt, None)
-            except Exception as e:  # noqa: BLE001 单件失败不连坐
-                logger.exception(f"[web] 任务 {task_id} {label}失败")
-                errors[fmt] = f"{type(e).__name__}: {e}"
-
-        meta = _read_meta(task_id)
-        if files:
-            meta["ai_files"] = files
-        else:
-            meta.pop("ai_files", None)
+def _run_ai_stage(task_id: str, config_path: str, fmts: tuple = ("feedback", "polished")) -> None:
+    """Publish complete AI artifacts atomically; failed attempts keep the last version."""
+    timestamp = datetime.now().isoformat(timespec="seconds")
+    meta = _read_meta(task_id)
+    files = dict(meta.get("ai_files") or {})
+    errors = dict(meta.get("ai_errors") or {})
+    attempts = meta.setdefault("ai_attempts", {})
+    meta["ai_feedback"] = True
+    meta.pop("ai_error", None)
+    for fmt in fmts:
+        attempts[fmt] = {"status": "running", "started_at": timestamp}
+    def persist(**fields):
+        meta["ai_files"] = files
         if errors:
             meta["ai_errors"] = errors
         else:
             meta.pop("ai_errors", None)
-        message = "AI 反馈完成" if not errors else \
-            f"AI 反馈完成（{len(errors)} 项失败）"
-        # ended_at 不写：那是转写管线的终点（_run_pipeline 已盖），
-        # 重生成收尾盖 now 会把"已用"污染成 started_at→最后重生的跨度
-        _update_task(
-            task_id, status="done", stage="done", progress=1.0,
-            message=message,
-            meta_json=json.dumps(meta, ensure_ascii=False),
-        )
-    except Exception as e:  # noqa: BLE001 前置失败（无转写/未配置）才走这里
-        logger.exception(f"[web] 任务 {task_id} AI 反馈失败")
-        meta = _read_meta(task_id)
-        meta["ai_error"] = f"{type(e).__name__}: {e}"
-        # progress 归 1.0：done 终态不配半程进度条
-        _update_task(
-            task_id, status="done", stage="ai", progress=1.0,
-            message="AI 反馈失败",
-            meta_json=json.dumps(meta, ensure_ascii=False),
-        )
+        return _update_task(task_id, meta_json=json.dumps(meta, ensure_ascii=False), **fields)
+    persist(status="running", stage="ai", progress=0, message="统计课堂数据", stage_started_at=timestamp)
+    try:
+        cfg = load_config(config_path, strict_models=False)
+        if not llm_enabled(cfg):
+            raise LLMError("LLM 未配置")
+        row = _repository().get(task_id)
+        if row is None:
+            return
+        segs = _read_final_segments(task_id)
+        if not segs:
+            raise LLMError("无转写结果，无法生成 AI 反馈")
+        transcript = "\n".join(f"{s.get('spk')}: {s['text']}" if s.get("spk") else s["text"] for s in segs)
+        stem = Path((row["name"] or _strip_known_ext(row["filename"])).replace("\\", "/")).name
+        builders = {
+            "feedback": lambda: build_feedback_messages(transcript, compute_stats(segs)),
+            "polished": lambda: build_polish_messages(transcript),
+            "deep": lambda: build_deep_messages(transcript),
+        }
+        for index, fmt in enumerate(fmts):
+            persist(progress=(index + 0.5) / len(fmts), stage="ai", message=f"生成 {fmt}")
+            try:
+                content = chat(builders[fmt](), cfg)
+                if not isinstance(content, str) or not content.strip():
+                    raise LLMError("LLM 返回空内容或正文类型异常")
+                target = Path(row["output_dir"]) / f"{task_id}_{stem}.{fmt}.md"
+                atomic_write_text(target, content)
+                files[fmt] = target.name
+                errors.pop(fmt, None)
+                attempts[fmt].update(status="succeeded", ended_at=datetime.now().isoformat(timespec="seconds"),
+                                     input_chars=len(transcript), output_chars=len(content))
+            except Exception as exc:
+                logger.error("[web] AI {} {} failed ({})", task_id, fmt, type(exc).__name__)
+                error = f"{type(exc).__name__}: {exc}"
+                if cfg.llm.api_key:
+                    error = error.replace(cfg.llm.api_key, "********")
+                errors[fmt] = error
+                attempts[fmt].update(status="failed", error=error, ended_at=datetime.now().isoformat(timespec="seconds"))
+            persist()
+        message = "AI 反馈完成" if not any(attempts[f]["status"] == "failed" for f in fmts) else "本次生成失败，仍可查看上次版本"
+        persist(status="done", stage="done", progress=1.0, message=message)
+    except Exception as exc:
+        error = "服务器配置加载失败" if isinstance(exc, ConfigLoadError) else f"{type(exc).__name__}: {exc}"
+        for fmt in fmts:
+            attempts[fmt].update(status="failed", error=error, ended_at=datetime.now().isoformat(timespec="seconds"))
+        meta["ai_error"] = error
+        persist(status="done", stage="ai", progress=1.0, message="AI 反馈失败，仍可查看上次版本")
 
 
-def _run_single_task(
-    task_id: str,
-    input_path: Path,
-    output_dir: Path,
-    config_path: str,
-    diarize: bool,
-    quality: str,
-    ai_feedback: bool,
-) -> None:
-    """单任务 wrapper：pipeline → （done 且开开关）AI stage。"""
+def _run_single_task(task_id, input_path, output_dir, config_path, diarize, quality, ai_feedback) -> None:
     _run_pipeline(task_id, input_path, output_dir, config_path, diarize, quality)
-    with closing(_db()) as conn:
-        status = conn.execute(
-            "SELECT status FROM tasks WHERE id=?", (task_id,)
-        ).fetchone()["status"]
-    if status == "done" and ai_feedback:
-        _run_ai_stage(task_id, config_path)
+    row = _repository().get(task_id)
+    if row and row["status"] == "done" and ai_feedback:
+        _auto_ai(task_id, config_path)
 
 
 # ---------------------------------------------------------------------------
@@ -1221,13 +1134,22 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--reload", action="store_true")
+    parser.add_argument("--config", default=os.environ.get("ASR_WEB_CONFIG", "config.yaml"))
     args = parser.parse_args()
+
+    password = os.environ.get("ASR_WEB_PASSWORD", "")
+    if not password and args.host != "localhost" and not loopback(args.host):
+        parser.error("非本机监听必须先设置 ASR_WEB_PASSWORD")
+    os.environ["ASR_WEB_CONFIG"] = str(Path(args.config).resolve())
+    DEFAULT_RUNTIME.config_path = Path(args.config).resolve()
+    DEFAULT_RUNTIME.password = password
 
     uvicorn.run(
         "asr.web:app",
         host=args.host,
         port=args.port,
         reload=args.reload,
+        proxy_headers=False,
     )
 
 

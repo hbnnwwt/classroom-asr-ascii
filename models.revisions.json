@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "verified_at": "2026-10-22",
+  "verification": "公开 ModelScope revisions 与 commits API；仅获取元数据，未下载模型或验证真实推理。",
+  "limitations": "ModelScope 1.35.3 snapshot_download 校验 branch/tag，不接受裸 commit。observed_commit 仅为核验时记录，未作为不可变下载锁。SenseVoiceSmall 没有公开 tag，master 会漂移；其他 tag 也未做内容哈希锁定。",
+  "models": [
+    {
+      "id": "iic/SenseVoiceSmall",
+      "revision": "master",
+      "revision_kind": "branch",
+      "observed_commit": "7bf452403abd7353a300cd760f7adae7701c92c1",
+      "source": "https://modelscope.cn/api/v1/models/iic/SenseVoiceSmall/commits?Ref=master&PageNumber=1&PageSize=1"
+    },
+    {
+      "id": "iic/speech_fsmn_vad_zh-cn-16k-common-pytorch",
+      "revision": "v2.0.4",
+      "revision_kind": "tag",
+      "observed_commit": "662fc7a38813d81305085696d59eb5b1141a204a",
+      "source": "https://modelscope.cn/api/v1/models/iic/speech_fsmn_vad_zh-cn-16k-common-pytorch/commits?Ref=v2.0.4&PageNumber=1&PageSize=1"
+    },
+    {
+      "id": "iic/punc_ct-transformer_zh-cn-common-vad_realtime-vocab272727",
+      "revision": "v2.0.4",
+      "revision_kind": "tag",
+      "observed_commit": "4f7a8782e2cf507ac3ab4d9523ffa34156163d26",
+      "source": "https://modelscope.cn/api/v1/models/iic/punc_ct-transformer_zh-cn-common-vad_realtime-vocab272727/commits?Ref=v2.0.4&PageNumber=1&PageSize=1"
+    },
+    {
+      "id": "iic/speech_campplus_sv_zh-cn_16k-common",
+      "revision": "v2.0.2",
+      "revision_kind": "tag",
+      "observed_commit": "930086088e5c5fa8a3f911c20795ca72f7f16397",
+      "source": "https://modelscope.cn/api/v1/models/iic/speech_campplus_sv_zh-cn_16k-common/commits?Ref=v2.0.2&PageNumber=1&PageSize=1"
+    },
+    {
+      "id": "iic/speech_paraformer-large-vad-punc_asr_nat-zh-cn-16k-common-vocab8404-pytorch",
+      "revision": "v2.0.5",
+      "revision_kind": "tag",
+      "observed_commit": "a3113885d79e23e89972675ee6f7f00fc4119579",
+      "source": "https://modelscope.cn/api/v1/models/iic/speech_paraformer-large-vad-punc_asr_nat-zh-cn-16k-common-vocab8404-pytorch/commits?Ref=v2.0.5&PageNumber=1&PageSize=1"
+    }
+  ]
+}

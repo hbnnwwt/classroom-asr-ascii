@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import requests
+from loguru import logger
 
 from .config import AppConfig
 
@@ -50,14 +51,23 @@ def chat(
             "LLM 请求经系统代理被拒——检查代理客户端是否正常（刚启动/切节点"
             "可稍后重试），或把 LLM 服务商域名加入代理直连规则") from e
     except requests.RequestException as e:  # noqa: BLE001
-        raise LLMError(f"LLM 请求失败: {type(e).__name__}: {e}") from e
+        raise LLMError(f"LLM 请求失败: {type(e).__name__}") from e
 
     if resp.status_code != 200:
-        raise LLMError(f"LLM HTTP {resp.status_code}: {resp.text[:200]}")
+        raise LLMError(f"LLM HTTP {resp.status_code}")
     try:
-        content = resp.json()["choices"][0]["message"]["content"]
+        choice = resp.json()["choices"][0]
+        content = choice["message"]["content"]
+        finish_reason = choice.get("finish_reason")
     except (ValueError, KeyError, IndexError, TypeError) as e:
         raise LLMError(f"LLM 响应结构异常: {e}") from e
-    if not content or not content.strip():
+    logger.info("[llm] input_chars={} output_chars={} finish_reason={}",
+                sum(len(str(m.get("content", ""))) for m in messages),
+                len(content) if isinstance(content, str) else 0, finish_reason or "unknown")
+    if finish_reason in ("length", "content_filter"):
+        raise LLMError(f"LLM 回复不完整: finish_reason={finish_reason}")
+    if not isinstance(content, str):
+        raise LLMError("LLM 正文不是字符串")
+    if not content.strip():
         raise LLMError("LLM 返回空内容")
     return content

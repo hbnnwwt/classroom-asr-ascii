@@ -32,17 +32,16 @@
 
     <section class="panel settings-panel">
       <div class="section-head">
-        <h2>AI 反馈（LLM）</h2>
+        <h2>AI 整理与教学反馈</h2>
         <span id="llm-state" class="status-badge status-pending" hidden>未配置</span>
       </div>
       <p class="hint">
-        云 API（GLM / DeepSeek 等）与本地 Ollama 都走 OpenAI 兼容端点。
-        base_url 与 model 都填好即启用；清空保存即关闭。
-        示例：Ollama 用 <code>http://localhost:11434/v1</code>（api_key 留空）。
+        选择服务商，填写模型名称与访问密钥。服务地址与模型名称都填好即启用；清空其中一项后保存可关闭。
+        生成 AI 内容时，逐字稿会发送至此处配置的服务。本地 Ollama 可留空密钥。
       </p>
       <form id="llm-form">
         <label>
-          常用服务商（一键填充 base_url 与 model，api_key 仍需自填）
+          服务商（选择后填入建议地址与模型，可自行修改）
           <select id="preset">
             <option value="">手动输入</option>
             <option value="ollama">Ollama 本地</option>
@@ -55,34 +54,39 @@
           </select>
         </label>
         <label>
-          base_url
-          <input type="text" id="base-url" placeholder="https://open.bigmodel.cn/api/paas/v4" />
+          模型名称
+          <input type="text" id="model" placeholder="服务商提供的模型名称，如 qwen2.5:7b" />
         </label>
         <label>
-          api_key（本地模型留空）
-          <input type="password" id="api-key" placeholder="sk-..." autocomplete="off" />
+          访问密钥
+          <input type="password" id="api-key" placeholder="输入新密钥；留空保留已保存的密钥" autocomplete="new-password" aria-describedby="key-state" />
         </label>
+        <p id="key-state" class="hint field-note" role="status"></p>
+        <label class="checkbox"><input type="checkbox" id="clear-api-key" />清除已保存的密钥</label>
+        <details class="settings-advanced"><summary>高级设置</summary>
         <label>
-          model
-          <input type="text" id="model" placeholder="glm-4-flash / qwen2.5:7b" />
+          服务地址（OpenAI 兼容接口）
+          <input type="text" id="base-url" placeholder="http://localhost:11434/v1" />
         </label>
         <div class="form-row">
           <label>
-            timeout（秒）
+            请求超时（秒）
             <input type="number" id="timeout" min="1" value="300" />
           </label>
           <label>
-            max_tokens
+            单次输出上限（tokens）
             <input type="number" id="max-tokens" min="1" value="16384" />
           </label>
         </div>
+        </details>
         <div class="form-actions">
           <button type="button" id="test-btn" class="btn">测试连接</button>
           <button type="button" id="save-btn" class="btn btn-primary">保存</button>
         </div>
       </form>
-      <p id="test-result" hidden></p>
-      <p id="save-result" hidden></p>
+      <p id="test-result" role="status" aria-live="polite" hidden></p>
+      <p id="save-result" role="status" aria-live="polite" hidden></p>
+      <a id="return-task" class="btn" hidden></a>
     </section>
   </main>
 

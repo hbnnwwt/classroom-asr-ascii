@@ -24,7 +24,7 @@
         <h1 id="project-name">项目详情</h1>
       </div>
       <div class="header-actions">
-        <a href="/settings" class="theme-toggle" aria-label="设置" title="设置（LLM / AI 反馈）">
+        <a href="/settings" id="task-settings-link" class="theme-toggle" aria-label="设置" title="设置（LLM / AI 反馈）">
           <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></svg>
         </a>
         <button id="theme-toggle" type="button" class="theme-toggle" aria-label="切换主题">
@@ -50,6 +50,12 @@
             <div id="summary-sub" class="summary-sub" hidden></div>
           </div>
 
+          <ol id="main-phases" class="main-phases" aria-label="转写阶段">
+            <li data-phase="prepare">准备录音</li><li data-phase="text">生成文字</li><li data-phase="results">整理结果</li>
+          </ol>
+          <p id="phase-message" class="hint" role="status" aria-live="polite">等待开始转写。</p>
+          <details class="technical-details">
+          <summary>查看处理详情</summary>
           <ol class="stages" id="stages">
             <li data-stage="merge"><span class="mark">·</span><span class="label">拼接音轨</span><span class="msg"></span></li>
             <li data-stage="probe"><span class="mark">·</span><span class="label">探测音视频</span><span class="msg"></span></li>
@@ -62,27 +68,31 @@
             <li data-stage="ai"><span class="mark">·</span><span class="label">AI 反馈</span><span class="msg"></span></li>
             <li data-stage="done"><span class="mark">·</span><span class="label">完成</span><span class="msg"></span></li>
           </ol>
+          </details>
 
-          <div class="progress-bar">
+          <div class="progress-bar" role="progressbar" aria-label="转写进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
             <div class="progress-fill" id="progress-fill">0%</div>
           </div>
 
-          <div id="error" class="error" hidden></div>
+          <div id="error" class="error" role="alert" hidden></div>
 
           <div id="downloads" hidden>
-            <h3>下载输出</h3>
+            <h3>下载转写结果</h3>
+            <p id="quality-note" class="hint field-note" hidden></p>
             <div class="download-list">
               <a class="btn btn-primary" data-fmt="srt">
                 <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m7 10 5 5 5-5"/><path d="M12 15V3"/></svg>
-                SRT 字幕
+                下载字幕（SRT）
               </a>
-              <a class="btn" data-fmt="txt">TXT</a>
+              <a class="btn" data-fmt="txt">下载文字稿（TXT）</a>
+            </div>
+            <details id="more-formats"><summary>更多格式</summary><div class="download-list">
               <a class="btn" data-fmt="vtt">VTT</a>
               <a class="btn" data-fmt="md">MD</a>
               <a class="btn" data-fmt="json">JSON</a>
               <a class="btn" data-fmt="mp4" hidden title="拼接合并后的完整视频（仅旧版合并任务）">MP4 视频</a>
-              <a class="btn" data-fmt="replace.log" hidden title="术语替换日志（调试用，术语命中过才有此文件）">replace.log</a>
-            </div>
+              <a class="btn" data-fmt="replace.log" hidden title="查看术语替换的具体记录">术语替换日志</a>
+            </div></details>
             <!-- 多段任务：每段一份独立 SRT（时间归零，直接配原视频） -->
             <div id="part-downloads" class="part-downloads" hidden>
               <h4>每段独立字幕（时间轴归零，配各段原视频）</h4>
@@ -93,27 +103,29 @@
           <!-- AI 反馈产物：查看（有产物才亮）+ 生成/重试，与转写下载分家。
                显隐跟随 #downloads 同一条件（done 或 AI 重跑中）；下载收进阅读层 -->
           <div id="ai-section" hidden>
-            <h3>AI 反馈产物</h3>
+            <h3>AI 整理与教学反馈</h3>
+            <p id="ai-state-message" class="hint field-note" role="status" aria-live="polite"></p>
+            <p class="hint field-note">生成时会将逐字稿发送至设置中配置的服务，请核对生成内容。</p>
             <div class="download-list">
               <button class="btn btn-view" type="button" data-view="feedback" hidden title="页面内阅读 AI 点评报告">
                 <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></svg>
-                查看 AI 点评
+                教学点评
               </button>
               <button class="btn btn-view" type="button" data-view="polished" hidden title="页面内阅读优化逐字稿">
                 <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></svg>
-                查看优化稿
+                整理后的逐字稿
               </button>
               <button class="btn btn-view" type="button" data-view="deep" hidden title="页面内阅读深度优化讲义（成稿化）">
                 <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></svg>
-                查看深度优化
+                课堂讲义
               </button>
             </div>
             <!-- 生成/重试（done 且 LLM 可用时出现）。点评+优化稿是上传开关的整组；深度优化按需单独生成 -->
+            <div id="ai-error" class="error" role="alert" hidden></div>
             <div id="ai-actions" hidden>
-              <div id="ai-error" class="error"></div>
               <div class="btn-row">
                 <button id="ai-retry" type="button" class="btn">生成 AI 反馈</button>
-                <button id="ai-deep" type="button" class="btn">生成深度优化</button>
+                <button id="ai-deep" type="button" class="btn">生成课堂讲义</button>
               </div>
             </div>
           </div>
@@ -124,7 +136,7 @@
       <div class="col-right">
         <section id="transcript-panel" hidden>
           <div class="transcript-toolbar">
-            <h3>实时转写 <span id="transcript-count" class="count"></span></h3>
+            <h3><span id="transcript-heading">实时转写</span> <span id="transcript-count" class="count"></span></h3>
             <div class="toolbar-actions">
               <button id="copy-transcript" type="button" title="复制全部转写文本（说话人前缀，不带时间戳）">复制全文</button>
               <button id="live-toggle" type="button" aria-label="暂停或恢复自动滚动">
@@ -133,7 +145,13 @@
               </button>
             </div>
           </div>
-          <div id="transcript" class="transcript"></div>
+          <div id="transcript-reading" class="reading-controls" hidden>
+            <label for="transcript-search" class="sr-only">搜索完整逐字稿</label>
+            <input type="search" id="transcript-search" placeholder="搜索完整逐字稿…" />
+            <div class="pagination"><button type="button" id="transcript-prev">上一页</button><span id="transcript-page" role="status" aria-live="polite"></span><button type="button" id="transcript-next">下一页</button></div>
+          </div>
+          <p id="transcript-note" class="hint field-note">正在准备录音。第一批文字出现前可能需要等待，请查看左侧处理阶段。</p>
+          <div id="transcript" class="transcript" tabindex="0" aria-label="转写正文"></div>
         </section>
       </div>
     </div>
@@ -143,7 +161,8 @@
   <div id="ai-modal" class="modal" hidden>
     <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="ai-modal-title">
       <div class="modal-head">
-        <h3 id="ai-modal-title">AI 产物</h3>
+        <h3 id="ai-modal-title" tabindex="-1">AI 产物</h3>
+        <button id="ai-modal-expand" class="btn" type="button" aria-pressed="false">全屏阅读</button>
         <button id="ai-modal-x" type="button" class="modal-x" aria-label="关闭">
           <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
         </button>
@@ -153,7 +172,7 @@
         <button type="button" class="tab active" data-tab="clean">优化稿</button>
         <button type="button" class="tab" data-tab="diff">修改痕迹</button>
       </div>
-      <div id="ai-modal-body" class="report"></div>
+      <div id="ai-modal-body" class="report" tabindex="0" aria-label="AI 正文"></div>
       <div class="modal-foot">
         <button id="ai-modal-regen" type="button" class="btn" title="单独重新生成本件 AI 产物">重新生成此件</button>
         <a id="ai-modal-dl" class="btn btn-primary">下载 .md</a>

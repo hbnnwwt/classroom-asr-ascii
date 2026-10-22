@@ -181,7 +181,7 @@ class FunASREngine(ASREngine):
         # 非 ASCII：创建 junction
         import os
         tmp_root = Path("tmp_models")
-        digest = hashlib.sha256(str(p_obj).casefold().encode("utf-8")).hexdigest()[:16]
+        digest = hashlib.sha256(os.path.normcase(str(p_obj)).encode("utf-8")).hexdigest()[:16]
         tmp_dst = (tmp_root / f"{alias}-{digest}").absolute()
         if not tmp_dst.exists():
             tmp_root.mkdir(parents=True, exist_ok=True)

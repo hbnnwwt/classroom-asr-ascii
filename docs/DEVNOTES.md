@@ -1,47 +1,71 @@
-# 开发记录：实现偏差 · 阶段进度 · 已知边界
+﻿# 开发记录与架构边界
 
-施工阶段的决策记录。使用说明看 [README](../README.md)，方案原文见 方案.txt。
+更新：2026-10-22。使用说明见 [README](../README.md)，接口迁移见 [web-contract.md](web-contract.md)，验收命令和真实样本协议见 [validation.md](validation.md)。
 
-## 实现偏差
+## 当前结构
 
-按方案第 8 条"以能跑通且满足验收清单为准"原则，以下与方案有偏差：
+保留 Python 单体、FastAPI、SQLite 和原生 HTML/CSS/JS；前端字体、图标和资源均来自本地。核心所有权如下：
 
-| 项 | 方案原文 | 实际实现 | 原因 |
-|---|---|---|---|
-| Python 版本 | "建议固定 3.10，FunASR 对 3.12 兼容性有风险" | 实际用 **Python 3.12.10**（机器无 3.10） | 当前 torch 2.14+cpu + funasr 1.2 + Python 3.12 跑通 |
-| Whisper 引擎 | 5.4 节要求 faster-whisper 作为回退引擎 | **禁用**，whisper_engine.py 留接口 stub，实例化即抛错 | 按用户明确要求"严格不要使用 whisper，用 FunASr" |
-| 项目路径 | 方案未提及 | 项目实际位于 **`E:\classroom-asr-ascii\`**（ASCII 路径） | Windows + sentencepiece 不支持中文路径；funasr 加载 bpe.model 时用 fopen 走 GBK 找不到文件。funasr_engine._ensure_ascii_path 自动建 junction，但仓库根必须 ASCII |
-| ASR 默认模型 | 5.3 节默认 `cfg.models.funasr.asr`（SenseVoice-Small） | 默认走 **`paraformer_model`**（Paraformer-Large） | 实测 SenseVoice 是端到端模型，**不输出时间戳**；Paraformer 才有 token-level timestamp |
-| FunASR `hotword` 参数 | 5.3 节通过 `hotword=" ".join(hotwords)` 传入 | 捕获 TypeError 后**改走术语表后处理路径** | 1.1+ 版本 hotword 参数语义变化 |
-| 时间戳单位 | 5.2 节"必须做单位探测与单测" | 实现 `_detect_time_unit()` 自动判 centisecond/秒 | Paraformer-large-vad-punc 实测返回 centisecond（1/100 秒），非毫秒非秒 |
-| Paraformer timestamp | 方案预期 sentence_info 字级别 | 实际只返回 token-level timestamp，**无 token→char 对齐** | 取首尾 token 时间区间作为整段范围；精确切分留给 P4 postprocess |
-| SRT 每条 ≤ 8 秒 | 5.5 节硬约束 + 验收 #6 | **降级为软约束** | FunASR 粗时间戳（22s/9 字），硬切条产生 3 字一段不可读；超长段仅 warning |
-| 说话人分离 | 5.6 节要求 | 实现按时长/首次出现启发式（教师/学生A-E/其他） | cam++ 在重叠语音不可靠，全班齐读场景建议关闭 `--diarize` |
-| faster-whisper 依赖 | requirements.txt 原列 `faster-whisper>=1.0` | **已移除** | whisper 禁用 |
-
-## 阶段进度
-
-| 阶段 | 状态 | 真实证据 |
+| 层 | 文件 | 责任 |
 |---|---|---|
-| P1 骨架 + check | ✅ | asr check 通过，11/11 测试 |
-| P2 whisper_engine | ⏸ **跳过** | 按用户要求禁用 whisper |
-| P3 FunASR 引擎 | ✅ | 真实中文转写，19/19 测试 |
-| P4 postprocess + writers | ✅ | 端到端生成五件套，48/48 测试（含 SRT 软约束 + 弱标点修复） |
-| P5 diarize | ✅ | diarize.py 角色启发式（教师/学生A-E/其他），9/9 单测；真实视频待生产时验证 |
-| P6 batch + 并发 | ✅ | batch 跑通，进度条 + 失败隔离 |
-| P7 长视频 + README FAQ | ✅ | README；51s 测试通过 |
-| P8 Web UI | ✅ | FastAPI + SQLite + 轮询；10/10 测试 |
-| P9 Web 增强 | ✅ | 多段上传合并、AI 反馈（LLM 点评/优化稿/在线阅读/修改痕迹 diff）、设置页；pytest 270 passed |
-| P10 AI 三件独立化 | ✅ | 新增深度优化讲义（成稿化，按需生成）；三件各自单独重生（任务页按钮 + 阅读层"重新生成此件"）；错误模型从全局 ai_error 改按件 ai_errors，单件失败不连坐；pytest 277 passed + E2E 24/24 |
+| 配置 | `asr/config.py` | 从固定 YAML 加载配置，管线使用深拷贝快照 |
+| 模型身份 | `asr/engines/spec.py` | 冻结实际 ASR/VAD/PUNC/SPK 路径、device 与加载 CPU 参数 |
+| 单次转写选项 | `asr/engines/base.py` | 冻结语言、ITN、热词、批次与说话人选项，显式传给共享引擎 |
+| 识别与后处理 | `asr/pipeline.py`、`engines/funasr_engine.py`、`postprocess.py` | 模型缓存与互斥、VAD 分组、文本与时间戳处理 |
+| 产物 | `asr/artifacts.py`、`srt.py` | 完整 stem 命名、AI 同目录临时文件原子发布 |
+| Web 资源 | `asr/web/runtime.py`、`access.py` | 固定配置/目录、真实连接认证和同源检查 |
+| Web 任务 | `asr/web/repository.py`、`execution.py` | SQLite 条件准入、上传凭证、恢复、有界执行队列与执行者登记 |
+| Web 交互 | `asr/web/static/` | 上传状态、列表、分页阅读、独立 AI 状态和设置 |
 
-**验收清单（方案第 8 节）：12 项中 9 通过 / 2 部分通过 / 1 待生产验证**。
+`Result.segments` 返回最终处理后的段落，Web 保存全文不依赖是否生成 JSON。新任务登记真实输出文件名；旧任务沿用受限旧查找，不批量改名。
 
-## 已知边界
+模型缓存按完整加载身份复用，创建和关闭均有锁；同实例完整推理串行。语言等单次调用选项不改变模型身份，也不会滞留为另一个任务的共享可变配置。Windows 非 ASCII 模型路径别名包含规范路径摘要，避免不同模型复用同一个 junction；项目根目录仍建议使用 ASCII 路径。
 
-1. **断句合并算法**：当前按字数比例插值时间戳，对短句重复（如多遍 wav）会产生过度切片。生产建议用真实课堂单段长录音。
-2. **Paraformer timestamp 异常**：某些版本下 end 值远超 duration，已硬裁剪（`validate_timestamps`）。
-3. **说话人分离真实数据未验证**：代码完成（diarize.py + 引擎 spk_model 集成），9/9 单测通过；真实视频未用 `--diarize` 重跑（重跑需 24 分钟）。
-4. **全班齐读/齐答时分离不可靠**：cam++ 在重叠语音场景下不可靠，建议关闭 `--diarize`。
-5. **SRT 每条 ≤ 8 秒形式验收已放弃**：FunASR 粗时间戳导致每段 22-170s 是常态，软约束 + warning 保留；根治需要 FunASR token-level timestamp 重建。
-6. **GPU 未在本机验证**：当前机器 `nvidia-smi` 报 "Unknown Error"，未配 NVIDIA 驱动。CPU 上 RTF ≈ 0.13 已验证。
-7. **Web UI 单文件 only**：批量请走 CLI `python -m asr batch`。
+Web 默认 1 个执行 worker、8 个等待位置；CLI batch 的文件并发数与 Web 队列是不同选项。增加 CLI workers 不保证同模型并行加速。系统不提供强杀卡死 native 推理，删除和关闭必须尊重实际执行者。
+
+## 本轮确定性改进
+
+- 强标点提交后清除段内切点，避免下一长句使用上一句的切点而丢字。
+- 中文百分数只转换完整支持的 0–99 表达；不支持的小数、负数和大数保持原文，年份转换继续保留。
+- 不完整 Markdown 表格行会消费输入并转义，避免解析死循环。
+- 带点 stem 的五件套和日志不再互相覆盖；批量输入先检查输出冲突，保留 WAV 后仍清理临时工作目录。
+- Web 限定配置与文件边界，密钥不回传，上传取消与受理在数据库中原子竞争；忙任务不能删除。
+- AI 尝试单独记账，截断或发布失败保留上次完整稿；转写完成时间与 AI 状态独立。
+- UI 展示服务端事实，运行态截取最近 80 段、完成态分页与全文搜索；阅读层管理键盘焦点，移动端保留项目名。
+- 安装和启动统一项目 `.venv`，不按端口终止其他进程；模型下载是显式步骤。
+
+本轮回归使用模板、临时目录、fake 引擎/LLM。测试数量与实际浏览器结果以实施计划的 Review、执行账本及当次命令输出为准；这里不维护会过期的累计数字。
+
+## 保留的技术选择
+
+1. **FunASR 是唯一启用的识别引擎。** Whisper 接口桩继续禁用，不添加其依赖。
+2. **balanced/high 当前使用同一 Paraformer。** fast 使用 SenseVoice，无精细时间戳；档位名称不构成准确率证据。
+3. **VAD 预切与独立标点保留。** 先按语音边界分组，逐组识别和加标点，再拼接偏移；模型输出异常仍需降级和检查。
+4. **字幕最大时长是软约束。** 模型时间锚不准确时，机械插值或硬切不能证明对齐正确。真实字幕验收同时检查文本、边界和可读性。
+5. **说话人是实验性输出。** cam++ 和角色启发式不保证真实师生身份；不同 VAD 组的局部编号不能当作全课稳定身份。
+6. **AI 是可选的外部依赖。** 本地 Ollama 与云端兼容端点共用接口；使用云端会传出逐字稿。没有自动续写或隐式增加付费调用。
+
+## 历史记录的来源与适用范围
+
+本文件改写前的最后记录来自 commit `219662d`，时间为 **2026-10-22 00:52:26 +08:00**。可用以下命令查阅完整原文：
+
+```bash
+git show 219662d:docs/DEVNOTES.md
+```
+
+旧记录包含 P1–P10 阶段进度、51 秒/300 秒/94 分钟等现场排查记录，以及当时的单测和临时 E2E 数量。它们保留为历史，不等于当前配置组合或本轮自动化重新验收。
+
+| 历史表述 | 当前处理 |
+|---|---|
+| Python 3.12、torch 2.14、FunASR 1.2 已跑通 | 旧笔记混用了版本描述。本轮轻量测试不加载真实模型；Python 声明为 3.10–3.12，CPU 候选依赖见约束文件 |
+| CPU RTF 约 0.13、GPU 可在一分钟内完成长课 | 缺少可复核的完整样本/配置/设备日志，不能作为当前性能承诺；GPU 本轮未验收 |
+| P5 说话人分离“完成” | 仅代码和局部测试不证明跨组身份正确，按 V1 真实样本协议继续验收 |
+| Web 单文件 only | 已支持页面多文件组成一个课堂项目；独立批量任务仍使用 CLI |
+| 默认模型约 2 GB、setup 自动下载 | 不把下载大小作为固定事实；当前 setup 只安装依赖，下载脚本显式运行 |
+| 临时 E2E 24/24 | 当前使用已纳入仓库的合成 HTTP 集成测试和浏览器脚本，历史临时脚本不作为可重复验收入口 |
+
+## 待真实数据验收
+
+真实多人跨组身份、重叠语音、GPU 速度、长课吞吐和持续多任务内存仍需实测。`constraints/cpu-py312.txt` 是公开元数据核验后的部分候选约束，不是完整传递依赖锁，也不证明真实模型可运行。`models.revisions.json` 的 observed commit 只记录核验时状态；SenseVoice 的 master 会变，tag 也未做内容哈希锁定。
+
+后续结果应附代码 commit、模型文件校验值、环境、录音时长、评分方法和原始日志。无法给出这些证据时，保留“待验收”，不要用 fake 通过率替代真实能力。

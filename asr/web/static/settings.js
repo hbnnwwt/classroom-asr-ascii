@@ -1,5 +1,28 @@
 // 设置页：LLM 配置回填 / 测试连接 / 保存（写回 config.yaml llm 节）
 const $ = (id) => document.getElementById(id);
+let savedKeySet = false;
+let returnTask = null;
+let settingsSaved = false;
+function showReturnTask() {
+  if (!settingsSaved || !returnTask) return;
+  $("return-task").href = `/task/${encodeURIComponent(returnTask.id)}`;
+  $("return-task").textContent = `返回《${returnTask.name}》`;
+  $("return-task").hidden = false;
+}
+const fromTask = new URLSearchParams(window.location.search).get("from_task");
+if (fromTask && /^[a-zA-Z0-9]+$/.test(fromTask)) {
+  fetch(`/api/projects/${encodeURIComponent(fromTask)}`)
+    .then((r) => r.ok ? r.json() : Promise.reject(new Error("项目不存在")))
+    .then((p) => { returnTask = { id: fromTask, name: p.name || p.filename || "原项目" }; showReturnTask(); })
+    .catch(() => {});
+}
+
+function showKeyState() {
+  $("key-state").textContent = savedKeySet ? "已保存访问密钥，出于安全原因不回显。留空将保留原密钥。" : "尚未保存访问密钥。本地服务通常不需要密钥。";
+}
+$("clear-api-key").addEventListener("change", () => {
+  $("api-key").disabled = $("clear-api-key").checked;
+});
 
 // 常用服务商预设：选中只填 base_url 与 model，api_key 是账号秘密，预设一律不碰。
 // 默认模型对齐 Exam_v5.0 参考项目（generate.py 硬编码值）：MiniMax-M2.7、
@@ -24,7 +47,7 @@ $("preset").addEventListener("change", (e) => {
 function collect() {
   return {
     base_url: $("base-url").value.trim(),
-    api_key: $("api-key").value.trim(),
+    api_key: $("clear-api-key").checked ? "" : ($("api-key").value.trim() || null),
     model: $("model").value.trim(),
     timeout: Number($("timeout").value) || 300,
     max_tokens: Number($("max-tokens").value) || 16384,
@@ -61,15 +84,18 @@ fetch("/api/llm/settings")
   .then((r) => r.json())
   .then((s) => {
     $("base-url").value = s.base_url || "";
-    $("api-key").value = s.api_key || "";
+    $("api-key").value = "";
+    savedKeySet = Boolean(s.api_key_set);
+    showKeyState();
     $("model").value = s.model || "";
     $("timeout").value = s.timeout || 300;
     $("max-tokens").value = s.max_tokens || 16384;
     setLlmState(Boolean(s.base_url && s.model));
   })
-  .catch(() => {});
+  .catch(() => showMsg($("save-result"), false, "加载设置失败，请刷新后重试。"));
 
 $("test-btn").addEventListener("click", async () => {
+  if (!$("llm-form").reportValidity()) return;
   const box = $("test-result");
   $("test-btn").disabled = true;
   box.hidden = false;
@@ -89,18 +115,27 @@ $("test-btn").addEventListener("click", async () => {
 });
 
 $("save-btn").addEventListener("click", async () => {
+  if (!$("llm-form").reportValidity()) return;
   const box = $("save-result");
   $("save-btn").disabled = true;
   try {
-    const { ok, data } = await postJSON("/api/llm/settings", collect());
+    const values = collect();
+    const { ok, data } = await postJSON("/api/llm/settings", values);
     if (!ok) {
-      showMsg(box, false, `✗ 保存失败：${data.detail || "未知错误"}`);
+      showMsg(box, false, `✗ 保存失败：${typeof data.detail === "string" ? data.detail : data.detail?.message || "请检查输入"}`);
       return;
     }
     setLlmState(Boolean(data.enabled));
+    if (values.api_key !== null) savedKeySet = Boolean(values.api_key);
+    $("api-key").value = "";
+    $("clear-api-key").checked = false;
+    $("api-key").disabled = false;
+    showKeyState();
     showMsg(box, true, data.enabled
       ? "✓ 已保存，AI 反馈已启用"
-      : "✓ 已保存（base_url/model 为空，AI 反馈保持关闭）");
+      : "✓ 已保存，服务地址或模型名称为空，AI 保持关闭");
+    settingsSaved = true;
+    showReturnTask();
   } catch (e) {
     showMsg(box, false, `✗ 请求失败: ${e.message}`);
   } finally {

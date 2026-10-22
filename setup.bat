@@ -1,55 +1,71 @@
 @echo off
-REM 一键环境搭建：装依赖 + 下载模型（约 2.1 GB，只需联网跑一次）。
-REM 用法：双击 setup.bat，完成后双击 run_web.bat 启动服务。
+setlocal
+REM Install only into the project environment. Model downloads are explicit.
 cd /d "%~dp0"
+set "VENV_PY=%~dp0.venv\Scripts\python.exe"
+if exist "%VENV_PY%" goto install
 
-REM First run: create local config.yaml (git-ignored, holds api_key) from template
-if not exist config.yaml copy /y config.example.yaml config.yaml >nul
-
-REM --- 1) 找 Python（优先 py 启动器，回退 PATH 里的 python）---
-set PY=
-py -3 --version >nul 2>&1 && set PY=py -3
-if not defined PY (
-    python --version >nul 2>&1 && set PY=python
+REM ASR_PYTHON is an optional full path; otherwise prefer supported py launcher versions.
+set "BOOTSTRAP=%ASR_PYTHON%"
+if defined BOOTSTRAP goto create
+for %%V in (3.12 3.11 3.10) do (
+    if not defined BOOTSTRAP (
+        for /f "delims=" %%P in ('py -%%V -c "import sys; print(sys.executable)" 2^>nul') do set "BOOTSTRAP=%%P"
+    )
 )
-if not defined PY (
-    echo [ERROR] 未找到 Python。请先安装 Python 3.10+:
+if not defined BOOTSTRAP (
+    echo [ERROR] Install Python 3.10-3.12 with the Python launcher:
     echo         https://www.python.org/downloads/
-    echo         安装时勾选 "Add python.exe to PATH"
+    echo         Or set ASR_PYTHON to the full path of a supported python.exe.
     pause
     exit /b 1
 )
 
-echo 使用 Python:
-%PY% --version
-echo.
-
-REM --- 2) 安装依赖 ---
-echo ==============================================
-echo  [1/2] 安装 Python 依赖
-echo ==============================================
-%PY% -m pip install -r requirements.txt
+:create
+"%BOOTSTRAP%" -c "import sys; sys.exit(0 if (3, 10) <= sys.version_info[:2] < (3, 13) else 1)" >nul 2>&1
 if errorlevel 1 (
-    echo [ERROR] 依赖安装失败，请检查网络后重试。
+    echo [ERROR] The selected interpreter must be Python 3.10-3.12.
     pause
     exit /b 1
 )
-echo.
+"%BOOTSTRAP%" -m venv "%~dp0.venv"
+if errorlevel 1 goto failed
+if not exist "%VENV_PY%" goto failed
 
-REM --- 3) 下载模型（已下载过的会自动校验跳过，可安全重复执行）---
-echo ==============================================
-echo  [2/2] 下载 ASR 模型（约 2.1 GB，耐心等待）
-echo ==============================================
-%PY% -X utf8 scripts\download_models.py
+:install
+"%VENV_PY%" -c "import sys; sys.exit(0 if (3, 10) <= sys.version_info[:2] < (3, 13) else 1)" >nul 2>&1
 if errorlevel 1 (
-    echo [ERROR] 模型下载失败，请检查网络后重试。
+    echo [ERROR] Existing .venv must use Python 3.10-3.12.
     pause
     exit /b 1
 )
+if not exist config.yaml copy /y config.example.yaml config.yaml >nul
+if not exist config.yaml goto failed
+"%VENV_PY%" --version
+"%VENV_PY%" -c "import sys; sys.exit(0 if sys.version_info[:2] == (3, 12) else 1)" >nul 2>&1
+if errorlevel 1 goto install_general
 
+REM Metadata-verified Windows CPU profile; real-model inference still needs validation.
+"%VENV_PY%" -m pip install -r requirements.txt -c constraints\cpu-py312.txt --extra-index-url https://download.pytorch.org/whl/cpu
+if errorlevel 1 goto failed
+goto validate
+
+:install_general
+"%VENV_PY%" -m pip install -r requirements.txt
+if errorlevel 1 goto failed
+
+:validate
+"%VENV_PY%" -m pip check
+if errorlevel 1 goto failed
 echo.
-echo ==============================================
-echo  搭建完成！双击 run_web.bat 启动服务，
-echo  浏览器访问 http://127.0.0.1:8765
-echo ==============================================
+echo Dependencies installed into .venv.
+echo Download models explicitly when online:
+echo   ".venv\Scripts\python.exe" -X utf8 scripts\download_models.py
+echo Then double-click run_web.bat. Browser: http://127.0.0.1:8765
 pause
+exit /b 0
+
+:failed
+echo [ERROR] Installation failed. Review the error above and rerun setup.bat.
+pause
+exit /b 1

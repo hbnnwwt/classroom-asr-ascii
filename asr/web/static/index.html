@@ -55,22 +55,29 @@
 
         <div class="form-row">
           <label>
-            质量档
+            转写用途
             <select id="quality" name="quality">
-              <option value="fast">fast（最快）</option>
-              <option value="balanced" selected>balanced（默认）</option>
-              <option value="high">high</option>
+              <option value="balanced" selected>字幕转写（推荐）</option>
+              <option value="fast">快速文字（无精细时间戳）</option>
             </select>
           </label>
           <label class="checkbox">
             <input type="checkbox" id="diarize" name="diarize" />
-            启用说话人分离
+            区分不同说话人（实验性）
           </label>
           <!-- 默认整个藏起来：list.js 探测到 llm 配置才显示——没配置的用户不该看到死开关 -->
           <label class="checkbox" id="ai-feedback-block" hidden>
             <input type="checkbox" id="ai-feedback" name="ai_feedback" />
-            AI 反馈（点评 + 优化稿）
+            生成教学点评与整理后的逐字稿
           </label>
+        </div>
+        <p class="hint field-note">说话人按声音区分，结果需核对。快速文字适合先看内容，字幕时间信息较粗。</p>
+        <p class="hint field-note" id="ai-privacy" hidden>转写在本机进行；开启 AI 后，逐字稿会发送至设置中配置的服务。</p>
+        <div id="upload-feedback" class="upload-feedback" hidden>
+          <p id="upload-message" role="status" aria-live="polite"></p>
+          <progress id="upload-progress" max="100" value="0" aria-label="文件上传进度"></progress>
+          <a id="upload-task-link" class="btn" hidden>查看已接收的任务</a>
+          <button id="upload-check-btn" type="button" class="btn" hidden>查询接收结果</button>
         </div>
         <div class="form-actions">
           <button type="submit" id="submit-btn" class="primary">开始转写</button>
@@ -89,7 +96,7 @@
         <option value="done">已完成</option>
         <option value="failed">失败</option>
       </select>
-      <span id="total-count" class="meta"></span>
+      <span id="total-count" class="meta" role="status" aria-live="polite"></span>
     </section>
 
     <!-- 批量操作工具栏（默认隐藏） -->
@@ -104,6 +111,7 @@
         批量删除
       </button>
       <button id="batch-clear-btn" type="button" class="action-btn">取消选择</button>
+      <span id="batch-busy-note" class="field-note" hidden></span>
     </section>
 
     <!-- 项目列表 -->
@@ -126,11 +134,12 @@
       </table>
       <div id="empty-state" hidden>
         <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/><path d="M16 13H8"/><path d="M16 17H8"/><path d="M10 9H8"/></svg>
-        <p>还没有转写项目<br />上传一段课堂录音，约 2~3 分钟后就能看到第一段文字。</p>
+        <p id="empty-message">还没有转写项目<br />上传课堂录音，开始后会逐段显示识别文字。</p>
         <button type="button" class="primary" id="empty-new-btn">
           <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
           新建第一个项目
         </button>
+        <button type="button" class="btn" id="empty-clear-btn" hidden>清除搜索与筛选</button>
       </div>
     </section>
   </main>

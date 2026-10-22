@@ -12,24 +12,47 @@ let searchTimer = null;
 let listPollTimer = null;
 const selectedIds = new Set();  // 复选框选中状态
 let llmEnabled = false;         // /api/llm/status 探明后置 true（默认藏好，别给没配置的用户看死按钮）
+let visibleProjects = [];
+let listRequest = 0;
+let uploadSession = null; // 凭证是取消裁决的事实来源；XHR.abort 只停止本端发送。
+
+function errorText(data, fallback) {
+  const detail = data && data.detail;
+  return typeof detail === "string" ? detail : (detail && detail.message) || fallback;
+}
+function canDelete(p) {
+  return p.can_delete !== undefined ? p.can_delete : !p.execution_active && !["pending", "running"].includes(p.status);
+}
+function transcriptionDone(p) {
+  return p.transcription_status === "done" || p.status === "done" || p.stage === "ai";
+}
 
 // ---------------------------------------------------------------------------
 // 项目列表
 // ---------------------------------------------------------------------------
 async function loadProjects() {
+  const request = ++listRequest;
   const q = $("search-input").value.trim();
   const status = $("status-filter").value;
   const params = new URLSearchParams();
   if (q) params.set("q", q);
   if (status) params.set("status", status);
 
-  const resp = await fetch(`/api/projects?${params}`);
+  let resp;
+  try { resp = await fetch(`/api/projects?${params}`); }
+  catch { if (request === listRequest) showError("暂时无法加载项目，请检查连接后重试"); return; }
+  if (request !== listRequest) return;
   if (!resp.ok) {
     showError("加载项目列表失败");
     return;
   }
   const data = await resp.json();
+  if (request !== listRequest) return;
+  visibleProjects = data.items;
+  const visible = new Set(data.items.map((p) => p.id));
+  for (const id of selectedIds) if (!visible.has(id)) selectedIds.delete(id);
   renderProjects(data.items);
+  updateBatchUI();
   $("total-count").textContent = `共 ${data.total} 个项目`;
 }
 
@@ -40,6 +63,10 @@ function renderProjects(items) {
 
   if (items.length === 0) {
     empty.hidden = false;
+    const filtered = Boolean($("search-input").value.trim() || $("status-filter").value);
+    $("empty-message").textContent = filtered ? "没有符合条件的项目" : "还没有转写项目。上传课堂录音，开始后会逐段显示识别文字。";
+    $("empty-new-btn").hidden = filtered;
+    $("empty-clear-btn").hidden = !filtered;
     return;
   }
   empty.hidden = true;
@@ -54,6 +81,7 @@ function renderProjects(items) {
     cb.type = "checkbox";
     cb.checked = selectedIds.has(p.id);
     cb.dataset.id = p.id;
+    cb.setAttribute("aria-label", `选择项目 ${p.name || p.filename}`);
     cb.addEventListener("change", () => toggleSelect(p.id, cb.checked));
     tdCheck.appendChild(cb);
 
@@ -72,11 +100,14 @@ function renderProjects(items) {
 
     // 状态
     const tdStatus = document.createElement("td");
-    tdStatus.innerHTML = `<span class="status-badge status-${p.status}">${STATUS_LABEL[p.status] || p.status}</span>`;
+    const badge = document.createElement("span");
+    badge.className = `status-badge status-${Object.hasOwn(STATUS_LABEL, p.status) ? p.status : "pending"}`;
+    badge.textContent = transcriptionDone(p) && ["queued", "running"].includes(p.ai_status) ? "转写完成 · AI 生成中" : STATUS_LABEL[p.status] || p.status;
+    tdStatus.appendChild(badge);
 
     // 进度（running/pending 行内迷你进度条；done 全量；failed 无进度）
     const tdProgress = document.createElement("td");
-    const pct = Math.round((p.progress || 0) * 100);
+    const pct = Math.max(0, Math.min(100, Math.round((p.progress || 0) * 100)));
     if (p.status === "done") tdProgress.textContent = "100%";
     else if (p.status === "failed") tdProgress.textContent = "—";
     else {
@@ -97,19 +128,19 @@ function renderProjects(items) {
     // 操作
     const tdActions = document.createElement("td");
     tdActions.className = "actions-cell";
-    if (p.status === "done") {
+    if (transcriptionDone(p)) {
       const dl = document.createElement("a");
       dl.href = `/download/${p.id}/srt`;
       dl.innerHTML = '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m7 10 5 5 5-5"/><path d="M12 15V3"/></svg>SRT';
       dl.className = "action-btn";
       dl.title = "下载 SRT 字幕";
-      tdActions.appendChild(dl);
+      if ((p.available_formats || p.meta?.formats || []).includes("srt")) tdActions.appendChild(dl);
 
       // AI 反馈入口：与详情页同一套显隐规则——没跑过或失败要重试才显示，
       // 已有产物不占 UI（重跑走 API）。未配置 LLM 也显示：点击跳设置页。
       const hasFiles = Boolean(p.meta && p.meta.ai_files);
       const hasError = Boolean(p.meta && p.meta.ai_error);
-      if (!hasFiles || hasError) {
+      if ((!hasFiles || hasError) && !p.execution_active && !["queued", "running"].includes(p.ai_status)) {
         const ai = document.createElement("button");
         ai.type = "button";
         ai.textContent = "AI 反馈";
@@ -130,6 +161,8 @@ function renderProjects(items) {
     del.innerHTML = '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6h18"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>';
     del.className = "action-btn danger icon-only";
     del.title = "删除项目";
+    del.disabled = !canDelete(p);
+    if (del.disabled) del.title = "任务仍在排队或处理中，结束后可删除";
     del.setAttribute("aria-label", `删除项目 ${p.name || p.filename}`);
     del.onclick = () => deleteProject(p);
     tdActions.appendChild(del);
@@ -141,22 +174,24 @@ function renderProjects(items) {
 
 async function runAiFeedback(p) {
   // 未配置 → 跳设置页配置（配置好回来再点就是真触发）
-  if (!llmEnabled) { window.location.href = "/settings"; return; }
+  if (!llmEnabled) { window.location.href = `/settings?from_task=${encodeURIComponent(p.id)}`; return; }
   // 详情页按钮的同款出口：202 后行变"处理中"，2 秒轮询自动接管
   const resp = await fetch(`/api/tasks/${p.id}/feedback`, { method: "POST" });
   if (!resp.ok) {
     const err = await resp.json().catch(() => ({}));
-    alert(err.detail || `请求失败: ${resp.status}`);
+    alert(errorText(err, `请求失败: ${resp.status}`));
     return;
   }
   await loadProjects();
 }
 
 async function deleteProject(p) {
+  if (!canDelete(p)) return;
   if (!confirm(`确认删除「${p.name || p.filename}」？\n（输出文件一并删除，不可恢复）`)) return;
   const resp = await fetch(`/api/projects/${p.id}`, { method: "DELETE" });
   if (!resp.ok) {
-    alert(`删除失败: ${resp.status}`);
+    const err = await resp.json().catch(() => ({}));
+    alert(errorText(err, `删除失败: ${resp.status}`));
     return;
   }
   await loadProjects();
@@ -171,7 +206,7 @@ function fmtTime(iso) {
 
 function showError(msg) {
   // 简单错误提示：塞到 total-count 里
-  $("total-count").innerHTML = `<span class="error">${msg}</span>`;
+  $("total-count").textContent = msg;
 }
 
 // ---------------------------------------------------------------------------
@@ -183,6 +218,7 @@ function openUploadPanel() {
 }
 
 $("new-project-btn").addEventListener("click", () => {
+  if (uploadSession) { openUploadPanel(); return; }
   const panel = $("upload-panel");
   if (panel.hidden) openUploadPanel();
   else { panel.hidden = true; $("upload-form").reset(); resetUploadForm(); }
@@ -191,7 +227,8 @@ $("new-project-btn").addEventListener("click", () => {
 // 空状态的 CTA 与顶栏按钮同行为
 $("empty-new-btn").addEventListener("click", openUploadPanel);
 
-$("cancel-upload-btn").addEventListener("click", () => {
+$("cancel-upload-btn").addEventListener("click", async () => {
+  if (uploadSession) { await cancelUpload(); return; }
   $("upload-panel").hidden = true;
   $("upload-form").reset();
   resetUploadForm();
@@ -235,10 +272,12 @@ function showFile() {
 function resetUploadForm() {
   selectedFiles = [];
   $("merge-panel").hidden = true;
+  $("upload-feedback").hidden = true;
   showFile();
 }
 
 function setFiles(list) {
+  if (uploadSession) return;
   selectedFiles = Array.from(list);
   $("merge-panel").hidden = selectedFiles.length < 2;
   renderPartsList();
@@ -314,7 +353,7 @@ dz.addEventListener("drop", (e) => {
   e.preventDefault();
   dz.classList.remove("dragover");
   const files = e.dataTransfer.files;
-  if (!files || !files.length) return;
+  if (uploadSession || !files || !files.length) return;
   // 类型校验走 accept 同款口径（全部文件都要过）
   if (!Array.from(files).every(isMediaFile)) {
     alert("不支持的文件类型，请拖入音视频文件");
@@ -330,7 +369,7 @@ dz.addEventListener("drop", (e) => {
 // ---------------------------------------------------------------------------
 $("upload-form").addEventListener("submit", async (e) => {
   e.preventDefault();
-  if (selectedFiles.length === 0) return;
+  if (selectedFiles.length === 0 || uploadSession) return;
 
   const form = new FormData();
   form.append("name", $("project-name-input").value.trim());
@@ -341,36 +380,147 @@ $("upload-form").addEventListener("submit", async (e) => {
   form.append("ai_feedback", $("ai-feedback").checked ? "true" : "false");
   for (const f of selectedFiles) form.append("files", f, f.name);
 
-  $("submit-btn").disabled = true;
-  $("submit-btn").innerHTML = '<span class="spinner" aria-hidden="true"></span>提交中…';
+  const session = { id: null, xhr: null, cancelRequested: false, resolving: false };
+  uploadSession = session;
+  setUploadLocked(true);
+  $("upload-feedback").hidden = false;
+  $("upload-task-link").hidden = true;
+  $("upload-check-btn").hidden = true;
+  $("upload-progress").value = 0;
+  uploadMessage("正在准备上传…");
   try {
-    const resp = await fetch("/api/projects", { method: "POST", body: form });
-    if (!resp.ok) {
-      const err = await resp.json().catch(() => ({}));
-      throw new Error(err.detail || `提交失败: ${resp.status}`);
-    }
-    const data = await resp.json();
-    // 收起表单 + 跳到详情
-    $("upload-panel").hidden = true;
-    $("upload-form").reset();
-    resetUploadForm();
-    window.location.href = `/task/${data.task_id}`;
+    session.ticketPromise = fetch("/api/uploads", { method: "POST" }).then(async (r) => {
+      const data = await r.json();
+      if (!r.ok) throw new Error(errorText(data, "无法创建上传凭证"));
+      session.id = data.upload_id;
+      return data;
+    });
+    await session.ticketPromise;
+    if (session.cancelRequested) return; // 取消处理器等待凭证后再裁决，永不开始发送。
+    const data = await sendUpload(session, form);
+    if (!session.cancelRequested) acceptUpload(session, data.task_id, true);
   } catch (err) {
-    alert(err.message);
-  } finally {
-    $("submit-btn").disabled = false;
-    $("submit-btn").textContent = "开始转写";
+    if (session.cancelRequested) return;
+    if (session.id) {
+      session.failureMessage = err.message;
+      uploadMessage(`${err.message}。正在查询接收结果…`);
+      await resolveUpload(session, true);
+    } else {
+      uploadMessage(`上传未开始：${err.message}。请重试。`);
+      finishUpload(session);
+    }
   }
+});
+
+function uploadMessage(message) { $("upload-message").textContent = message; }
+function setUploadLocked(locked) {
+  $("upload-form").setAttribute("aria-busy", String(locked));
+  for (const id of ["submit-btn", "file-input", "project-name-input", "quality", "diarize", "ai-feedback"]) $(id).disabled = locked;
+  document.querySelectorAll("#parts-list button").forEach((b) => { b.disabled = locked; });
+  $("submit-btn").textContent = locked ? "正在上传…" : "开始转写";
+  $("cancel-upload-btn").textContent = locked ? "取消上传" : "收起";
+}
+function sendUpload(session, form) {
+  return new Promise((resolve, reject) => {
+    const xhr = session.xhr = new XMLHttpRequest();
+    xhr.open("POST", "/api/projects");
+    xhr.setRequestHeader("X-Upload-Id", session.id);
+    xhr.upload.onprogress = (e) => {
+      if (session.cancelRequested) return;
+      if (e.lengthComputable) {
+        const pct = Math.min(100, Math.round(e.loaded / e.total * 100));
+        $("upload-progress").value = pct;
+        uploadMessage(e.loaded >= e.total ? "正在确认接收…" : `正在上传 ${pct}% · ${fmtSize(e.loaded)} / ${fmtSize(e.total)}`);
+      } else {
+        $("upload-progress").removeAttribute("value");
+        uploadMessage(`正在上传 · 已发送 ${fmtSize(e.loaded)}`);
+      }
+    };
+    xhr.upload.onload = () => { if (!session.cancelRequested) uploadMessage("正在确认接收…"); };
+    xhr.onload = () => {
+      let data = {};
+      try { data = JSON.parse(xhr.responseText); } catch { /* 响应异常由凭证恢复 */ }
+      if (xhr.status >= 200 && xhr.status < 300 && data.task_id) resolve(data);
+      else reject(new Error(errorText(data, `上传请求失败（${xhr.status}）`)));
+    };
+    xhr.onerror = () => reject(new Error("网络连接中断"));
+    xhr.onabort = () => reject(new Error("已停止发送，等待服务端确认"));
+    xhr.send(form);
+  });
+}
+function finishUpload(session) {
+  if (uploadSession !== session) return;
+  uploadSession = null;
+  setUploadLocked(false);
+  $("cancel-upload-btn").disabled = false;
+  $("upload-check-btn").hidden = true;
+}
+function acceptUpload(session, taskId, navigate) {
+  if (!taskId) return;
+  uploadMessage("任务已接收，继续处理。");
+  $("upload-progress").value = 100;
+  const link = $("upload-task-link");
+  link.href = `/task/${encodeURIComponent(taskId)}`;
+  link.hidden = false;
+  finishUpload(session);
+  loadProjects();
+  if (navigate && !session.cancelRequested) window.location.href = link.href;
+}
+async function resolveUpload(session, requestCancel = false) {
+  if (!session.id || session.resolving) return;
+  session.resolving = true;
+  $("upload-check-btn").disabled = true;
+  try {
+    const resp = await fetch(`/api/uploads/${encodeURIComponent(session.id)}${requestCancel ? "/cancel" : ""}`, requestCancel ? { method: "POST" } : {});
+    const data = await resp.json();
+    const state = resp.ok ? data : data.detail || {};
+    if (state.status === "accepted" || state.code === "upload_already_accepted") {
+      acceptUpload(session, state.task_id, false);
+    } else if (resp.ok && state.status === "cancelled") {
+      uploadMessage(session.cancelRequested ? "已取消上传，未创建转写任务。" : `${session.failureMessage || "上传未完成"}。已确认未创建任务，可以重试。`);
+      finishUpload(session);
+    } else {
+      throw new Error(errorText(data, "服务端尚未确认取消"));
+    }
+  } catch {
+    uploadMessage(`${session.cancelRequested ? "取消" : "接收"}结果暂未确认。请保持此页，恢复连接后查询；任务可能已经接收。`);
+    $("upload-check-btn").hidden = false;
+    $("cancel-upload-btn").disabled = false;
+  } finally {
+    session.resolving = false;
+    $("upload-check-btn").disabled = false;
+  }
+}
+async function cancelUpload() {
+  const session = uploadSession;
+  if (!session || session.resolving) return;
+  session.cancelRequested = true;
+  $("cancel-upload-btn").disabled = true;
+  uploadMessage("已停止发送，正在确认取消结果…");
+  if (session.xhr) session.xhr.abort();
+  try { await session.ticketPromise; }
+  catch { uploadMessage("上传未开始，未创建转写任务。"); finishUpload(session); return; }
+  await resolveUpload(session, true);
+}
+$("upload-check-btn").addEventListener("click", () => {
+  if (uploadSession) resolveUpload(uploadSession, true);
 });
 
 // ---------------------------------------------------------------------------
 // 搜索 + 筛选（防抖）
 // ---------------------------------------------------------------------------
 $("search-input").addEventListener("input", () => {
+  clearSelection();
   clearTimeout(searchTimer);
   searchTimer = setTimeout(loadProjects, 200);
 });
-$("status-filter").addEventListener("change", loadProjects);
+$("status-filter").addEventListener("change", () => { clearSelection(); loadProjects(); });
+$("empty-clear-btn").addEventListener("click", () => {
+  $("search-input").value = "";
+  $("status-filter").value = "";
+  clearSelection();
+  loadProjects();
+});
 
 // ---------------------------------------------------------------------------
 // 轮询：处理中的任务需要刷新进度（每 2 秒一次，避开节流）
@@ -396,6 +546,12 @@ function updateBatchUI() {
   const n = selectedIds.size;
   $("selected-count").textContent = String(n);
   $("batch-toolbar").hidden = n === 0;
+  const busy = visibleProjects.filter((p) => selectedIds.has(p.id) && !canDelete(p));
+  const noOutput = visibleProjects.filter((p) => selectedIds.has(p.id) && !transcriptionDone(p));
+  $("batch-busy-note").hidden = !busy.length;
+  $("batch-busy-note").textContent = `${busy.length ? `${busy.length} 个任务仍在处理，删除会跳过。` : ""}${noOutput.length ? `ZIP 将跳过 ${noOutput.length} 个尚无转写结果的项目，并附跳过清单。` : ""}`;
+  $("batch-busy-note").hidden = !busy.length && !noOutput.length;
+  $("batch-delete-btn").disabled = n > 0 && busy.length === n;
 
   // 全选 checkbox 状态：部分选 → indeterminate；全选 → checked；都没选 → unchecked
   const all = document.querySelectorAll("#projects-body input[type='checkbox']");
@@ -428,18 +584,22 @@ function syncSelectAll(checked) {
   });
 }
 
-$("batch-clear-btn").addEventListener("click", () => {
+function clearSelection() {
   selectedIds.clear();
   document.querySelectorAll("#projects-body input[type='checkbox']").forEach((c) => (c.checked = false));
   $("select-all").checked = false;
   $("select-all").indeterminate = false;
   updateBatchUI();
-});
+}
+$("batch-clear-btn").addEventListener("click", clearSelection);
 
 $("batch-delete-btn").addEventListener("click", async () => {
-  const ids = Array.from(selectedIds);
+  const targets = visibleProjects.filter((p) => selectedIds.has(p.id) && canDelete(p));
+  const ids = targets.map((p) => p.id);
   if (ids.length === 0) return;
-  if (!confirm(`确认删除 ${ids.length} 个项目？\n（输出文件一并删除，不可恢复）`)) return;
+  const names = targets.map((p) => `• ${p.name || p.filename}`).join("\n");
+  const skipped = selectedIds.size - ids.length;
+  if (!confirm(`确认删除以下 ${ids.length} 个项目？\n${names}\n\n录音上传副本、转写和 AI 输出文件一并删除，不可恢复。${skipped ? `\n另有 ${skipped} 个处理中任务将跳过。` : ""}`)) return;
 
   const resp = await fetch("/api/projects/batch-delete", {
     method: "POST",
@@ -453,7 +613,7 @@ $("batch-delete-btn").addEventListener("click", async () => {
   const data = await resp.json();
   selectedIds.clear();
   await loadProjects();
-  const failedMsg = data.failed.length ? `（${data.failed.length} 个失败）` : "";
+  const failedMsg = data.failed.length ? `（${data.failed.length} 个未删除，可能仍在处理）` : "";
   alert(`已删除 ${data.deleted.length} 个项目${failedMsg}`);
 });
 
@@ -502,6 +662,7 @@ fetch("/api/llm/status")
     if (!s.enabled) return;
     llmEnabled = true;
     $("ai-feedback-block").hidden = false;
+    $("ai-privacy").hidden = false;
     // 列表可能先于此返回（竞态）：补一次渲染让 AI 按钮出现
     loadProjects();
   })
