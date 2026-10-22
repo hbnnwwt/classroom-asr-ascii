@@ -1667,6 +1667,63 @@ def test_run_ai_stage_marks_flag_and_stats_fed(isolated_db, monkeypatch):
     assert meta["ai_feedback"] is True                # 手动补跑也补旗标
 
 
+# ---------------------------------------------------------------------------
+# ended_at 语义：started_at/ended_at = 转写管线的一生，AI 重生成不得触碰。
+# 现网事故：重生成收尾盖 ended_at=now，10-20 的任务显示"已用 36h40m"。
+# ---------------------------------------------------------------------------
+PIPE_END = "2026-10-20T12:17:52"
+
+
+def _set_ai_task_clock(wm):
+    """给 ai1 补上管线时间戳（started → ended 共 185s，对齐 meta.elapsed_s 口径）。"""
+    with closing(wm._db()) as conn:
+        conn.execute(
+            "UPDATE tasks SET started_at='2026-10-20T12:14:47', ended_at=?"
+            " WHERE id='ai1'", (PIPE_END,))
+
+
+def test_ai_regen_preserves_pipeline_ended_at(isolated_db, monkeypatch):
+    """AI stage 收尾（成功 / 按件失败 / 前置失败）都不写 ended_at。"""
+    from asr.llm import LLMError
+    wm, _, _ = _mk_ai_task(isolated_db, monkeypatch)
+    _set_ai_task_clock(wm)
+
+    wm._run_ai_stage("ai1", "config.yaml")            # 成功路径
+    monkeypatch.setattr(
+        wm, "chat", lambda *a, **kw: (_ for _ in ()).throw(LLMError("HTTP 500: boom")))
+    wm._run_ai_stage("ai1", "config.yaml")            # 按件失败路径（走成功收尾）
+    monkeypatch.setattr(wm, "llm_enabled", lambda cfg: False)
+    wm._run_ai_stage("ai1", "config.yaml")            # 前置失败路径（外层 except）
+
+    with closing(wm._db()) as conn:
+        row = conn.execute(
+            "SELECT status, ended_at FROM tasks WHERE id='ai1'").fetchone()
+    assert row["status"] == "done"
+    assert row["ended_at"] == PIPE_END
+
+
+def test_start_ai_run_keeps_ended_at(isolated_db, monkeypatch):
+    """重生成入口（202 前置 UPDATE）不得清 ended_at：前端靠它冻结已用计时。"""
+    wm, _, _ = _mk_ai_task(isolated_db, monkeypatch)
+    _set_ai_task_clock(wm)
+
+    class _NoThread:                                  # 不真跑 AI 线程，只验前置 UPDATE
+        def __init__(self, *a, **kw):
+            pass
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(wm.threading, "Thread", _NoThread)
+    resp = wm._start_ai_run("ai1", "config.yaml", ("feedback",))
+    assert resp.status_code == 202
+    with closing(wm._db()) as conn:
+        row = conn.execute(
+            "SELECT status, ended_at FROM tasks WHERE id='ai1'").fetchone()
+    assert row["status"] == "running"
+    assert row["ended_at"] == PIPE_END
+
+
 def test_upload_ai_feedback_flag_reaches_meta(client, isolated_db, monkeypatch):
     """上传带 ai_feedback=true → meta 落库，单任务 wrapper 收到 True。"""
     import asr.web as wm
@@ -1880,8 +1937,9 @@ def _mk_done_plain_task(isolated_db, task_id="fb1", status="done"):
 def test_feedback_trigger_202_and_clears_error(client, isolated_db, monkeypatch):
     """手动补跑通过：清旧 ai_error、status→running/stage→ai、线程跑 _run_ai_stage。
 
-    meta 读-改-写不许冲掉 parts 等既有键（e041444 同类回归）；progress 归 0、
-    ended_at 清空——202 后不得出现 running+100%+旧结束时间的假象。
+    meta 读-改-写不许冲掉 parts 等既有键（e041444 同类回归）；progress 归 0
+    ——202 后不得出现 running+100% 的假象。ended_at 保留：它是转写管线的终点，
+    AI 重生成不动它（动了会把"已用"污染成 started_at→最后重生的跨度）。
 
     偏离 brief：brief 原版用真 threading.Thread + Event.wait(5)（竞态），
     且没 mock llm_enabled——仓库 config.yaml 无 llm 节，真跑会 409 而非 202。
@@ -1912,7 +1970,7 @@ def test_feedback_trigger_202_and_clears_error(client, isolated_db, monkeypatch)
             " WHERE id='fb1'").fetchone()
     assert row["status"] == "running" and row["stage"] == "ai"
     assert row["progress"] == 0, "重跑从 0 开始，不得残留上次的 100%"
-    assert row["ended_at"] is None, "running 不配旧 ended_at"
+    assert row["ended_at"] == "2026-10-21T09:00:00", "ended_at 是管线终点，重生成不动"
     meta = json.loads(row["meta_json"])
     assert "ai_error" not in meta
     assert meta["parts"] == ["a.mp4", "b.mp4"], "清 ai_error 不得冲掉 parts 等既有键"

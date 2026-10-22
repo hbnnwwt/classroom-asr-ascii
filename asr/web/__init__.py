@@ -819,8 +819,9 @@ def _start_ai_run(task_id: str, config: str, fmts: tuple) -> JSONResponse:
         raise HTTPException(409, "LLM 未配置（config.yaml 缺 llm 节）")
 
     # 清旧错误 + 标 running，起线程；_run_ai_stage 自己管成功/失败终态。
-    # progress/ended_at 一并复位：202 后不得残留 done 期的 100% 进度条与
-    # 旧结束时间（前端会渲染成 running+100%+冻结计时的假象）
+    # progress 复位：202 后不得残留 done 期的 100% 进度条（前端渲染成
+    # running+100% 假象）。ended_at 不动：它是转写管线的终点，AI 重生成只记
+    # 阶段账（stage_started_at）；清了它，前端重载页面会从 started_at 起跳计时
     meta = _read_meta(task_id)
     meta.pop("ai_error", None)
     files = meta.get("ai_files") or {}
@@ -837,7 +838,7 @@ def _start_ai_run(task_id: str, config: str, fmts: tuple) -> JSONResponse:
     else:
         meta.pop("ai_errors", None)
     _update_task(task_id, status="running", stage="ai", message="AI 反馈",
-                 progress=0, ended_at=None,
+                 progress=0,
                  stage_started_at=datetime.now().isoformat(timespec="seconds"),
                  meta_json=json.dumps(meta, ensure_ascii=False))
     threading.Thread(target=_run_ai_stage, args=(task_id, config, fmts),
@@ -1169,10 +1170,11 @@ def _run_ai_stage(task_id: str, config_path: str,
             meta.pop("ai_errors", None)
         message = "AI 反馈完成" if not errors else \
             f"AI 反馈完成（{len(errors)} 项失败）"
+        # ended_at 不写：那是转写管线的终点（_run_pipeline 已盖），
+        # 重生成收尾盖 now 会把"已用"污染成 started_at→最后重生的跨度
         _update_task(
             task_id, status="done", stage="done", progress=1.0,
             message=message,
-            ended_at=datetime.now().isoformat(timespec="seconds"),
             meta_json=json.dumps(meta, ensure_ascii=False),
         )
     except Exception as e:  # noqa: BLE001 前置失败（无转写/未配置）才走这里
@@ -1183,7 +1185,6 @@ def _run_ai_stage(task_id: str, config_path: str,
         _update_task(
             task_id, status="done", stage="ai", progress=1.0,
             message="AI 反馈失败",
-            ended_at=datetime.now().isoformat(timespec="seconds"),
             meta_json=json.dumps(meta, ensure_ascii=False),
         )
 

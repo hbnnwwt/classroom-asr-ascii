@@ -428,11 +428,21 @@ function renderStages(stage, msg, stageStartedAt, taskStartedAt) {
 }
 
 /**
- * "现在"的有效值：任务终态（done/failed）后时间冻结在 ended_at，
- * 所有计时（任务级 + 阶段级）随之停走，不再随真实时间增长。
+ * 任务级"现在"：ended_at 在即冻结——已用 = started_at→ended_at（转写管线的
+ * 一生）。AI 重生成不清 ended_at，重载页面计时也不从 started_at 起跳。
  */
-function effectiveNowMs() {
+function taskNowMs() {
   return taskEndTimeMs || Date.now();
+}
+
+/**
+ * 阶段级"现在"：任务终态才冻结在 ended_at；运行中（含 AI 重生成，此时
+ * ended_at 还是管线旧值）必须走真实时间，否则阶段计时被旧终点冻死。
+ */
+function stageNowMs() {
+  return (taskStatus === "done" || taskStatus === "failed")
+    ? taskEndTimeMs || Date.now()
+    : Date.now();
 }
 
 /**
@@ -441,7 +451,7 @@ function effectiveNowMs() {
  * 阶段切换时由 renderStages 重置计时。
  */
 function updateStageMsg(li, baseMsg) {
-  const secs = Math.max(0, Math.floor((effectiveNowMs() - stageStartTime) / 1000));
+  const secs = Math.max(0, Math.floor((stageNowMs() - stageStartTime) / 1000));
   if (secs <= 0) {
     // 没有可展示的已用时间（阶段刚开始，或终态后 0 时长的 done 阶段）：只显示消息
     li.querySelector(".msg").textContent = baseMsg || "";
@@ -459,7 +469,7 @@ function updateTaskElapsed(t) {
   if (taskElapsedTimer) clearInterval(taskElapsedTimer);
   if (taskStartTimeMs > 0) {
     const render = () => {
-      const secs = Math.max(0, Math.floor((effectiveNowMs() - taskStartTimeMs) / 1000));
+      const secs = Math.max(0, Math.floor((taskNowMs() - taskStartTimeMs) / 1000));
       $("task-elapsed").textContent = formatDuration(secs);
     };
     render();
