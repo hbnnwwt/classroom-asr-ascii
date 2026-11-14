@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 import pytest
 from fastapi.testclient import TestClient
+from starlette.datastructures import State
 
 from asr.web import (
     _init_db, _update_task, _row_to_dict, _db, DB_PATH, OUTPUT_ROOT, UPLOAD_DIR,
@@ -29,9 +30,8 @@ def isolated_db(web_runtime, monkeypatch):
     from asr.web.runtime import WebRuntime
     from asr.web.execution import ExecutionManager
     runtime = WebRuntime(web_runtime.config_path, test_db, test_uploads, test_outputs)
-    monkeypatch.setattr(wm.app.state, "runtime", runtime, raising=False)
     executor = ExecutionManager()
-    monkeypatch.setattr(wm.app.state, "execution", executor, raising=False)
+    monkeypatch.setattr(wm.app, "state", State({"runtime": runtime, "execution": executor}))
     monkeypatch.setattr(wm, "DB_PATH", test_db)
     monkeypatch.setattr(wm, "UPLOAD_DIR", test_uploads)
     monkeypatch.setattr(wm, "OUTPUT_ROOT", test_outputs)

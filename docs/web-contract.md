@@ -58,6 +58,38 @@ curl -X POST http://127.0.0.1:8000/api/uploads/返回的upload_id/cancel
 
 启动时，未结束的转写任务标记中断；仅 AI 中断时保留转写和旧 AI 稿，记录尝试失败，不自动再次调用服务。看门狗超时表示状态标记失败，不表示底层 native 推理已终止。关闭时先停止准入，再等待在途执行者，最后释放模型。
 
+## 外部集成
+
+### `GET /health`
+
+此端点供调用方或负载均衡探活，检查能否读取服务配置的 SQLite 任务表。检查成功返回 HTTP 200，`status` 为 `ok`，`checks.db` 为 `true`。探测失败时返回 HTTP 503，`status` 为 `degraded`，`checks.db` 为 `false`。它沿用页面的访问控制。设置 `ASR_WEB_PASSWORD` 后，探针也需使用 HTTP Basic，用户名为 `classroom`。模型检查使用 `python -m asr check`，转写状态通过任务接口查询。
+
+### `POST /api/transcribe`
+
+此端点仅接受与服务进程直接建立的真实回环连接，包含设置访问密码的部署。远程程序通过 `POST /api/projects` 上传。若用同机反向代理接受远程请求，在代理的远程入口屏蔽 `/api/transcribe`。应用按直连对端识别回环，且不会使用转发头判断请求来源。
+
+用 `application/x-www-form-urlencoded` 提交服务端文件路径。该任务借用源文件，调用方须确保源在转写完成前保持可读。任务删除时由服务清理产物并保留源文件。
+
+| 字段 | 必填 | 含义 |
+|---|---|---|
+| `input_path` | 是 | 服务端路径。相对路径按服务进程当前目录解析 |
+| `sync` | 否 | 默认为 `false`，受理后即返回。设为 `true` 时等待转写 |
+| `fmts` | 否 | 同步返回的格式，默认 `srt,txt`。同步请求至少选择一项，用逗号分隔，可选 `srt`、`vtt`、`txt`、`md`、`json` |
+| `name` / `config` / `quality` / `diarize` / `ai_feedback` | 否 | 沿用上传语义。`config` 映射到服务启动时固定的配置 |
+| `timeout` | 否 | 同步等待转写的上限（秒）。取值大于 0 且不超过 3600，默认 3600 |
+
+- 非法路径、无法探测媒体或没有音轨时返回 400。非法 `config`、`quality`、同步请求里的非法 `timeout` 或空白及不支持的 `fmts` 同样在受理前返回 400。
+- 异步受理和同步等待超时均返回 HTTP 202，响应为 `{"task_id":"...","status":"accepted"}`。任务继续执行。保留该 `task_id`，轮询 `GET /status/{task_id}` 的 `transcription_status`，转写完成后下载所需格式。
+- 同步请求在转写完成后返回 HTTP 200 和 `status: "done"`，AI 整理可继续在后台运行。转写失败时返回 HTTP 500，`detail` 包含 `task_id` 和 `message`。
+- `formats` 是成功读取的格式及其文本内容。SRT 按产物生成时的 `meta.srt_encoding` 解码，默认为 `utf-8-sig`。其他格式用 UTF-8 解码。返回的文本会去除开头的 BOM。`available_formats` 为响应时已生成的格式。`format_errors` 按请求格式给出未生成或读取失败的原因。转写成功且某个请求格式不可用时，响应仍为 HTTP 200，调用方应检查该格式后再保存字幕。
+- 受理使用现有有界队列。队满返回 HTTP 503、错误码 `queue_full` 和 `Retry-After`。
+
+`meta.source_path` 记录解析后的源路径。下载仍限于该任务的产物目录。
+
+### 字幕文本清洗
+
+SenseVoiceSmall 返回识别结果后，FunASR 引擎在标点恢复和分段前去除已知的模型控制标记，例如 `<|zh|><|NEUTRAL|><|Speech|><|withitn|>`。普通文本中的尖括号保留，只有控制标记的结果不会生成空字幕。CLI、Web 上传和本机路径转写共用这一处理。
+
 ## 产物与 AI 发布
 
 新任务的基础产物由 `meta.output_files` 登记真实文件名，下载限定在该任务输出目录；仅未登记的旧任务使用受限的旧文件查找。重命名项目不影响定位。`meta.quality` 记录新任务请求值，缺失的历史任务不会被推测为某一质量。

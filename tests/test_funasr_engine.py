@@ -1,5 +1,6 @@
 """FunASR 引擎单测（不加载真实模型，只验证 _parse_results 与降级逻辑）。"""
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -662,6 +663,75 @@ class TestVadSlicedTranscribe:
         assert batches[0][0].text == "大家好。"
         # 交付累计 == 最终返回（组结果不回炉）
         assert [s for b in batches for s in b] == segs
+
+    def test_sensevoice_cleans_before_punctuation_and_vad_delivery(self, tmp_path, cfg):
+        wav = tmp_path / "sensevoice.wav"
+        self._make_wav(wav, 5.0)
+        groups = iter([
+            {"text": "<|zh/en|><|NEUTRAL|><|Speech|><|withitn|>甲<|BGM|>乙<|/BGM|>",
+             "timestamp": [[100, 200], [300, 400], [1000, 1100], [1200, 1300]],
+             "words": ["甲", "<|BGM|>", "乙", "<|/BGM|>"]},
+            {"text": "<|nospeech|><|NEUTRAL|><|Applause|><|woitn|>"},
+        ])
+        punctuated = []
+
+        def punctuate(input):
+            punctuated.append(input)
+            return [{"text": input.replace("甲乙", "甲。乙") if "甲乙" in input else input + "。"}]
+
+        engine = self._engine(cfg)
+        engine._load_model = lambda: SimpleNamespace(
+            kwargs={"model": "SenseVoiceSmall"}, generate=lambda **kw: [next(groups)])
+        engine._load_vad_model = lambda: SimpleNamespace(
+            generate=lambda **kw: [{"value": [[0, 1400], [4000, 4500]]}])
+        engine._load_punc_model = lambda: SimpleNamespace(generate=punctuate)
+        delivered = []
+
+        result = engine.transcribe(wav, on_segments=delivered.append)
+
+        expected = [Segment(0.1, 0.2, "甲。"), Segment(1.0, 1.1, "乙")]
+        assert result == expected
+        assert delivered == [expected]
+        assert punctuated == ["甲乙"]
+
+    def test_sensevoice_whole_file_fallback_cleans_sentence_info(self, tmp_path, cfg):
+        wav = tmp_path / "sensevoice.wav"
+        self._make_wav(wav, 2.0)
+        item = {
+            "text": "<|zh|><|Speech|><|withitn|>写法 <|placeholder|>",
+            "sentence_info": [
+                {"start": 200, "end": 800, "text": "<|zh|><|Speech|><|withitn|>写法 <|placeholder|>", "spk": 1},
+                {"start": 800, "end": 1500, "text": "<|nospeech|><|BGM|>", "spk": 1},
+            ],
+        }
+
+        def fail_vad():
+            raise RuntimeError("VAD unavailable")
+
+        engine = self._engine(cfg)
+        engine._load_model = lambda: SimpleNamespace(
+            kwargs={"model": "SenseVoiceSmall"}, generate=lambda **kw: [item])
+        engine._load_vad_model = fail_vad
+        engine._load_punc_model = lambda: SimpleNamespace(generate=lambda **kw: [{"text": kw["input"]}])
+
+        assert engine.transcribe(wav) == [Segment(0.2, 0.8, "写法 <|placeholder|>", spk="spk1")]
+
+    def test_paraformer_retains_tag_shaped_text_through_postprocess(self, tmp_path, cfg):
+        from asr.postprocess import apply
+
+        wav = tmp_path / "paraformer.wav"
+        self._make_wav(wav, 1.0)
+        body = "语法 <|zh|> 与 <|placeholder|>"
+        engine = self._engine(cfg)
+        engine._load_model = lambda: SimpleNamespace(
+            kwargs={"model": "Paraformer"}, generate=lambda **kw: [{"text": body}])
+        engine._load_vad_model = lambda: SimpleNamespace(
+            generate=lambda **kw: [{"value": [[0, 1000]]}])
+        engine._load_punc_model = lambda: SimpleNamespace(generate=lambda **kw: [{"text": kw["input"]}])
+
+        result, _ = apply(engine.transcribe(wav), cfg, duration_s=1.0)
+
+        assert result == [Segment(0.0, 1.0, body)]
 
     def test_on_segments_exception_does_not_kill_transcription(self, tmp_path, cfg):
         """回调失败不影响主流程（转写照常返回全量段落）。"""

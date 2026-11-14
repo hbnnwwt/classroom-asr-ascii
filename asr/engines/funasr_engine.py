@@ -20,6 +20,7 @@ from __future__ import annotations
 import subprocess
 import sys
 import hashlib
+import re
 import threading
 from pathlib import Path
 from typing import List, Optional, Callable
@@ -29,6 +30,18 @@ from loguru import logger
 from .base import ASREngine, Segment, TranscriptionOptions
 from .spec import EngineLoadSpec
 from ..config import AppConfig
+
+
+# 与 SenseVoiceSmall 词表中的控制标记保持一致，保留其他尖括号文本。
+_SENSEVOICE_TAG_RE = re.compile(
+    r"<\|(?:zh|en|zh/en|en/zh|yue|minnan|wuyu|dialect|ja|de|es|ru|ko|fr|pt|tr|pl|ca|nl|ar|sv|it|"
+    r"id|hi|fi|vi|he|uk|el|ms|cs|ro|da|hu|ta|no|th|ur|hr|bg|lt|la|mi|ml|cy|sk|te|fa|lv|bn|sr|"
+    r"az|sl|kn|et|mk|br|eu|is|hy|ne|mn|bs|kk|sq|sw|gl|mr|pa|si|km|sn|yo|so|af|oc|ka|be|tg|sd|"
+    r"gu|am|yi|lo|uz|fo|ht|ps|tk|nn|mt|sa|lb|my|bo|tl|mg|as|tt|haw|ln|ha|ba|jw|su|nospeech|"
+    r"HAPPY|SAD|ANGRY|NEUTRAL|FEARFUL|DISGUSTED|SURPRISED|OTHER|EMO_UNKNOWN|"
+    r"/?(?:Speech|BGM|Applause|Laughter)|Cry|Sneeze|Breath|Cough|Sing|Speech_Noise|GBG|Event_UNK|"
+    r"withitn|woitn|ASR|AED|SER|SPECIAL_TOKEN_(?:[1-9]|[12][0-9]|3[0-5]))\|>"
+)
 
 
 class FunASREngine(ASREngine):
@@ -68,11 +81,10 @@ class FunASREngine(ASREngine):
         from funasr import AutoModel
 
         # --quality 决定 ASR 模型：
-        #   fast     → SenseVoice-Small（最快，但**无时间戳输出**，仅纯文本）
+        #   fast     → SenseVoice-Small（默认只输出文本，开说话人分离时可输出时间戳）
         #   balanced → Paraformer-Large（带 sentence_info 时间戳，**默认**）
         #   high     → Paraformer-Large + 高精度（当前同一模型；未来换 Fun-ASR-Nano）
         #
-        # 重要：SenseVoice 是端到端模型，不输出时间戳。如需时间戳，必须用 Paraformer。
         # 因此默认 quality=balanced，让"教师单讲"场景拿到的结果可直接做字幕。
         asr_path = str(self.load_spec.asr)
 
@@ -449,6 +461,11 @@ class FunASREngine(ASREngine):
             else:
                 raise
 
+        # 使用 AutoModel 解析后的注册模型名，覆盖不同路径和档位。
+        if getattr(model, "kwargs", {}).get("model") == "SenseVoiceSmall":
+            for item in results or []:
+                _clean_sensevoice_result(item)
+
         # 跑完置 100%
         if on_progress:
             try:
@@ -573,6 +590,25 @@ def _as_text(v) -> str:
     if isinstance(v, (list, tuple)):
         return "".join(str(x) for x in v).strip()
     return str(v).strip()
+
+
+def _clean_sensevoice_text(value) -> str:
+    return _SENSEVOICE_TAG_RE.sub("", _as_text(value)).strip()
+
+
+def _clean_sensevoice_result(item: dict) -> None:
+    """在标点恢复、切段和渐进交付前移除模型控制标记。"""
+    item["text"] = _clean_sensevoice_text(item.get("text"))
+    for sentence in item.get("sentence_info") or []:
+        sentence["text"] = _clean_sensevoice_text(sentence.get("text"))
+
+    # 前置控制标记不参与模型对齐，正文内的事件标记可能有独立时间戳。
+    words = item.get("words") or []
+    timestamps = item.get("timestamp") or []
+    if words and len(words) == len(timestamps):
+        keep = [not _SENSEVOICE_TAG_RE.fullmatch(word) for word in words]
+        item["words"] = [word for word, keep_word in zip(words, keep) if keep_word]
+        item["timestamp"] = [stamp for stamp, keep_word in zip(timestamps, keep) if keep_word]
 
 
 # ---------------------------------------------------------------------------

@@ -103,6 +103,96 @@ llm:
 
 Web 的 SQLite、上传和输出默认位于 `asr/web/`。升级前备份这些数据及个人配置；新数据库迁移保留旧记录，已有产物不批量改名，项目重命名不改输出文件名。
 
+## 外部程序调用（HTTP 接口）
+
+外部程序可用 HTTP API 生成字幕。设置 `ASR_WEB_PASSWORD` 后，客户端用 HTTP Basic 认证，用户名为 `classroom`。同机程序通过回环地址直接提交文件路径，远程程序走上传流程。
+
+### 健康检查
+
+`GET /health` 检查服务能否读取 SQLite。检查成功返回 HTTP 200，失败返回 503。模型和运行依赖可单独用 `python -m asr check` 核对。
+
+### 同机调用（直接提交文件路径）
+
+`POST /api/transcribe` 仅允许真实回环连接，设置访问密码后依然如此。源文件由调用方管理，需保持可读直到转写完成，删除任务时服务会保留源文件。使用同机反向代理接收远程请求时，请在代理的远程入口屏蔽该端点。
+
+```
+POST /api/transcribe         (application/x-www-form-urlencoded)
+  input_path=完整文件路径    必填
+  sync=true                  等待转写完成并返回字幕文本
+  fmts=srt                   仅 sync=true 时生效，逗号分隔，默认 srt,txt
+  name / config / quality / diarize / ai_feedback / timeout   可选
+```
+
+`sync=true` 时，转写完成即返回 HTTP 200。以下是请求 `srt` 且成功读取时的响应。
+
+```json
+{"task_id":"...","status":"done","name":"...","segments":3,"duration_s":16.45,
+ "formats":{"srt":"1\n00:00:00,150 --> 00:00:03,750\n大家好……\n"},
+ "available_formats":["srt","txt","vtt","md","json"],"format_errors":{}}
+```
+
+同步请求仅等待转写，AI 整理可继续在后台运行。`timeout` 必须大于 0 秒，默认和最多均为 3600 秒。`sync=false`（默认）或同步等待超时时返回 `202 {"task_id":"...","status":"accepted"}`。用原 `task_id` 查询 `GET /status/{task_id}`，以 `transcription_status` 判断字幕是否完成。
+
+`fmts` 支持 `srt,vtt,txt,md,json`。同步响应的 `formats` 只包含已读取的请求格式。格式未生成或文件读取失败时，`format_errors` 会提供逐项原因。调用方应先确认所选格式在 `formats` 中，再写入字幕文件。
+
+### 上传流程（远程调用）
+
+```
+POST /api/uploads                       -> 201 {"upload_id":"..."}
+POST /api/projects  (multipart)         -> {"task_id":"..."}
+       files=<二进制>  X-Upload-Id: <upload_id>  quality=balanced …
+GET  /status/{task_id}                  -> transcription_status/stage/progress/message
+GET  /download/{task_id}/{fmt}          -> 文件内容，fmt ∈ srt|vtt|txt|md|json
+```
+
+`POST /api/uploads` 和 `X-Upload-Id` 可选，用于取消上传与防止同一会话重复提交。等到 `transcription_status` 为 `done` 且 `available_formats` 包含目标格式后，再下载文件。
+
+### 调用示例
+
+`scripts/api_client_example.py` 只依赖 Python 标准库。命令行受理任务后轮询并下载原始字幕文件，远程上传按块读取媒体文件。`--wait-timeout` 设置状态轮询的总时限，默认 7200 秒。
+
+在服务端终端设置密码，按访问范围选择一条启动命令。
+
+```powershell
+$env:ASR_WEB_PASSWORD='你的密码'
+
+# 同机访问
+.\.venv\Scripts\python.exe -m asr.web --host 127.0.0.1 --port 8765
+
+# 局域网访问
+.\.venv\Scripts\python.exe -m asr.web --host 0.0.0.0 --port 8765
+```
+
+在发起调用的终端中设置同一密码，再按调用位置选择命令。
+
+```powershell
+$env:ASR_WEB_PASSWORD='你的密码'
+
+# 同机通过回环地址提交本地路径
+.\.venv\Scripts\python.exe scripts\api_client_example.py E:\media\lecture.mp4 --base http://127.0.0.1:8765 --local -o lecture.srt
+
+# 另一台电脑通过局域网地址上传
+.\.venv\Scripts\python.exe scripts\api_client_example.py E:\media\lecture.mp4 --base http://10.0.0.9:8765 -o lecture.srt
+```
+
+在 Python 中也可直接调用客户端。
+
+```python
+import os
+
+from scripts.api_client_example import AsrClient
+
+c = AsrClient("http://127.0.0.1:8765", secret=os.environ["ASR_WEB_PASSWORD"])
+print(c.health())
+srt = c.transcribe(r"E:\media\lecture.mp4", local=True, quality="balanced")   # bytes
+```
+
+若需要字典形式的字幕文本，可调用 `c.transcribe_local(路径, fmts="srt")`。当同步请求返回 202 时，该方法会继续轮询同一个任务。
+
+服务运行时可访问 `/docs`、`/redoc`、`/openapi.json` 查看路由和请求字段。响应与状态约定见 [Web 接口文档](docs/web-contract.md)。
+
+> 注意：本项目是**语音识别（ASR）**，把音轨转成字幕。若需要识别**画面上的文字**（课件、板书、屏幕截图），属于 OCR，不在本项目范围内。
+
 ## 开发与验收
 
 默认测试使用模板配置、临时 SQLite、合成 WAV 和 fake 引擎/LLM，不读取个人配置、不下载模型、不调用真实云服务：

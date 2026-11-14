@@ -13,6 +13,8 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 pytestmark = pytest.mark.skipif(os.name != "nt", reason="Windows batch launchers")
+# Windows venv's python.exe is a redirector that needs its own pyvenv.cfg.
+BASE_PYTHON = Path(sys._base_executable)
 
 
 class IsolatedEnvironment(dict):
@@ -42,7 +44,7 @@ def launcher_workspace(tmp_path):
     env["PYTHONHOME"] = sys.base_prefix
     env["ASR_TEST_LAUNCH_LOG"] = str(tmp_path / "launch.json")
     env["ASR_TEST_INSTALL_LOG"] = str(tmp_path / "install.jsonl")
-    env["ASR_PYTHON"] = sys.executable
+    env["ASR_PYTHON"] = str(BASE_PYTHON)
     return tmp_path, env
 
 
@@ -58,7 +60,7 @@ def install_fake_web(workspace, *, occupied=False):
     directory, _ = workspace
     scripts = directory / ".venv" / "Scripts"
     scripts.mkdir(parents=True)
-    shutil.copyfile(sys.executable, scripts / "python.exe")
+    shutil.copyfile(BASE_PYTHON, scripts / "python.exe")
     package = directory / "asr"
     package.mkdir()
     (package / "__init__.py").write_text("")
@@ -133,7 +135,7 @@ def test_setup_creates_local_environment_and_keeps_download_explicit(launcher_wo
     directory, _ = launcher_workspace
     events = [json.loads(line) for line in (directory / "install.jsonl").read_text().splitlines()]
     assert events[0]["module"] == "venv"
-    assert Path(events[0]["executable"]) == Path(sys.executable)
+    assert Path(events[0]["executable"]) == BASE_PYTHON
     pip_events = [event for event in events if event["module"] == "pip"]
     assert pip_events
     assert all(Path(event["executable"]) == directory / ".venv" / "Scripts" / "python.exe" for event in pip_events)

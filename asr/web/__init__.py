@@ -12,19 +12,21 @@ Web UI（FastAPI）：
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
 import shutil
 import sqlite3
 import threading
+import time
 import uuid
 from contextlib import asynccontextmanager, closing
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
-from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from loguru import logger
 from pydantic import BaseModel
@@ -123,13 +125,17 @@ def _init_db() -> None:
     _repository().initialize()
 
 
+def _transcription_status(row) -> str:
+    return "done" if row["stage"] == "ai" else row["status"]
+
+
 def _row_to_dict(row: sqlite3.Row) -> dict:
     item = task_dict(row)
     meta = item["meta"]
     active = _executor().is_active(item["id"])
     item["execution_active"] = active
     item["can_delete"] = not active and item["status"] not in ("pending", "running")
-    item["transcription_status"] = "done" if item["stage"] == "ai" else item["status"]
+    item["transcription_status"] = _transcription_status(item)
     attempts = meta.get("ai_attempts", {})
     states = [a.get("status") for a in attempts.values()]
     legacy_ai = ("running" if item["stage"] == "ai" and item["status"] in ("pending", "running") else
@@ -332,6 +338,182 @@ async def upload(
     upload_id: str | None = Header(None, alias="X-Upload-Id"),
 ) -> JSONResponse:
     return await _accept_upload([file], "", config, diarize, quality, False, upload_id, legacy=True)
+
+
+# ---------------------------------------------------------------------------
+# 外部程序集成接口
+# ---------------------------------------------------------------------------
+_TEXT_FORMATS = frozenset({"srt", "vtt", "txt", "md", "json"})
+_MAX_SYNC_WAIT_S = 3600.0
+
+
+@app.get("/health")
+def health() -> JSONResponse:
+    """检查服务能否读取任务数据库。"""
+    runtime = _runtime()
+    try:
+        uri = f"{runtime.db_path.as_uri()}?mode=ro"
+        with closing(sqlite3.connect(uri, uri=True, timeout=1)) as conn:
+            conn.execute("SELECT id FROM tasks LIMIT 1").fetchone()
+        db_ok = True
+    except sqlite3.Error:
+        db_ok = False
+    return JSONResponse({"status": "ok" if db_ok else "degraded", "checks": {"db": db_ok},
+                         "workers": runtime.workers, "max_waiting": runtime.max_waiting},
+                        status_code=200 if db_ok else 503)
+
+
+def _accept_local_path(input_path: Path, name: str, config_path: Path, diarize: bool,
+                       quality: str, ai_feedback: bool) -> str:
+    """借用调用方的媒体，任务只拥有产物。"""
+    if quality not in ("fast", "balanced", "high"):
+        raise HTTPException(400, "不支持的质量档位")
+    try:
+        is_file = input_path.is_file()
+    except OSError as exc:
+        raise HTTPException(400, "无法访问输入文件") from exc
+    if not is_file:
+        raise HTTPException(400, "文件不存在或不是普通文件")
+    try:
+        info = probe(input_path)
+    except Exception as exc:
+        raise HTTPException(400, f"无法探测 {input_path.name}，请检查媒体文件") from exc
+    if not info.audio_streams:
+        raise HTTPException(400, f"{input_path.name} 没有音轨")
+
+    runtime = _runtime()
+    task_id = uuid.uuid4().hex[:12]
+    out_dir = runtime.output_root / task_id
+    out_dir.mkdir(parents=True)
+    final_name = name.strip() or input_path.stem
+    meta = {"ai_feedback": ai_feedback, "quality": quality,
+            "source_path": str(input_path)}
+    task = {"id": task_id, "name": final_name, "filename": input_path.name,
+            "input_path": str(input_path), "output_dir": str(out_dir),
+            "meta_json": json.dumps(meta, ensure_ascii=False)}
+
+    def work():
+        if not _repository().claim(task_id, current_owner()):
+            return
+        _run_single_task(task_id, input_path, out_dir, str(config_path),
+                         diarize, quality, ai_feedback)
+
+    accepted = False
+    try:
+        _executor().submit(task_id, work,
+                           admit=lambda: _repository().accept_task(task))
+        accepted = True
+    except (QueueFull, TaskBusy, AdmissionError) as exc:
+        raise _admission_error(exc)
+    finally:
+        if not accepted:
+            shutil.rmtree(out_dir, ignore_errors=True)
+    return task_id
+
+
+def _read_local_task(task_id: str):
+    with closing(_db()) as conn:
+        return conn.execute("SELECT status, stage, error, name, output_dir, meta_json FROM tasks WHERE id=?",
+                            (task_id,)).fetchone()
+
+
+def _local_transcription_response(task_id: str, row, wanted: tuple[str, ...]) -> JSONResponse:
+    item = task_dict(row)
+    meta = item["meta"]
+    out_dir = Path(item["output_dir"])
+    contents: dict[str, str] = {}
+    errors: dict[str, str] = {}
+    for fmt in wanted:
+        art = _output_artifact(out_dir, meta, fmt)
+        if art is None:
+            errors[fmt] = "该格式的产物不存在"
+            continue
+        encoding = meta.get("srt_encoding", "utf-8-sig") if fmt == "srt" else "utf-8-sig"
+        try:
+            contents[fmt] = art.read_bytes().decode(encoding).removeprefix("\ufeff")
+        except (LookupError, OSError, UnicodeDecodeError):
+            errors[fmt] = "读取或解码产物失败"
+    return JSONResponse({
+        "task_id": task_id,
+        "status": "done",
+        "name": item["name"],
+        "segments": meta.get("segments_count"),
+        "duration_s": meta.get("duration_s"),
+        "formats": contents,
+        "format_errors": errors,
+        "available_formats": _available_formats(out_dir, meta),
+    })
+
+
+@app.post("/api/transcribe", responses={202: {"description": "任务已受理，按 task_id 继续查询"}})
+async def transcribe_local(
+    request: Request,
+    input_path: str = Form(...),
+    name: str = Form(""),
+    config: str = Form("config.yaml"),
+    diarize: bool = Form(False),
+    quality: str = Form("balanced"),
+    ai_feedback: bool = Form(False),
+    sync: bool = Form(False),
+    timeout: str = Form(str(_MAX_SYNC_WAIT_S)),
+    fmts: str = Form("srt,txt"),
+):
+    """外部程序入口：直接给本机文件路径，免 HTTP 上传。
+
+    两种模式：
+    - sync=false（默认）：登记任务后立即返回 202 + task_id，调用方自行轮询
+      /status/{task_id}；适合大批量 / 任务长时。
+    - sync=true：服务端等待转写完成（超时未完成也返回
+      202 让调用方继续轮询）；直接返回所选格式的文本内容，适合脚本一次性
+      转发字幕。
+
+    fmts 仅在 sync=true 时生效，逗号分隔，可选 srt/vtt/txt/md/json。
+    """
+    if request.client is None or not loopback(request.client.host):
+        raise HTTPException(403, "本地路径转写仅允许本机回环连接")
+    config_path = _config_path(config)
+    wanted: tuple[str, ...] = ()
+    wait_s = 0.0
+    if sync:
+        form = await request.form()
+        try:
+            wait_s = float(form.get("timeout", timeout))
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(400, "timeout 必须是秒数") from exc
+        if not 0 < wait_s <= _MAX_SYNC_WAIT_S:
+            raise HTTPException(400, "timeout 必须大于 0 且不超过 3600 秒")
+        requested = form.get("fmts", fmts)
+        if isinstance(requested, str):
+            wanted = tuple(dict.fromkeys(fmt.strip() for fmt in requested.split(",") if fmt.strip()))
+        if not wanted or not _TEXT_FORMATS.issuperset(wanted):
+            raise HTTPException(400, "fmts 仅支持 srt、vtt、txt、md、json")
+    try:
+        src = await run_in_threadpool(lambda: Path(input_path).expanduser().resolve())
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise HTTPException(400, "输入路径无效") from exc
+
+    task_id = await run_in_threadpool(_accept_local_path, src, name, config_path, diarize, quality, ai_feedback)
+    accepted = JSONResponse({"task_id": task_id, "status": "accepted"}, status_code=202)
+    if not sync:
+        return accepted
+
+    deadline = time.monotonic() + wait_s
+    while (remaining := deadline - time.monotonic()) > 0:
+        try:
+            row = await asyncio.wait_for(run_in_threadpool(_read_local_task, task_id), remaining)
+        except asyncio.TimeoutError:
+            break
+        if time.monotonic() >= deadline:
+            break
+        if row is None:
+            raise HTTPException(404, "任务不存在")
+        state = _transcription_status(row)
+        if state == "done":
+            return await run_in_threadpool(_local_transcription_response, task_id, row, wanted)
+        if state == "failed":
+            raise HTTPException(500, {"task_id": task_id, "message": row["error"] or "转写失败"})
+        await asyncio.sleep(min(0.5, max(0.0, deadline - time.monotonic())))
+    return accepted
 
 
 @app.get("/status/{task_id}")
@@ -604,9 +786,10 @@ def _delete_one(task_id: str) -> bool:
     out_dir = Path(row["output_dir"]).resolve()
     if out_dir.is_relative_to(runtime.output_root) and out_dir != runtime.output_root:
         shutil.rmtree(out_dir, ignore_errors=True)
-    in_path = Path(row["input_path"]).resolve()
-    if in_path.is_relative_to(runtime.upload_dir) and in_path.is_file():
-        in_path.unlink(missing_ok=True)
+    if "source_path" not in row["meta"]:
+        in_path = Path(row["input_path"]).resolve()
+        if in_path.is_relative_to(runtime.upload_dir) and in_path.is_file():
+            in_path.unlink(missing_ok=True)
     parts_dir = runtime.upload_dir / f"{task_id}_parts"
     resolved_parts = parts_dir.resolve()
     if resolved_parts.is_relative_to(runtime.upload_dir) and resolved_parts != runtime.upload_dir and parts_dir.is_dir():
@@ -975,7 +1158,6 @@ def _auto_ai(task_id, config_path):
 
 def _run_pipeline(task_id, input_path, output_dir, config_path, diarize, quality) -> None:
     """Persist progress only while this execution still owns a nonterminal task."""
-    import time
     owner = current_owner()
     _update_task(task_id, status="running", started_at=datetime.now().isoformat(timespec="seconds"), message="开始处理")
     last_callback = [time.monotonic()]
@@ -1023,6 +1205,8 @@ def _run_pipeline(task_id, input_path, output_dir, config_path, diarize, quality
                 "segments_count": result.segments_count, "formats": list(result.written),
                 "output_files": {fmt: Path(file).name for fmt, file in result.written.items()},
                 "quality": quality}
+        if "srt" in result.written:
+            meta["srt_encoding"] = cfg.output.srt_encoding
         final = getattr(result, "segments", None)
         # Legacy Result constructors may supply only a JSON file and count.
         # A real zero-segment result is authoritative and must clear progress.
@@ -1122,7 +1306,7 @@ def _run_single_task(task_id, input_path, output_dir, config_path, diarize, qual
 
 
 # ---------------------------------------------------------------------------
-# 启动入口（python -m asr.web 或 uvicorn asr.web:app）
+# 启动入口（python -m asr.web）
 # ---------------------------------------------------------------------------
 def main() -> None:
     """命令行启动：python -m asr.web [--host 0.0.0.0] [--port 8000]"""
